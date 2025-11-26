@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "defaults_to": "text",
+  "families_multimodal": ["mllama", "gemma3", "idefics"],
+  "name_contains_multimodal": ["vision", "vl", "llava", "bakllava", "moondream"],
+  "regex_multimodal": [".*llama3\\.[12]-vision.*", ".*gemma3.*"],
+  "model_overrides": {
+    "gemma3:latest": "multimodal",
+    "llama3.2-vision:latest": "multimodal"
+  }
+}
+

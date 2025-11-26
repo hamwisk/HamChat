@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "by_name": {
+    "gemma3:latest": 8192,
+    "gemma3:12b":    8192,
+    "llama3.2-vision:latest": 8192,
+    "llava:7b": 4096,
+    "llava:13b": 4096,
+    "granite3.2-vision:latest": 16384,
+    "gpt-oss:latest": 128000
+  },
+  "by_regex": {
+    ".*gemma3.*": 8192,
+    ".*llama3\\.[12]-vision.*": 8192,
+    ".*mistral.*": 8192,
+    ".*qwen3.*": 32000,
+    ".*gpt[-_]?oss.*": 128000
+  },
+  "default_by_family": {
+    "gemma3": 8192,
+    "mllama": 8192,
+    "llama": 4096,
+    "mistral": 8192,
+    "granite": 16384,
+    "qwen2": 32000,
+    "qwen3": 32000,
+    "phi2": 2048,
+    "gptoss": 128000
+  }
+}
+

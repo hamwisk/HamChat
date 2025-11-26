@@ -3,6 +3,7 @@
 import os, sqlite3, json, time, hashlib, hmac, secrets, logging
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Literal
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from hamchat.paths import settings_dir
 from hamchat.db_init import ensure_database_ready  # reuse your creator/validator
@@ -109,6 +110,35 @@ def _now() -> int:
 def _one(c) -> Optional[Any]:
     r = c.fetchone()
     return r[0] if r else None
+
+def _field_key(existing_only: bool = False) -> bytes:
+    k = _dbi._get_or_create_field_key(existing_only=existing_only)
+    if not k:
+        raise RuntimeError("Field key unavailable; strict mode requires HC_KEY_FIELD or keyring.")
+    return k
+
+def encrypt_field(conn, plaintext: str) -> tuple[bytes, bytes]:
+    """
+    Encrypt a text field for strict mode using AES-GCM and the existing field key.
+    Returns (ciphertext, nonce).
+    """
+    key = _field_key(existing_only=False)
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aes.encrypt(nonce, plaintext.encode("utf-8"), None)
+    return ct, nonce
+
+def decrypt_field(conn, ciphertext: bytes, nonce: bytes) -> str:
+    """
+    Decrypt a text field for strict mode using AES-GCM and the existing field key.
+    Returns the plaintext string.
+    """
+    key = _field_key(existing_only=True)
+    if not key:
+        raise RuntimeError("Field key unavailable; cannot decrypt strict content.")
+    aes = AESGCM(key)
+    pt = aes.decrypt(nonce, ciphertext, None)
+    return pt.decode("utf-8")
 
 # ---------- users & auth ----------
 
@@ -280,15 +310,22 @@ def delete_conversation(conn, conversation_id: int) -> None:
 def add_message(conn, conversation_id: int, sender_type: SenderType,
                 sender_id: Optional[int], content: str,
                 metadata: Optional[Dict[str, Any]] = None) -> int:
-    # In 'strict' mode your triggers require encrypted fields; for now we write plaintext to `content`.
-    # If/when you switch to AEAD, route through an encrypt() before insert.
     meta_json = json.dumps(metadata or {})
+    mode = read_db_mode(conn)
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO messages(conversation_id, sender_type, sender_id, content, metadata, created) "
-        "VALUES(?,?,?,?,?,?)",
-        (conversation_id, sender_type, sender_id, content, meta_json, _now()),
-    )
+    if mode == "strict":
+        ct, nonce = encrypt_field(conn, content)
+        cur.execute(
+            "INSERT INTO messages(conversation_id, sender_type, sender_id, content, content_ct, content_nonce, content_key_id, metadata, created) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (conversation_id, sender_type, sender_id, None, ct, nonce, 1, meta_json, _now()),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO messages(conversation_id, sender_type, sender_id, content, content_ct, content_nonce, content_key_id, metadata, created) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (conversation_id, sender_type, sender_id, content, None, None, None, meta_json, _now()),
+        )
     mid = cur.lastrowid
     conn.commit()
     return mid
@@ -303,18 +340,30 @@ def list_conversations(conn, user_id: int, limit: int = 50) -> List[Dict[str, An
     return [{"id": r[0], "title": r[1], "created": r[2]} for r in rows]
 
 def list_messages(conn, conversation_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    mode = read_db_mode(conn)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, sender_type, sender_id, content, metadata, created "
+        "SELECT id, sender_type, sender_id, content, content_ct, content_nonce, metadata, created "
         "FROM messages WHERE conversation_id=? ORDER BY id ASC LIMIT ?",
         (conversation_id, limit),
     )
     rows = cur.fetchall()
     out = []
     for r in rows:
+        content = r[3]
+        if mode == "strict":
+            ct = r[4]
+            nonce = r[5]
+            if content:
+                pass  # legacy plaintext; prefer it
+            elif ct and nonce:
+                try:
+                    content = decrypt_field(conn, bytes(ct), bytes(nonce))
+                except Exception:
+                    content = ""
         out.append({
             "id": r[0], "sender_type": r[1], "sender_id": r[2],
-            "content": r[3], "metadata": json.loads(r[4] or "{}"), "created": r[5]
+            "content": content, "metadata": json.loads(r[6] or "{}"), "created": r[7]
         })
     return out
 
@@ -347,14 +396,55 @@ def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str,str]] = None) -
 
 def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
     """
-    INSERT OR IGNORE into Files(sha256, mime, bytes, size, created_at)
-    Return file_id. De-dupe by sha256.
+    Ensure the file is present in on-disk CAS (data/cas/<sha256>), de-dupe by sha256, and return the id from the files table.
     """
-    raw = Path(src_path).read_bytes()
-    size = len(raw)
+    cas_root = _data_dir() / "cas"
+    cas_root.mkdir(parents=True, exist_ok=True)
+    cas_path = cas_root / sha256
+
+    raw_bytes: Optional[bytes] = None
+    if not cas_path.exists():
+        raw_bytes = Path(src_path).read_bytes()
+        cas_path.write_bytes(raw_bytes)
+
+    sha_blob = bytes.fromhex(sha256)
     cur = db.cursor()
-    cur.execute("INSERT OR IGNORE INTO Files(sha256, mime, bytes, size, created_at) VALUES(?,?,?,?,strftime('%s','now'))",
-                (sha256, mime, raw, size))
-    cur.execute("SELECT file_id FROM Files WHERE sha256=?", (sha256,))
+    cur.execute("SELECT id FROM files WHERE sha256=?", (sha_blob,))
     row = cur.fetchone()
+    if row:
+        return int(row[0])
+
+    if raw_bytes is None:
+        raw_bytes = Path(src_path).read_bytes()
+    size_bytes = len(raw_bytes)
+    kind = "image" if mime.startswith("image/") else "other"
+    original_name = Path(src_path).name
+
+    cur.execute(
+        "INSERT OR IGNORE INTO files(kind, mime, sha256, size_bytes, width, height, page_count, duration_ms, exif_json, thumb_sha256, original_name, ref_count, created) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (kind, mime, sha_blob, size_bytes, None, None, None, None, None, None, original_name, 1, _now()),
+    )
+    cur.execute("SELECT id FROM files WHERE sha256=?", (sha_blob,))
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError("Failed to insert or retrieve file metadata.")
     return int(row[0])
+
+def cas_path_for_file(db, file_id: int) -> Optional[Path]:
+    """
+    Given a files.id, return the filesystem path to the CAS file (data/cas/<sha256>),
+    or None if not found or the file does not exist.
+    """
+    cur = db.cursor()
+    cur.execute("SELECT sha256 FROM files WHERE id=?", (file_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    sha_blob = row[0]
+    if isinstance(sha_blob, memoryview):
+        sha_blob = sha_blob.tobytes()
+    sha_hex = sha_blob.hex()
+    cas_root = _data_dir() / "cas"
+    path = cas_root / sha_hex
+    return path if path.exists() else None

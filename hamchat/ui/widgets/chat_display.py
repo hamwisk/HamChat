@@ -111,6 +111,13 @@ class MessageListModel(QAbstractListModel):
         self.endInsertRows()
         return row
 
+    def insert(self, row: int, msg: Msg) -> int:
+        row = max(0, min(row, len(self._items)))
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._items.insert(row, msg)
+        self.endInsertRows()
+        return row
+
     def set_text(self, row: int, new_text: str):
         if 0 <= row < len(self._items):
             self._items[row].text = new_text
@@ -336,4 +343,14 @@ class ChatDisplay(QWidget):
             return
         # Append a dedicated image-only bubble for the user with all thumbs
         self._model.append(Msg("user", "", thumb_urls))
+        self._call_qml("ensureAtEnd")
+
+    def insert_thumbs_after(self, row: int, paths: list[str]):
+        def norm(p: str) -> str:
+            return p if p.lower().startswith("file://") else "file://" + p
+        thumb_urls = [norm(p) for p in paths if p]
+        if not thumb_urls:
+            return
+        insert_at = max(0, row + 1)
+        self._model.insert(insert_at, Msg("user", "", thumb_urls))
         self._call_qml("ensureAtEnd")

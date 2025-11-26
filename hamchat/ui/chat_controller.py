@@ -43,7 +43,7 @@ class ChatController(QObject):
         # ---- In-memory session history ----
         self._history: List[ChatMessage] = []
         self._assistant_buf: List[str] = []
-        self._max_turns: int = 64   # rolling window; adjust as needed
+        self._max_turns: int = 256   # rolling window; adjust as needed
         # ToDo set the max turns in the session, load it from app.json, or infer it from spec report maybe
 
         # ---- Persistence context (optional; enabled only for role='user') ----
@@ -96,6 +96,26 @@ class ChatController(QObject):
         except Exception:
             # Do not break UX if saving fails
             self._conv_id = None
+
+    def _persist_user_with_attachments(self, text: str, attachments_meta: Optional[List[Dict]] = None) -> None:
+        if not self._save_enabled():
+            return
+        try:
+            self._ensure_conversation(text)
+            if not self._conv_id:
+                return
+            uid = int(self._session.current.user_id)  # type: ignore
+            dbo.add_message(
+                self._db,
+                conversation_id=int(self._conv_id),
+                sender_type="user",
+                sender_id=uid,
+                content=text,
+                metadata={"attachments": attachments_meta} if attachments_meta else None,
+            )
+        except Exception:
+            # do not break UX if persistence fails
+            pass
 
     # ---------- Configuration ----------
 
@@ -165,7 +185,7 @@ class ChatController(QObject):
         self.chat.set_streaming(True)
         self._active_ticket = self.broker.submit(self.stream_func, text)
 
-    def send_user_with_media(self, text: str, llm_parts: List[Dict]):
+    def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
         """
         Send a user turn that includes vision parts (base64 images).
         Keeps history text-only; media parts are passed just-in-time to the backend.
@@ -173,6 +193,7 @@ class ChatController(QObject):
         # record user text into rolling history (same as _on_user_text)
         self._history.append(ChatMessage(role="user", content=text))
         self._assistant_buf = []
+        self._persist_user_with_attachments(text, attachments_meta)
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
 
@@ -266,9 +287,14 @@ class ChatController(QObject):
         self._assistant_buf = []
         self._conv_id = int(conversation_id)
 
+        insert_offset = 0  # tracks extra rows added for thumbs so indices stay aligned
+        ui_row = -1
+
         for m in messages:
             sender = m.get("sender_type", "assistant")
             text = m.get("content", "") or ""
+            metadata = m.get("metadata") or {}
+            attachments = metadata.get("attachments") or []
             if not text:
                 continue
 
@@ -281,6 +307,33 @@ class ChatController(QObject):
                 role = "assistant"
 
             self._history.append(ChatMessage(role=role, content=text))
+            ui_row += 1
+
+            if role == "user" and attachments and getattr(self, "chat", None):
+                thumb_paths: list[str] = []
+                for att in attachments:
+                    thumb_id = att.get("thumb_file_id")
+                    file_id = att.get("file_id")
+                    path = None
+                    if thumb_id is not None and self._db is not None:
+                        try:
+                            path = dbo.cas_path_for_file(self._db, int(thumb_id))
+                        except Exception:
+                            path = None
+                    if path is None and file_id is not None and self._db is not None:
+                        try:
+                            path = dbo.cas_path_for_file(self._db, int(file_id))
+                        except Exception:
+                            path = None
+                    if path:
+                        thumb_paths.append(str(path))
+                if thumb_paths:
+                    try:
+                        target_row = ui_row + insert_offset
+                        self.chat.insert_thumbs_after(target_row, thumb_paths)
+                        insert_offset += 1
+                    except Exception:
+                        pass
 
     def hard_kill(self) -> bool:
         """

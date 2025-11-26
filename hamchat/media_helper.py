@@ -41,7 +41,10 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
     - user → CAS: insert-or-ignore by sha256; return file_id (requires db_ops)
     """
     results = {"stored": [], "thumbs": [], "llm_parts": []}
-    work_dir = tempfile.mkdtemp(prefix="hamchat_") if ephemeral else None
+    if not ephemeral and db is None:
+        # fail safe: without DB we fallback to temp-only handling
+        ephemeral = True
+    work_dir = tempfile.mkdtemp(prefix="hamchat_")
 
     for idx, p in enumerate(paths):
         src = p[7:] if p.lower().startswith("file://") else p
@@ -58,16 +61,23 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
         else:
             # CAS store via db_ops (implements de-dupe by sha256)
             from hamchat import db_ops as dbo
-            file_id = dbo.cas_put(db, sha256=sha, mime=mime, src_path=src)  # you’ll add this
+            file_id = dbo.cas_put(db, sha256=sha, mime=mime, src_path=src)
             stored_path = None
 
         # thumbnail
-        thumb_path = os.path.join(work_dir or os.path.dirname(src), f"thumb_{sha}.png")
+        thumb_path = os.path.join(work_dir, f"thumb_{sha}.png")
         _make_thumb(src, thumb_path, THUMB_SIZE)
+        thumb_sha = _sha256_file(thumb_path)
+        thumb_mime = "image/png"
+
+        if not ephemeral and db is not None:
+            thumb_file_id = dbo.cas_put(db, sha256=thumb_sha, mime=thumb_mime, src_path=thumb_path)
+        else:
+            thumb_file_id = None
 
         # llm part (base64 from the stored copy if ephemeral; else from src or cas fetch)
-        b64 = _to_base64(src) if ephemeral else _to_base64(src)  # CAS fetch raw if you prefer
+        b64 = _to_base64(src)  # CAS fetch raw if you prefer
         results["stored"].append({"file_id": file_id, "tmp_path": stored_path, "sha256": sha, "mime": mime})
-        results["thumbs"].append({"path": thumb_path, "w": THUMB_SIZE, "h": THUMB_SIZE})
+        results["thumbs"].append({"path": thumb_path, "w": THUMB_SIZE, "h": THUMB_SIZE, "file_id": thumb_file_id, "sha256": thumb_sha, "mime": thumb_mime})
         results["llm_parts"].append({"type": "image", "media_type": mime, "data_base64": b64})
     return results

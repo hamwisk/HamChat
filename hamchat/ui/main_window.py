@@ -756,6 +756,15 @@ class MainWindow(QMainWindow):
                                    session=self.session)
             parts = batch["llm_parts"]
             thumb_paths = [t["path"] for t in batch.get("thumbs", [])]
+            attachments_meta = []
+            for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
+                attachments_meta.append({
+                    "file_id": stored["file_id"],
+                    "sha256": stored["sha256"],
+                    "mime": stored["mime"],
+                    "thumb_file_id": thumb.get("file_id"),
+                    "thumb_sha256": thumb.get("sha256"),
+                })
         except Exception as e:
             self.statusBar().showMessage(f"Attachment processing failed: {e}", 6000)
             # As a last resort, send text so the user isn't blocked
@@ -765,7 +774,7 @@ class MainWindow(QMainWindow):
         if parts:
             if thumb_paths:
                 self.chat_display.draw_thumbs(thumb_paths)
-            self.chat_controller.send_user_with_media(text, parts)
+            self.chat_controller.send_user_with_media(text, parts, attachments_meta or None)
         else:
             self.chat_display.sig_send_text.emit(text)
 

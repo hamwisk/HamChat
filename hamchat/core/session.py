@@ -13,7 +13,7 @@ class Preferences:
     theme_variant: str = "dark"          # "light" | "dark"
     spellcheck_enabled: bool = True
     locale: str = "en_GB"
-    model_id: str = "mistral:latest"     # NEW: default LLM model
+    model_id: str = "gpt-oss:latest"     # NEW: default LLM model
 
 
 @dataclass
@@ -25,7 +25,7 @@ class SessionData:
     server_url: Optional[str] = None
     prefs: Preferences = Preferences()
     current_model: str = None
-    vision: bool = False
+    vision: bool = False                 # Is it 'False' though? Really... is it?
 
 
 class SessionManager(QObject):
@@ -41,7 +41,8 @@ class SessionManager(QObject):
         self.current.prefs.spellcheck_enabled = bool(settings.get("spellcheck_enabled", True))
         self.current.prefs.locale             = settings.get("locale", "en_GB")
         self.current.prefs.model_id           = settings.get("model_id", "gpt-oss:latest")
-        self.current.vision                   = False
+        # compute initial vision flag from model capabilities
+        self._refresh_current_capabilities()
         self.prefsChanged.emit(self.current.prefs)
 
     # --- Minimal auth/account helpers (MVP storage in Settings) ---
@@ -108,6 +109,8 @@ class SessionManager(QObject):
             user_id=None, username="Guest", role="guest",
             runtime_mode=cur.runtime_mode, server_url=cur.server_url, prefs=cur.prefs
         )
+        # Recompute capabilities for this session's model
+        self._refresh_current_capabilities()
         self.sessionChanged.emit(self.current)
 
     # called after a real login later
@@ -121,6 +124,9 @@ class SessionManager(QObject):
         p.spellcheck_enabled = user_prefs.get("spellcheck_enabled", p.spellcheck_enabled)
         p.locale             = user_prefs.get("locale", p.locale)
         p.model_id           = user_prefs.get("model_id", p.model_id)   # NEW
+        # NEW: recompute vision for this user's model
+        self._refresh_current_capabilities()
+
         self.sessionChanged.emit(self.current)
         self.prefsChanged.emit(self.current.prefs)
 
@@ -151,6 +157,15 @@ class SessionManager(QObject):
         caps = self.get_model_capabilities(model_id)
         self.set_model_vision(bool(caps.get("vision", False)))
         self.prefsChanged.emit(self.current.prefs)
+
+    def _refresh_current_capabilities(self) -> None:
+        """
+        Recompute capabilities (currently just 'vision') for the active model
+        and store them on self.current.
+        """
+        model_id = self.get_model_id()
+        caps = self.get_model_capabilities(model_id)
+        self.current.vision = bool(caps.get("vision", False))
 
     def get_model_choices(self) -> list[tuple[str, str]]:
         """

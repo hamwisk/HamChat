@@ -1,8 +1,9 @@
 # hamchat/app.py
 from __future__ import annotations
 import logging, sys
-from PyQt6.QtWidgets import QApplication
 import argparse, logging, os, platform
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QIcon
 from pathlib import Path
 from enum import Enum
 from multiprocessing import Process, Pipe
@@ -20,6 +21,13 @@ class RunMode(str, Enum):
     SOLO = "solo"      # 🥓 whole hog (local/solo)
     HAM = "ham"        # 🐖 server
     SNOUT = "snout"    # 🐽 agent
+
+def get_app_icon() -> QIcon:
+    # hamchat/app.py → parent is hamchat/, then /ui/ham_ico.ico
+    icon_path = Path(__file__).resolve().parent / "ui" / "ham_ico.ico"
+    if icon_path.exists():
+        return QIcon(str(icon_path))
+    return QIcon()
 
 def _resolve_mode(args: argparse.Namespace) -> RunMode:
     # Primary ham-themed flags
@@ -69,10 +77,12 @@ def parse_args() -> argparse.Namespace:
 def needs_local_init(mode: RunMode) -> bool:
     return mode in (RunMode.SOLO, RunMode.HAM)
 
-# --- stubs; wire your real implementations here ---
+# --- Runtime implementations here ---
 def run_solo(db_conn, db_mode_str):
     logging.getLogger("boot").info("Starting SOLO (🥓 whole hog) — launching MainWindow")
     app = QApplication(sys.argv)
+    app.setWindowIcon(get_app_icon())
+
     w = MainWindow(runtime_mode=RunMode.SOLO.value, db_conn=db_conn, db_mode=db_mode_str)
     w.show()
     app.exec()

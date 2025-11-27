@@ -95,9 +95,6 @@ class MainWindow(QMainWindow):
         self.session = SessionManager(app_cfg, self.runtime_mode, self.server_url)
         self.session.prefsChanged.connect(self._apply_prefs)
 
-        caps = self.session.get_model_capabilities(self.session.get_model_id())
-        self.session.set_model_vision(bool(caps.get("vision", False)))
-
         self.side_panel.bind_session(self.session)
 
         # Side panel: provide loaders for user-specific lists

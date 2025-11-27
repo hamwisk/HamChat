@@ -12,6 +12,7 @@ from hamchat import db_init as _dbi  # to reach _get_or_create_db_key()
 log = logging.getLogger("db.ops")
 
 DB_FILENAME = "ham_mem.db"
+CAS_MAGIC = b"HCAS1"
 
 Role = Literal["user", "admin"]
 SenderType = Literal["user", "assistant", "system", "tool"]
@@ -139,6 +140,28 @@ def decrypt_field(conn, ciphertext: bytes, nonce: bytes) -> str:
     aes = AESGCM(key)
     pt = aes.decrypt(nonce, ciphertext, None)
     return pt.decode("utf-8")
+
+def encrypt_bytes_for_cas(raw: bytes) -> tuple[bytes, bytes]:
+    """
+    Encrypt arbitrary bytes for CAS using AES-GCM and the existing field key.
+    Returns (ciphertext, nonce).
+    """
+    key = _field_key(existing_only=False)
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aes.encrypt(nonce, raw, None)
+    return ct, nonce
+
+def decrypt_bytes_for_cas(ciphertext: bytes, nonce: bytes) -> bytes:
+    """
+    Decrypt CAS bytes using AES-GCM and the existing field key.
+    Returns the raw plaintext bytes.
+    """
+    key = _field_key(existing_only=True)
+    if not key:
+        raise RuntimeError("Field key unavailable; cannot decrypt CAS content.")
+    aes = AESGCM(key)
+    return aes.decrypt(nonce, ciphertext, None)
 
 # ---------- users & auth ----------
 
@@ -401,11 +424,16 @@ def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
     cas_root = _data_dir() / "cas"
     cas_root.mkdir(parents=True, exist_ok=True)
     cas_path = cas_root / sha256
+    mode = read_db_mode(db)
 
     raw_bytes: Optional[bytes] = None
     if not cas_path.exists():
         raw_bytes = Path(src_path).read_bytes()
-        cas_path.write_bytes(raw_bytes)
+        if mode == "strict":
+            ct, nonce = encrypt_bytes_for_cas(raw_bytes)
+            cas_path.write_bytes(CAS_MAGIC + nonce + ct)
+        else:
+            cas_path.write_bytes(raw_bytes)
 
     sha_blob = bytes.fromhex(sha256)
     cur = db.cursor()
@@ -447,4 +475,25 @@ def cas_path_for_file(db, file_id: int) -> Optional[Path]:
     sha_hex = sha_blob.hex()
     cas_root = _data_dir() / "cas"
     path = cas_root / sha_hex
-    return path if path.exists() else None
+    if not path.exists():
+        return None
+
+    mode = read_db_mode(db)
+    if mode != "strict":
+        return path
+
+    data = path.read_bytes()
+    raw_bytes = data
+    if data.startswith(CAS_MAGIC) and len(data) >= len(CAS_MAGIC) + 12:
+        nonce = data[len(CAS_MAGIC):len(CAS_MAGIC) + 12]
+        ct = data[len(CAS_MAGIC) + 12:]
+        try:
+            raw_bytes = decrypt_bytes_for_cas(ct, nonce)
+        except Exception:
+            raw_bytes = b""
+
+    tmp_root = _data_dir() / "cas_tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_root / sha_hex
+    tmp_path.write_bytes(raw_bytes)
+    return tmp_path

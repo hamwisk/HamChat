@@ -312,21 +312,26 @@ class ChatController(QObject):
             if role == "user" and attachments and getattr(self, "chat", None):
                 thumb_paths: list[str] = []
                 for att in attachments:
-                    thumb_id = att.get("thumb_file_id")
-                    file_id = att.get("file_id")
-                    path = None
-                    if thumb_id is not None and self._db is not None:
-                        try:
-                            path = dbo.cas_path_for_file(self._db, int(thumb_id))
-                        except Exception:
-                            path = None
-                    if path is None and file_id is not None and self._db is not None:
-                        try:
-                            path = dbo.cas_path_for_file(self._db, int(file_id))
-                        except Exception:
-                            path = None
-                    if path:
-                        thumb_paths.append(str(path))
+                    if isinstance(att, dict):
+                        thumb_id = att.get("thumb_file_id")
+                        file_id = att.get("file_id")
+                        path = None
+                        if thumb_id is not None and self._db is not None:
+                            try:
+                                path = dbo.cas_path_for_file(self._db, int(thumb_id))
+                            except Exception:
+                                path = None
+                        if path is None and file_id is not None and self._db is not None:
+                            try:
+                                path = dbo.cas_path_for_file(self._db, int(file_id))
+                            except Exception:
+                                path = None
+                        if path:
+                            thumb_paths.append(str(path))
+                    elif isinstance(att, str):
+                        # Legacy metadata: att is already a filesystem path or file:// URL
+                        thumb_paths.append(att)
+
                 if thumb_paths:
                     try:
                         target_row = ui_row + insert_offset

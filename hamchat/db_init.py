@@ -30,7 +30,17 @@ def ensure_database_ready(data_dir: Path, *, update_settings: bool = True) -> in
     """Create/verify the database. Return 0 on success, 1 on fatal error.
     If update_settings=True, persist the effective db_mode into settings/app.json."""
     try:
+        # Ensure base data dir
         data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure CAS dirs exist early, so any code that assumes they're there
+        # (including weird first-run flows) doesn't silently misbehave.
+        cas_dir = data_dir / "cas"
+        cas_dir.mkdir(parents=True, exist_ok=True)
+
+        cas_tmp_dir = data_dir / "cas_tmp"
+        cas_tmp_dir.mkdir(parents=True, exist_ok=True)
+
         db_path = data_dir / DB_FILENAME
         settings_path = settings_dir().joinpath("app.json")
 

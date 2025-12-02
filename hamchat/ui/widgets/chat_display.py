@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Any, Optional
 from PyQt6.QtCore import pyqtSlot, Qt, QUrl, pyqtSignal, QAbstractListModel, QModelIndex, QVariant, QTimer
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLineEdit, QPushButton
 from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtQml import QQmlContext
@@ -157,6 +158,7 @@ class ChatDisplay(QWidget):
     sig_stop_requested = pyqtSignal()
     sig_file_dropped = pyqtSignal(str)
     sig_file_detected = pyqtSignal(str, str)
+    bubbleAction = pyqtSignal(str, int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -226,11 +228,20 @@ class ChatDisplay(QWidget):
         self._submit_text(self.input.toPlainText().strip())
 
     def _submit_text(self, text: str):
-        if not text or self._streaming:
+        # Don't allow submitting while streaming a response
+        if self._streaming:
             return
 
-        attachments = self._attachments.snapshot()  # snapshot first
-        self.append_message("user", text)
+        # Take a snapshot of attachments *before* we decide to bail
+        attachments = self._attachments.snapshot()
+
+        # Bail out only if there is no text AND no attachments
+        if (not text) and (not attachments):
+            return
+
+        # Only append a text bubble if there actually is text
+        if text:
+            self.append_message("user", text)
 
         # EMIT ONLY ONE of these:
         if attachments:
@@ -318,6 +329,26 @@ class ChatDisplay(QWidget):
         qml_dir = Path(__file__).resolve().parent / "qml"
         qml_dir.mkdir(parents=True, exist_ok=True)   # ensure path exists
         self.qml.setSource(QUrl.fromLocalFile(str(qml_dir / "ChatView.qml")))
+        self._wire_qml_signals()
+
+    def _wire_qml_signals(self):
+        root_obj = self.qml.rootObject()
+        if not root_obj:
+            return
+        try:
+            root_obj.bubbleActionRequested.disconnect(self._on_bubble_action)
+        except Exception:
+            pass
+        try:
+            root_obj.bubbleActionRequested.connect(self._on_bubble_action)
+        except Exception:
+            pass
+
+    def _on_bubble_action(self, action: str, index: int, role: str, text: str):
+        if action == "copy":
+            QGuiApplication.clipboard().setText(text or "")
+            return
+        self.bubbleAction.emit(action, index, role, text)
 
     def clear_messages(self):
         # make sure we're not in "Stop" state and no spinner lingers
@@ -353,4 +384,73 @@ class ChatDisplay(QWidget):
             return
         insert_at = max(0, row + 1)
         self._model.insert(insert_at, Msg("user", "", thumb_urls))
+        self._call_qml("ensureAtEnd")
+
+    # ---- helpers for bubble actions ----------------------------------------
+    def _normalize_paths(self, paths: list[str]) -> list[str]:
+        normed = []
+        for p in paths:
+            if not p:
+                continue
+            normed.append(p[7:] if p.lower().startswith("file://") else p)
+        return normed
+
+    def get_message_payload(self, index: int) -> Optional[dict]:
+        """
+        Return a logical message payload for the given bubble index, including any
+        attached thumbs that belong to the same user message.
+        """
+        items = getattr(self._model, "_items", [])
+        if not (0 <= index < len(items)):
+            return None
+
+        msg = items[index]
+        base_idx = index
+        text = msg.text or ""
+        attachments: list[str] = []
+
+        if msg.role == "user":
+            if not text:
+                for i in range(index - 1, -1, -1):
+                    prev = items[i]
+                    if prev.role == "user" and prev.text:
+                        base_idx = i
+                        text = prev.text
+                        break
+            if getattr(msg, "thumbs", None):
+                attachments.extend(msg.thumbs)
+            if 0 <= base_idx + 1 < len(items):
+                nxt = items[base_idx + 1]
+                if nxt.role == "user" and not nxt.text and getattr(nxt, "thumbs", None):
+                    attachments.extend(nxt.thumbs)
+            return {
+                "role": "user",
+                "text": text,
+                "attachments": self._normalize_paths(attachments),
+                "base_index": base_idx,
+            }
+
+        return {
+            "role": msg.role,
+            "text": text,
+            "attachments": [],
+            "base_index": base_idx,
+        }
+
+    def get_user_payload(self, index: int) -> Optional[dict]:
+        payload = self.get_message_payload(index)
+        if payload and payload.get("role") == "user":
+            return payload
+        for i in range(index - 1, -1, -1):
+            candidate = self.get_message_payload(i)
+            if candidate and candidate.get("role") == "user":
+                return candidate
+        return None
+
+    def set_pending_attachments(self, paths: list[str]) -> None:
+        """Populate the pending attachments model (used by edit & resend)."""
+        self.clear_attachments()
+        for p in self._normalize_paths(paths or []):
+            if not self._attachments.contains(p):
+                self._attachments.append_path(p)
         self._call_qml("ensureAtEnd")

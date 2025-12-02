@@ -8,6 +8,7 @@ from hamchat.infra.llm.base import ChatMessage
 from hamchat.infra.llm.backend_adapter import make_stream_func_from_client
 from hamchat import db_ops as dbo  # persistence API (create_conversation, add_message)
 from hamchat.core.session import SessionManager
+from hamchat.media_helper import process_images
 
 class ChatController(QObject):
     """
@@ -43,7 +44,7 @@ class ChatController(QObject):
         # ---- In-memory session history ----
         self._history: List[ChatMessage] = []
         self._assistant_buf: List[str] = []
-        self._max_turns: int = 256   # rolling window; adjust as needed
+        self._max_turns: int = 512   # rolling window; adjust as needed
         # ToDo set the max turns in the session, load it from app.json, or infer it from spec report maybe
 
         # ---- Persistence context (optional; enabled only for role='user') ----
@@ -126,13 +127,25 @@ class ChatController(QObject):
         """
 
         def _build_messages(prompt: str) -> List[ChatMessage]:
-            # window: keep last N turns (system messages optional; add if you have them)
-            hist = self._history[-self._max_turns * 2:]  # user+assistant pairs
-            return [*hist, ChatMessage(role="user", content=prompt)]
+            hist: List[ChatMessage] = []
+
+            for m in self._history[-self._max_turns * 2:]:
+                has_attachments = bool(m.metadata and m.metadata.get("attachments"))
+                has_text = bool(m.content)
+
+                # Only include a text message if there is actually text
+                if has_text:
+                    hist.append(ChatMessage(role=m.role, content=m.content))
+
+                # For any message with attachments, add a stub
+                if has_attachments:
+                    stub = self._attachment_stub_for_model(m.metadata["attachments"])
+                    if stub:
+                        hist.append(ChatMessage(role="user", content=stub))
+            return hist
 
         def _build_options() -> dict:
             return {"temperature": 0.7}
-            # ToDo expose this value to a slider or other suitable QObject in the AI profiles manager and load it from the session
 
         self.stream_func = make_stream_func_from_client(
             self._model_client,
@@ -188,12 +201,16 @@ class ChatController(QObject):
     def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
         """
         Send a user turn that includes vision parts (base64 images).
-        Keeps history text-only; media parts are passed just-in-time to the backend.
+        Media parts go to the backend via llm_parts; metadata tracks attachments for history.
         """
-        # record user text into rolling history (same as _on_user_text)
-        self._history.append(ChatMessage(role="user", content=text))
+        meta = {"attachments": attachments_meta} if attachments_meta else None
+
+        # Record user turn (even if text == "" for image-only)
+        self._history.append(ChatMessage(role="user", content=text or "", metadata=meta))
         self._assistant_buf = []
+
         self._persist_user_with_attachments(text, attachments_meta)
+
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
 
@@ -214,6 +231,7 @@ class ChatController(QObject):
             build_messages=build_messages,
             build_options=build_options,
         )
+
         self._active_ticket = self.broker.submit(stream_func, text)
 
     def _on_stop(self):
@@ -295,7 +313,7 @@ class ChatController(QObject):
             text = m.get("content", "") or ""
             metadata = m.get("metadata") or {}
             attachments = metadata.get("attachments") or []
-            if not text:
+            if not text and not attachments:
                 continue
 
             if sender == "user":
@@ -306,8 +324,13 @@ class ChatController(QObject):
                 # treat tool/assistant/anything-else as assistant in the LLM context
                 role = "assistant"
 
-            self._history.append(ChatMessage(role=role, content=text))
-            ui_row += 1
+            # Always put the logical message into _history if there's text or attachments.
+            # This keeps LLM context consistent for reloads.
+            self._history.append(ChatMessage(role=role, content=text or "", metadata=metadata))
+
+            # UI row index is only advanced when there's a visible text bubble
+            if text:
+                ui_row += 1
 
             if role == "user" and attachments and getattr(self, "chat", None):
                 thumb_paths: list[str] = []
@@ -340,6 +363,210 @@ class ChatController(QObject):
                     except Exception:
                         pass
 
+    def resend_message(self, index: int):
+        """MVP: called when user chooses 'Resend' from a bubble context menu."""
+        payload = self._get_user_payload(index)
+        if not payload:
+            return
+        text = payload.get("text") or ""
+        attachments = payload.get("attachments") or []
+
+        if attachments:
+            self._send_with_attachments(text, attachments)
+        else:
+            if not text:
+                return
+            self.chat.append_message("user", text)
+            self._on_user_text(text)
+
+    def regenerate_from(self, index: int):
+        """MVP: regenerate the assistant response for the user message at this index."""
+        payload = self._get_user_payload(index)
+        if not payload:
+            # Fallback: last user message in history
+            for m in reversed(self._history):
+                if m.role == "user":
+                    payload = {"text": m.content, "attachments": []}
+                    break
+        if not payload:
+            return
+
+        text = payload.get("text") or ""
+        attachments = payload.get("attachments") or []
+        if not text:
+            return
+
+        # Do not add another user bubble; just start a new assistant stream using the same prompt.
+        if attachments:
+            self._regenerate_with_attachments(text, attachments)
+            return
+
+        self._regenerate_text_only(text)
+
+    def fork_chat_at(self, index: int):
+        """MVP: create a new chat from history up to this index."""
+        # TODO: create a new conversation cloned up to this logical message, then switch UI to it.
+        print(f"Fork requested at bubble index {index}")
+
+    def _attachment_stub_for_model(self, attachments: list) -> str:
+        """
+        Build a short textual stub describing attachments for the LLM history, e.g.
+        "[User attached 2 image(s)]". Uses MIME buckets only.
+        """
+        if not attachments:
+            return ""
+
+        counts = {"image": 0, "audio": 0, "video": 0, "text": 0, "other": 0}
+
+        for att in attachments:
+            if isinstance(att, dict):
+                mime = (att.get("mime") or att.get("mime_type") or "").lower()
+                if mime.startswith("image/"):
+                    counts["image"] += 1
+                elif mime.startswith("audio/"):
+                    counts["audio"] += 1
+                elif mime.startswith("video/"):
+                    counts["video"] += 1
+                elif mime.startswith("text/"):
+                    counts["text"] += 1
+                else:
+                    counts["other"] += 1
+            else:
+                counts["other"] += 1
+
+        parts = []
+        if counts["image"]:
+            parts.append(f"{counts['image']} image(s)")
+        if counts["audio"]:
+            parts.append(f"{counts['audio']} audio file(s)")
+        if counts["video"]:
+            parts.append(f"{counts['video']} video file(s)")
+        if counts["text"]:
+            parts.append(f"{counts['text']} text file(s)")
+        if counts["other"]:
+            parts.append(f"{counts['other']} other file(s)")
+
+        if not parts:
+            return ""
+
+        return "[User attached " + ", ".join(parts) + "]"
+
+    # ---- helpers for bubble actions ----------------------------------------
+    def _get_user_payload(self, index: int) -> Optional[dict]:
+        try:
+            if hasattr(self.chat, "get_user_payload"):
+                return self.chat.get_user_payload(index)
+        except Exception:
+            return None
+        return None
+
+    def _send_with_attachments(self, text: str, attachments: list[str]) -> None:
+        if not attachments:
+            return
+        if text:
+            self.chat.append_message("user", text)
+        # If vision is unavailable, fall back to text-only send.
+        if not getattr(getattr(self._session, "current", None), "vision", False):
+            self._on_user_text(text)
+            return
+
+        try:
+            batch = process_images(
+                attachments,
+                ephemeral=(getattr(getattr(self._session, "current", None), "role", "guest") != "user"),
+                db=self._db,
+                session=self._session,
+            )
+            parts = batch["llm_parts"]
+            thumb_paths = [t["path"] for t in batch.get("thumbs", [])]
+            attachments_meta = []
+            for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
+                attachments_meta.append({
+                    "file_id": stored["file_id"],
+                    "sha256": stored["sha256"],
+                    "mime": stored["mime"],
+                    "thumb_file_id": thumb.get("file_id"),
+                    "thumb_sha256": thumb.get("sha256"),
+                })
+        except Exception:
+            parts, thumb_paths, attachments_meta = [], [], []
+
+        if not parts:
+            self._on_user_text(text)
+            return
+
+        if thumb_paths:
+            self.chat.draw_thumbs(thumb_paths)
+        self.send_user_with_media(text, parts, attachments_meta or None)
+
+    def _regenerate_text_only(self, text: str) -> None:
+        if not text:
+            return
+        regen_msg = ChatMessage(role="user", content=text)
+        self._history.append(regen_msg)
+
+        def _build_messages(_prompt: str) -> List[ChatMessage]:
+            hist: List[ChatMessage] = []
+            for m in self._history[-self._max_turns * 2:]:
+                has_attachments = bool(m.metadata and m.metadata.get("attachments"))
+                has_text = bool(m.content)
+
+                if has_text:
+                    hist.append(ChatMessage(role=m.role, content=m.content))
+                if has_attachments:
+                    stub = self._attachment_stub_for_model(m.metadata["attachments"])
+                    if stub:
+                        hist.append(ChatMessage(role="user", content=stub))
+            return hist
+
+        def _build_options() -> dict:
+            return {"temperature": 0.7}
+
+        stream_func = make_stream_func_from_client(
+            self._model_client,
+            model=self._model_name,
+            build_messages=_build_messages,
+            build_options=_build_options,
+        )
+        self._assistant_buf = []
+        self._active_row = self.chat.begin_assistant_stream()
+        self.chat.set_streaming(True)
+        self._active_ticket = self.broker.submit(stream_func, text)
+
+    def _regenerate_with_attachments(self, text: str, attachments: list[str]) -> None:
+        if not getattr(getattr(self._session, "current", None), "vision", False):
+            # Fallback: regenerate as text-only.
+            self._regenerate_text_only(text)
+            return
+
+        try:
+            batch = process_images(
+                attachments,
+                ephemeral=(getattr(getattr(self._session, "current", None), "role", "guest") != "user"),
+                db=self._db,
+                session=self._session,
+            )
+            parts = batch["llm_parts"]
+            attachments_meta = []
+            for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
+                attachments_meta.append({
+                    "file_id": stored["file_id"],
+                    "sha256": stored["sha256"],
+                    "mime": stored["mime"],
+                    "thumb_file_id": thumb.get("file_id"),
+                    "thumb_sha256": thumb.get("sha256"),
+                })
+        except Exception:
+            parts, attachments_meta = [], []
+
+        if not parts:
+            # No usable media; fall back to text-only regen
+            self._regenerate_text_only(text)
+            return
+
+        # Run a media-enabled request without adding new user bubbles to the UI.
+        self.send_user_with_media(text, parts, attachments_meta or None)
+
     def hard_kill(self) -> bool:
         """
         Best-effort kill switch for any background LLM work.
@@ -363,8 +590,6 @@ class ChatController(QObject):
             except Exception:
                 pass
 
-            print("ChatController.hard_kill(): broker queue cleared")
             return True
         except Exception as e:
-            print(f"ChatController.hard_kill(): error during shutdown: {e}")
             return False

@@ -1,12 +1,49 @@
 {
   "version": 1,
   "defaults_to": "text",
-  "families_multimodal": ["mllama", "gemma3", "idefics"],
-  "name_contains_multimodal": ["vision", "vl", "llava", "bakllava", "moondream"],
-  "regex_multimodal": [".*llama3\\.[12]-vision.*", ".*gemma3.*"],
+  "families_multimodal": [
+    "mllama",
+    "gemma3",
+    "idefics",
+    "qwen3",
+    "qwen2.5vl",
+    "llama4",   
+    "granite3.2",
+    "mistral-small3",
+    "moondream"
+  ],
+  "name_contains_multimodal": [
+    "vision",
+    "vl",
+    "llava",
+    "bakllava",
+    "moondream",
+    "qwen", 
+    "minicpm",  
+    "granite",  
+    "mistral-small"  
+  ],
+  "regex_multimodal": [
+    ".*llama3\\.[12]-vision.*",
+    ".*gemma3.*",
+    ".*qwen3-vl.*",  
+    ".*qwen2\\.5vl.*",   
+    ".*llama4.*",    
+    ".*granite3\\.2-vision.*",
+    ".*mistral-small3\\.1.*", 
+    ".*minicpm-v.*",
+    ".*deepseek-ocr.*"
+  ],
   "model_overrides": {
     "gemma3:latest": "multimodal",
-    "llama3.2-vision:latest": "multimodal"
+    "llama3.2-vision:latest": "multimodal",
+    "qwen3-vl:latest": "multimodal",   
+    "qwen2.5vl:latest": "multimodal",  
+    "llama4:latest": "multimodal", 
+    "granite3.2-vision:latest": "multimodal",
+    "mistral-small3.1:latest": "multimodal",
+    "minicpm-v:latest": "multimodal",
+    "deepseek-ocr:latest": "multimodal"
   }
 }
 

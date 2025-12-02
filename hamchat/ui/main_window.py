@@ -261,6 +261,7 @@ class MainWindow(QMainWindow):
 
         self.side_panel.request_login.connect(self._open_login_flow)
         self.side_panel.request_logout.connect(self._do_logout)
+        self.chat_display.bubbleAction.connect(self._on_bubble_action)
 
     def _init_theme(self):
         # Load + merge defaults (writes back if needed) then apply chosen variant
@@ -475,6 +476,32 @@ class MainWindow(QMainWindow):
     def _do_logout(self):
         self.session.logout()
         self._new_chat()
+
+    def _on_bubble_action(self, action, index, role, text):
+        if action == "edit_resend":
+            payload = None
+            try:
+                payload = self.chat_display.get_user_payload(index)
+            except Exception:
+                payload = None
+            if not payload:
+                return
+            self.chat_display.input.setPlainText(payload.get("text") or "")
+            try:
+                self.chat_display.set_pending_attachments(payload.get("attachments") or [])
+            except Exception:
+                pass
+            return
+
+        if not hasattr(self, "chat_controller"):
+            return
+
+        if action == "resend":
+            self.chat_controller.resend_message(index)
+        elif action == "regenerate":
+            self.chat_controller.regenerate_from(index)
+        elif action == "fork":
+            self.chat_controller.fork_chat_at(index)
 
     # ----------------- Settings helpers -----------------
 

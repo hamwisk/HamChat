@@ -4,8 +4,10 @@ import QtQuick.Controls 2.15
 
 Item {
   id: root
+  signal bubbleActionRequested(string action, int messageIndex, string role, string text)
   property string role: "assistant"
   property string text: ""
+  property int messageIndex: -1
   property var thumbs: []       // array of thumbnail URLs (file://)
   property var theme: ({})    // injected from Python; may be {}
 
@@ -139,6 +141,50 @@ Item {
         running: spinner.visible
       }
       onSpinAngleChanged: requestPaint()
+    }
+  }
+
+  MouseArea {
+    anchors.fill: parent
+    acceptedButtons: Qt.LeftButton | Qt.RightButton
+    hoverEnabled: true
+
+    onClicked: (mouse) => {
+      if (mouse.button === Qt.RightButton) {
+        contextMenu.popup()
+      }
+    }
+  }
+
+  Menu {
+    id: contextMenu
+
+    MenuItem {
+      text: "Copy"
+      onTriggered: root.bubbleActionRequested("copy", root.messageIndex, root.role, root.text)
+    }
+
+    MenuItem {
+      text: "Resend"
+      visible: root.isUser
+      onTriggered: root.bubbleActionRequested("resend", root.messageIndex, root.role, root.text)
+    }
+
+    MenuItem {
+      text: "Edit & resend"
+      visible: root.isUser
+      onTriggered: root.bubbleActionRequested("edit_resend", root.messageIndex, root.role, root.text)
+    }
+
+    MenuItem {
+      text: "Regenerate"
+      visible: !root.isUser && !root.isSystem
+      onTriggered: root.bubbleActionRequested("regenerate", root.messageIndex, root.role, root.text)
+    }
+
+    MenuItem {
+      text: "Fork from here"
+      onTriggered: root.bubbleActionRequested("fork", root.messageIndex, root.role, root.text)
     }
   }
 }

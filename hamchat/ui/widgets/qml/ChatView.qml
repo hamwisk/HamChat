@@ -4,6 +4,7 @@ import QtQuick.Controls 2.15
 
 Rectangle {
   id: root
+  signal bubbleActionRequested(string action, int messageIndex, string role, string text)
   color: (Theme && Theme.chat_bg) ? Theme.chat_bg : "#2B3037"
   anchors.fill: parent
 
@@ -39,11 +40,42 @@ Rectangle {
       thumbs: model.thumbs || []
       theme: Theme || ({})
       width: list.width
+      messageIndex: index
+
+      onBubbleActionRequested: function(action, messageIndex, role, text) {
+        root.bubbleActionRequested(action, messageIndex, role, text)
+      }
     }
 
     Component.onCompleted: { positionViewAtEnd(); stickToBottom = true; }
     onCountChanged:        { if (stickToBottom) positionViewAtEnd(); }
     onModelChanged:        { if (stickToBottom) positionViewAtEnd(); }
+
+    Rectangle {
+        id: scrollToBottomButton
+        width: 32
+        height: 32
+        radius: 16
+        color: "#555555"
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: 12
+        visible: list.contentHeight > list.height && !list.atYEnd
+        opacity: 0.9
+        z: 10
+
+        Text {
+            anchors.centerIn: parent
+            text: "↓"
+            color: "white"
+            font.pixelSize: 18
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: list.positionViewAtEnd()
+        }
+    }
 
   footer: Item {
   width: list.width

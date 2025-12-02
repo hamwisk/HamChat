@@ -214,5 +214,5 @@ __marimo__/
 data/
 
 # Generated settings files
-data/app.json
+settings/app.json
 settings/models.json

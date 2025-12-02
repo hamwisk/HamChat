@@ -7,6 +7,8 @@ from typing import Iterator, List, Dict, Optional
 class ChatMessage:
     role: str   # "user" | "assistant" | "system"
     content: str
+    metadata: dict | None = None
+
 
 @dataclass
 class StreamEvent:
@@ -15,6 +17,7 @@ class StreamEvent:
     finish_reason: Optional[str] = None
     usage: Optional[Dict] = None
     error: Optional[str] = None
+
 
 class ModelClient:
     """Abstract client."""

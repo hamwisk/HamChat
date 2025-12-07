@@ -1,5 +1,7 @@
 # hamchat/ui/chat_controller.py
 from __future__ import annotations
+import re
+from dataclasses import dataclass
 from typing import Optional, List, Dict
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
@@ -9,6 +11,13 @@ from hamchat.infra.llm.backend_adapter import make_stream_func_from_client
 from hamchat import db_ops as dbo  # persistence API (create_conversation, add_message)
 from hamchat.core.session import SessionManager
 from hamchat.media_helper import process_images
+
+
+@dataclass
+class HistoryEntry:
+    db_id: Optional[int]   # database messages.id, or None for unsaved/ephemeral
+    msg: ChatMessage
+
 
 class ChatController(QObject):
     """
@@ -23,6 +32,8 @@ class ChatController(QObject):
 
     # Fired when we lazily create a saved_conversations row for a user chat
     conversation_started = pyqtSignal(int)  # conversation_id
+    # Fired when we programmatically create a forked conversation and want the UI to open it
+    forked_conversation = pyqtSignal(int)   # conversation_id
 
     def __init__(        self,
         chat_display,
@@ -42,7 +53,7 @@ class ChatController(QObject):
         self._model_name = model_name
 
         # ---- In-memory session history ----
-        self._history: List[ChatMessage] = []
+        self._history: List[HistoryEntry] = []
         self._assistant_buf: List[str] = []
         self._max_turns: int = 512   # rolling window; adjust as needed
         # ToDo set the max turns in the session, load it from app.json, or infer it from spec report maybe
@@ -98,15 +109,22 @@ class ChatController(QObject):
             # Do not break UX if saving fails
             self._conv_id = None
 
-    def _persist_user_with_attachments(self, text: str, attachments_meta: Optional[List[Dict]] = None) -> None:
+    def _persist_user_with_attachments(
+        self,
+        text: str,
+        attachments_meta: Optional[List[Dict]] = None,
+    ) -> Optional[int]:
+        """
+        Persist a user message with attachments and return the DB message id, or None on failure.
+        """
         if not self._save_enabled():
-            return
+            return None
         try:
             self._ensure_conversation(text)
             if not self._conv_id:
-                return
+                return None
             uid = int(self._session.current.user_id)  # type: ignore
-            dbo.add_message(
+            mid = dbo.add_message(
                 self._db,
                 conversation_id=int(self._conv_id),
                 sender_type="user",
@@ -114,8 +132,63 @@ class ChatController(QObject):
                 content=text,
                 metadata={"attachments": attachments_meta} if attachments_meta else None,
             )
+            return int(mid)
         except Exception:
             # do not break UX if persistence fails
+            return None
+
+    # ---- helpers for forking ----------------------------------------
+
+    def _make_fork_title(self) -> str:
+        """
+        Generate a unique '... - Forked N' title based on the current conversation title.
+        """
+        if not self._db or not self._conv_id:
+            return "Forked chat"
+
+        cur = self._db.cursor()
+        cur.execute(
+            "SELECT title FROM saved_conversations WHERE id = ?",
+            (int(self._conv_id),),
+        )
+        row = cur.fetchone()
+        base = (row[0] if row and row[0] else "Untitled").strip()
+
+        # Extract root + existing fork number, if any.
+        m = re.match(r"^(.*?)(?:\s-\sForked\s(\d+))?$", base)
+        if m:
+            root = (m.group(1) or "").strip()
+            num = m.group(2)
+            n = int(num) + 1 if num is not None else 1
+        else:
+            root = base
+            n = 1
+
+        return f"{root} - Forked {n}"
+
+    def _clone_message_to_conversation(self, new_conv_id: int, row: Dict) -> None:
+        """
+        Clone a single message row (from list_messages) into a new conversation.
+        """
+        if not self._db:
+            return
+
+        sender_type = row.get("sender_type", "assistant")
+        sender_id = row.get("sender_id")
+        content = row.get("content") or ""
+        metadata = row.get("metadata") or None
+
+        try:
+            dbo.add_message(
+                self._db,
+                conversation_id=int(new_conv_id),
+                sender_type=sender_type,
+                sender_id=sender_id,
+                content=content,
+                metadata=metadata,
+            )
+        except Exception:
+            # Don't let a single bad row kill the fork.
             pass
 
     # ---------- Configuration ----------
@@ -129,7 +202,8 @@ class ChatController(QObject):
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
 
-            for m in self._history[-self._max_turns * 2:]:
+            for entry in self._history[-self._max_turns * 2:]:
+                m = entry.msg
                 has_attachments = bool(m.metadata and m.metadata.get("attachments"))
                 has_text = bool(m.content)
 
@@ -169,29 +243,61 @@ class ChatController(QObject):
     # ---------- Slots ----------
 
     def _on_user_text(self, text: str):
-        # Record user turn into the rolling history
-        self._history.append(ChatMessage(role="user", content=text))
-        self._assistant_buf = []  # reset buffer for this turn
+        """
+        Handle a plain-text user turn.
+
+        - Optionally grabs pending attachments from the UI (for metadata only).
+        - Persists to DB first (if enabled) and captures the message row id.
+        - Appends a ChatMessage with metadata for attachments.
+        """
+        # Reset assistant buffer for this turn
+        self._assistant_buf = []
+
+        # Optional metadata: include pending attachments if any
+        attachments_meta: List[Dict] = []
+        if hasattr(self.chat, "get_pending_attachments"):
+            try:
+                attachments_meta = self.chat.get_pending_attachments() or []
+            except Exception:
+                attachments_meta = []
+
+        base_meta: Optional[Dict] = {"attachments": attachments_meta} if attachments_meta else None
 
         # --- Persistence: create conversation (first turn) + save user message
+        msg_db_id: Optional[int] = None
         if self._save_enabled():
             try:
-                # Create conversation on first user msg
                 self._ensure_conversation(text)
                 if self._conv_id:
-                    # optional metadata: include pending attachments if any
-                    attachments = self.chat.get_pending_attachments() if hasattr(self.chat, "get_pending_attachments") else []
-                    dbo.add_message(
+                    msg_db_id = dbo.add_message(
                         self._db,
-                        conversation_id=self._conv_id,
+                        conversation_id=int(self._conv_id),
                         sender_type="user",
                         sender_id=int(self._session.current.user_id),  # type: ignore
                         content=text,
-                        metadata={"attachments": attachments} if attachments else None,
+                        metadata=base_meta,
                     )
+                    if msg_db_id is not None:
+                        msg_db_id = int(msg_db_id)
             except Exception:
                 # ignore persistence errors; keep chat flowing
-                pass
+                msg_db_id = None
+
+        # Build metadata for in-memory history (attachments only)
+        msg_metadata: Optional[Dict] = dict(base_meta) if base_meta else None
+
+        # Record user turn into the rolling history
+        msg = ChatMessage(
+            role="user",
+            content=text,
+            metadata=msg_metadata or None,   # attachments only
+        )
+        self._history.append(
+            HistoryEntry(
+                db_id=msg_db_id,
+                msg=msg,
+            )
+        )
 
         # Prepare UI row and kick off background job
         self._active_row = self.chat.begin_assistant_stream()
@@ -203,20 +309,35 @@ class ChatController(QObject):
         Send a user turn that includes vision parts (base64 images).
         Media parts go to the backend via llm_parts; metadata tracks attachments for history.
         """
-        meta = {"attachments": attachments_meta} if attachments_meta else None
+        # Persist first (if enabled) and capture DB row id
+        msg_db_id = self._persist_user_with_attachments(text, attachments_meta)
+
+        # Build metadata for in-memory ChatMessage
+        meta: Dict = {}
+        if attachments_meta:
+            meta["attachments"] = attachments_meta
 
         # Record user turn (even if text == "" for image-only)
-        self._history.append(ChatMessage(role="user", content=text or "", metadata=meta))
+        msg = ChatMessage(
+            role="user",
+            content=text or "",
+            metadata=meta or None,
+        )
+        self._history.append(
+            HistoryEntry(
+                db_id=msg_db_id,
+                msg=msg,
+            )
+        )
         self._assistant_buf = []
-
-        self._persist_user_with_attachments(text, attachments_meta)
 
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
 
         # submit a one-off stream function that wraps the standard messages/options
         def build_messages(prompt: str) -> List[ChatMessage]:
-            hist = self._history[-self._max_turns * 2:]
+            hist_entries = self._history[-self._max_turns * 2:]
+            hist = [entry.msg for entry in hist_entries]
             # replace the last (just-appended) user turn with a copy that has .parts
             msg = ChatMessage(role="user", content=prompt)
             setattr(msg, "parts", llm_parts)  # <-- important: keep it an object
@@ -249,20 +370,29 @@ class ChatController(QObject):
         # Commit assistant turn iff we received any content
         if self._assistant_buf:
             final_text = "".join(self._assistant_buf)
-            self._history.append(ChatMessage(role="assistant", content=final_text))
-            # --- Persistence: save assistant message
+            msg_db_id: Optional[int] = None
             if self._save_enabled() and self._conv_id:
                 try:
-                    dbo.add_message(
-                        self._db,
-                        conversation_id=self._conv_id,
-                        sender_type="assistant",
-                        sender_id=None,
-                        content=final_text,
-                        metadata=None,
+                    msg_db_id = int(
+                        dbo.add_message(
+                            self._db,
+                            conversation_id=int(self._conv_id),
+                            sender_type="assistant",
+                            sender_id=None,
+                            content=final_text,
+                            metadata=None,
+                        )
                     )
                 except Exception:
-                    pass
+                    msg_db_id = None
+
+            msg = ChatMessage(role="assistant", content=final_text)
+            self._history.append(
+                HistoryEntry(
+                    db_id=msg_db_id,
+                    msg=msg,
+                )
+            )
         self._assistant_buf = []
 
         self.chat.set_streaming(False)
@@ -309,9 +439,11 @@ class ChatController(QObject):
         ui_row = -1
 
         for m in messages:
+            msg_db_id = m.get("id")
             sender = m.get("sender_type", "assistant")
             text = m.get("content", "") or ""
             metadata = m.get("metadata") or {}
+            metadata = dict(metadata)
             attachments = metadata.get("attachments") or []
             if not text and not attachments:
                 continue
@@ -321,12 +453,17 @@ class ChatController(QObject):
             elif sender == "system":
                 role = "system"
             else:
-                # treat tool/assistant/anything-else as assistant in the LLM context
                 role = "assistant"
 
             # Always put the logical message into _history if there's text or attachments.
             # This keeps LLM context consistent for reloads.
-            self._history.append(ChatMessage(role=role, content=text or "", metadata=metadata))
+            msg = ChatMessage(role=role, content=text or "", metadata=metadata or None)
+            self._history.append(
+                HistoryEntry(
+                    db_id=int(msg_db_id) if msg_db_id is not None else None,
+                    msg=msg,
+                )
+            )
 
             # UI row index is only advanced when there's a visible text bubble
             if text:
@@ -364,49 +501,252 @@ class ChatController(QObject):
                         pass
 
     def resend_message(self, index: int):
-        """MVP: called when user chooses 'Resend' from a bubble context menu."""
+        """Resend from this user message: truncate after it, then replay it."""
         payload = self._get_user_payload(index)
         if not payload:
             return
+
         text = payload.get("text") or ""
         attachments = payload.get("attachments") or []
+        msg_id = payload.get("message_id")
+        base_index = payload.get("base_index")
 
+        # 1) Persisted truncate (if we have a real conversation + message id)
+        if self._save_enabled() and self._db is not None and self._conv_id and msg_id:
+            try:
+                dbo.delete_many_messages(
+                    self._db,
+                    conversation_id=int(self._conv_id),
+                    message_id=int(msg_id),
+                )
+            except Exception:
+                pass
+
+        # Keep in-memory history consistent with DB
+        try:
+            self._truncate_history_from_message_id(int(msg_id))
+        except Exception:
+            pass
+
+        # 2) Update the UI to remove all message bubbles from this logical message onward
+        if isinstance(base_index, int):
+            try:
+                self.chat.truncate_messages_from(base_index)
+            except Exception:
+                pass
+
+        # 3) Resend payload
         if attachments:
             self._send_with_attachments(text, attachments)
         else:
             if not text:
                 return
+            # Append a new user bubble and stream as usual
             self.chat.append_message("user", text)
             self._on_user_text(text)
 
     def regenerate_from(self, index: int):
-        """MVP: regenerate the assistant response for the user message at this index."""
+        """
+        Regenerate an assistant reply by treating this as a 'resend' of the
+        corresponding user message. The ChatDisplay payload resolver will walk
+        backwards from this bubble to find the right user turn.
+        """
+        self.resend_message(index)
+
+    def prepare_edit_resend(self, index: int) -> Optional[dict]:
+        """
+        Prepare an 'edit & resend' operation:
+
+        - Find the logical user payload for this bubble index
+          (text + attachments + db message id).
+        - Truncate the DB conversation tail starting at that message.
+        - Truncate the UI bubbles from the logical base_index onward.
+        - Return a payload dict with 'text' and 'attachments' for the caller
+          to stuff back into the input field.
+
+        Unlike resend_message(), this does NOT actually send anything.
+        """
         payload = self._get_user_payload(index)
         if not payload:
-            # Fallback: last user message in history
-            for m in reversed(self._history):
-                if m.role == "user":
-                    payload = {"text": m.content, "attachments": []}
-                    break
-        if not payload:
-            return
+            return None
 
         text = payload.get("text") or ""
         attachments = payload.get("attachments") or []
-        if not text:
-            return
+        msg_id = payload.get("message_id")
+        base_index = payload.get("base_index")
 
-        # Do not add another user bubble; just start a new assistant stream using the same prompt.
-        if attachments:
-            self._regenerate_with_attachments(text, attachments)
-            return
+        # 1) Persisted truncate (if we have a real conversation + message id)
+        if self._save_enabled() and self._db is not None and self._conv_id and msg_id:
+            try:
+                dbo.delete_many_messages(
+                    self._db,
+                    conversation_id=int(self._conv_id),
+                    message_id=int(msg_id),
+                )
+            except Exception:
+                pass
 
-        self._regenerate_text_only(text)
+        try:
+            self._truncate_history_from_message_id(int(msg_id))
+        except Exception:
+            pass
+
+        # 2) Update the UI to remove all message bubbles from this logical message onward
+        if isinstance(base_index, int):
+            try:
+                self.chat.truncate_messages_from(base_index)
+            except Exception:
+                pass
+
+        return {
+            "text": text,
+            "attachments": attachments,
+        }
 
     def fork_chat_at(self, index: int):
-        """MVP: create a new chat from history up to this index."""
-        # TODO: create a new conversation cloned up to this logical message, then switch UI to it.
-        print(f"Fork requested at bubble index {index}")
+        """
+        Fork the current conversation at a given bubble index.
+
+        - If the selected bubble belongs to a *user* message:
+            * New conversation is created with history up to *before* that user message.
+            * The selected user message's text + attachments are put into the input
+              (like edit_resend), ready to send in the fork.
+
+        - If the selected bubble is an *assistant* message:
+            * New conversation is created with history up to and including that
+              assistant message.
+        """
+        # Must be a real, persisted user conversation, otherwise we're just resending the message.
+        if not self._save_enabled() or not self._db or not self._conv_id:
+            self.resend_message(index)
+            return
+        if not self._session or self._session.current.user_id is None:
+            return
+
+        # Get the raw payload so we know which role we're forking on.
+        try:
+            if not hasattr(self.chat, "get_message_payload"):
+                return
+            raw_payload = self.chat.get_message_payload(index)
+        except Exception:
+            return
+
+        if not raw_payload:
+            return
+
+        role = raw_payload.get("role") or ""
+        if role not in ("user", "assistant"):
+            # Only user/assistant bubbles make sense to fork from.
+            return
+
+        # For user forks we also want the logical user payload (text + attachments + msg_id)
+        user_payload: Optional[dict] = None
+        pivot_msg_id: Optional[int] = None
+
+        if role == "user":
+            # This resolves image bubbles into their logical text+attachments user turn.
+            user_payload = self._get_user_payload(index)
+            if not user_payload or user_payload.get("role") != "user":
+                return
+            pivot_msg_id = user_payload.get("message_id")
+            base_index = user_payload.get("base_index")
+        else:
+            # Assistant fork: pivot is the assistant message itself.
+            base_index = raw_payload.get("base_index", index)
+
+        # Map base_index → HistoryEntry → db_id, if we don't already have it.
+        if pivot_msg_id is None:
+            if not isinstance(base_index, int):
+                return
+            if not (0 <= base_index < len(self._history)):
+                return
+            entry = self._history[base_index]
+            pivot_msg_id = entry.db_id
+
+        if pivot_msg_id is None:
+            # Message isn't in DB (unsaved / ephemeral thread) → nothing to fork.
+            return
+
+        # Create the forked conversation with an appropriate title.
+        uid = int(self._session.current.user_id)  # type: ignore
+        new_title = self._make_fork_title()
+        try:
+            new_conv_id = dbo.create_conversation(self._db, user_id=uid, title=new_title)
+        except Exception:
+            return
+
+        # Copy messages from the old conversation up to the pivot.
+        include_pivot = (role == "assistant")
+        try:
+            rows = dbo.list_messages(self._db, int(self._conv_id), limit=1000000)
+        except Exception:
+            rows = []
+
+        for row in rows:
+            mid = row.get("id")
+            if mid is None:
+                continue
+
+            if mid < pivot_msg_id:
+                self._clone_message_to_conversation(new_conv_id, row)
+            elif mid == pivot_msg_id:
+                if include_pivot:
+                    self._clone_message_to_conversation(new_conv_id, row)
+                break
+            else:
+                break
+
+        # Load the new conversation into controller + UI.
+        try:
+            new_rows = dbo.list_messages(self._db, int(new_conv_id), limit=1000000)
+        except Exception:
+            new_rows = []
+
+        # Notify UI: new conversation exists & should be opened.
+        # conversation_started → refresh chats list / badges.
+        try:
+            self.conversation_started.emit(int(new_conv_id))
+        except Exception:
+            pass
+
+        # forked_conversation → MainWindow._open_conversation (draw bubbles + attach controller)
+        try:
+            self.forked_conversation.emit(int(new_conv_id))
+        except Exception:
+            pass
+
+        # For user forks: behave like edit_resend on the forked convo:
+        # pre-fill the input and pending attachments, but don't send yet.
+        if role == "user" and user_payload:
+            text = user_payload.get("text") or ""
+            attachments = user_payload.get("attachments") or []
+            try:
+                self.chat.input.setPlainText(text)
+            except Exception:
+                pass
+            try:
+                if hasattr(self.chat, "set_pending_attachments"):
+                    self.chat.set_pending_attachments(attachments)
+            except Exception:
+                pass
+
+    def _truncate_history_from_message_id(self, message_id: int) -> None:
+        """
+        Drop all history entries whose db_id is >= message_id.
+        Keeps in-memory context aligned with the DB after truncation.
+        """
+        if not self._history:
+            return
+
+        cutoff = None
+        for i, entry in enumerate(self._history):
+            db_id = entry.db_id
+            if db_id is not None and db_id >= message_id:
+                cutoff = i
+                break
+
+        if cutoff is not None:
+            self._history = self._history[:cutoff]
 
     def _attachment_stub_for_model(self, attachments: list) -> str:
         """
@@ -453,12 +793,42 @@ class ChatController(QObject):
 
     # ---- helpers for bubble actions ----------------------------------------
     def _get_user_payload(self, index: int) -> Optional[dict]:
+        """
+        Ask the ChatDisplay for the logical payload for a bubble index, then
+        enrich it with our DB message id (if we have one) via HistoryEntry.
+
+        We assume ChatDisplay.get_user_payload(index) returns at least:
+            {
+                "role": "user" | "assistant" | ...,
+                "text": str,
+                "attachments": list,
+                "base_index": int,   # logical message index in history
+                ...
+            }
+        """
         try:
-            if hasattr(self.chat, "get_user_payload"):
-                return self.chat.get_user_payload(index)
+            if not hasattr(self.chat, "get_user_payload"):
+                return None
+            payload = self.chat.get_user_payload(index)
         except Exception:
             return None
-        return None
+
+        if not payload:
+            return None
+
+        # Only care about user messages for delete/resend/regenerate.
+        if payload.get("role") != "user":
+            return payload
+
+        base_index = payload.get("base_index")
+        if isinstance(base_index, int):
+            if 0 <= base_index < len(self._history):
+                entry = self._history[base_index]
+                if entry.db_id is not None:
+                    # Attach the DB id so callers can use it.
+                    payload["message_id"] = entry.db_id
+
+        return payload
 
     def _send_with_attachments(self, text: str, attachments: list[str]) -> None:
         if not attachments:
@@ -503,11 +873,17 @@ class ChatController(QObject):
         if not text:
             return
         regen_msg = ChatMessage(role="user", content=text)
-        self._history.append(regen_msg)
+        self._history.append(
+            HistoryEntry(
+                db_id=None,          # this regen helper user message is not a new DB row
+                msg=regen_msg,
+            )
+        )
 
         def _build_messages(_prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
-            for m in self._history[-self._max_turns * 2:]:
+            for entry in self._history[-self._max_turns * 2:]:
+                m = entry.msg
                 has_attachments = bool(m.metadata and m.metadata.get("attachments"))
                 has_text = bool(m.content)
 

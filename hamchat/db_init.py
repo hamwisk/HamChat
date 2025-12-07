@@ -476,6 +476,19 @@ CREATE TABLE IF NOT EXISTS files (
   ref_count INTEGER DEFAULT 0, created INTEGER
 );
 
+-- Link table between messages and files (attachments, thumbs, etc.)
+CREATE TABLE IF NOT EXISTS message_files (
+  message_id INTEGER NOT NULL
+    REFERENCES messages(id) ON DELETE CASCADE,
+  file_id INTEGER NOT NULL
+    REFERENCES files(id) ON DELETE CASCADE,
+  role TEXT,  -- 'attachment', 'thumb', etc.
+  PRIMARY KEY (message_id, file_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_files_file
+  ON message_files(file_id);
+
 -- Admin-only governance
 CREATE TABLE IF NOT EXISTS org_policy (
   id INTEGER PRIMARY KEY CHECK(id=1),
@@ -532,6 +545,24 @@ BEGIN
 END;
 """
 
+DDL_REFCOUNT_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS trg_message_files_ins
+AFTER INSERT ON message_files
+BEGIN
+  UPDATE files
+  SET ref_count = ref_count + 1
+  WHERE id = NEW.file_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_message_files_del
+AFTER DELETE ON message_files
+BEGIN
+  UPDATE files
+  SET ref_count = ref_count - 1
+  WHERE id = OLD.file_id;
+END;
+"""
+
 def _create_schema(conn, mode: str) -> None:
     cur = conn.cursor()
     cur.executescript(DDL_CORE)
@@ -543,3 +574,5 @@ def _create_schema(conn, mode: str) -> None:
     # strict guard rails
     if mode == "strict":
         cur.executescript(DDL_STRICT_TRIGGERS)
+    # ref_count maintenance for files via message_files
+    cur.executescript(DDL_REFCOUNT_TRIGGERS)

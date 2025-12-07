@@ -17,15 +17,18 @@ CAS_MAGIC = b"HCAS1"
 Role = Literal["user", "admin"]
 SenderType = Literal["user", "assistant", "system", "tool"]
 
+
 # ---------- password hashing (scrypt) ----------
 
 def _hash_password(plain: str, salt: bytes) -> bytes:
     # scrypt(N=2^14, r=8, p=1) → 32 bytes (adjustable later)
     return hashlib.scrypt(plain.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
 
+
 def _verify_password(plain: str, salt: bytes, expect_hash: bytes) -> bool:
     trial = _hash_password(plain, salt)
     return hmac.compare_digest(trial, expect_hash)
+
 
 # ---------- connection handling ----------
 
@@ -35,6 +38,12 @@ def _data_dir() -> Path:
     d = root / "data"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _apply_runtime_pragmas(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("PRAGMA foreign_keys=ON;")
+
 
 def init_and_open() -> Tuple[sqlite3.Connection, str]:
     """
@@ -52,6 +61,7 @@ def init_and_open() -> Tuple[sqlite3.Connection, str]:
     # 1) try plain sqlite
     try:
         conn = sqlite3.connect(db_path)
+        _apply_runtime_pragmas(conn)
         cur = conn.cursor()
         cur.execute("PRAGMA integrity_check;")
         if cur.fetchone()[0] == "ok":
@@ -74,6 +84,7 @@ def init_and_open() -> Tuple[sqlite3.Connection, str]:
         raise RuntimeError("Encrypted DB but no key available in keyring/ENV.")
 
     conn = sqlcipher.connect(str(db_path))  # type: ignore
+    _apply_runtime_pragmas(conn)
     cur = conn.cursor()
     # mirror your PRAGMA setup
     cur.execute(f"PRAGMA key = \"x'{key.hex()}'\";")
@@ -81,8 +92,10 @@ def init_and_open() -> Tuple[sqlite3.Connection, str]:
     cur.execute("PRAGMA kdf_iter = 256000;")
     cur.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA512;")
     cur.execute("PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;")
-    try: cur.execute("PRAGMA cipher_memory_security = ON;")
-    except Exception: pass
+    try:
+        cur.execute("PRAGMA cipher_memory_security = ON;")
+    except Exception:
+        pass
 
     # confirm readable and fetch exact mode from meta
     cur.execute("SELECT value FROM meta WHERE key='db_mode';")
@@ -92,8 +105,10 @@ def init_and_open() -> Tuple[sqlite3.Connection, str]:
     mode = row[0]
     return conn, mode
 
+
 def _mode_from_cfg(cfg: dict) -> str:
     return (cfg.get("security", {}).get("mode") or "lite").lower()
+
 
 def open_by_detection(data_dir: Path):
     """
@@ -103,20 +118,24 @@ def open_by_detection(data_dir: Path):
     conn, meta_mode = init_and_open()  # this already tries sqlite → sqlcipher
     return conn, meta_mode
 
+
 # ---------- tiny helpers ----------
 
 def _now() -> int:
     return int(time.time())
 
+
 def _one(c) -> Optional[Any]:
     r = c.fetchone()
     return r[0] if r else None
+
 
 def _field_key(existing_only: bool = False) -> bytes:
     k = _dbi._get_or_create_field_key(existing_only=existing_only)
     if not k:
         raise RuntimeError("Field key unavailable; strict mode requires HC_KEY_FIELD or keyring.")
     return k
+
 
 def encrypt_field(conn, plaintext: str) -> tuple[bytes, bytes]:
     """
@@ -128,6 +147,7 @@ def encrypt_field(conn, plaintext: str) -> tuple[bytes, bytes]:
     nonce = os.urandom(12)
     ct = aes.encrypt(nonce, plaintext.encode("utf-8"), None)
     return ct, nonce
+
 
 def decrypt_field(conn, ciphertext: bytes, nonce: bytes) -> str:
     """
@@ -141,6 +161,7 @@ def decrypt_field(conn, ciphertext: bytes, nonce: bytes) -> str:
     pt = aes.decrypt(nonce, ciphertext, None)
     return pt.decode("utf-8")
 
+
 def encrypt_bytes_for_cas(raw: bytes) -> tuple[bytes, bytes]:
     """
     Encrypt arbitrary bytes for CAS using AES-GCM and the existing field key.
@@ -152,6 +173,7 @@ def encrypt_bytes_for_cas(raw: bytes) -> tuple[bytes, bytes]:
     ct = aes.encrypt(nonce, raw, None)
     return ct, nonce
 
+
 def decrypt_bytes_for_cas(ciphertext: bytes, nonce: bytes) -> bytes:
     """
     Decrypt CAS bytes using AES-GCM and the existing field key.
@@ -162,6 +184,7 @@ def decrypt_bytes_for_cas(ciphertext: bytes, nonce: bytes) -> bytes:
         raise RuntimeError("Field key unavailable; cannot decrypt CAS content.")
     aes = AESGCM(key)
     return aes.decrypt(nonce, ciphertext, None)
+
 
 # ---------- users & auth ----------
 
@@ -184,8 +207,10 @@ def create_user(conn, *, name: str, handle: str, email: Optional[str],
     conn.commit()
     return user_id
 
+
 def probe_admin_exists(conn) -> bool:
     return count_admins(conn) > 0
+
 
 def authenticate(conn, *, username: str, password: str) -> Optional[Tuple[int, str, Dict[str, Any]]]:
     cur = conn.cursor()
@@ -210,10 +235,12 @@ def authenticate(conn, *, username: str, password: str) -> Optional[Tuple[int, s
     conn.commit()
     return user_id, role, prefs
 
+
 def set_user_role(conn, user_id: int, role: Role) -> None:
     cur = conn.cursor()
     cur.execute("UPDATE user_auth SET role=?, updated=? WHERE id=?", (role, _now(), user_id))
     conn.commit()
+
 
 def delete_user(conn, user_id: int) -> None:
     # Probably should remove this one and use the "safe" variant `delete_user_safe()`
@@ -221,6 +248,7 @@ def delete_user(conn, user_id: int) -> None:
     cur = conn.cursor()
     cur.execute("DELETE FROM user_profiles WHERE id=?", (user_id,))
     conn.commit()
+
 
 # --- Signup request queue ---
 
@@ -239,6 +267,7 @@ def submit_signup_request(conn, *, name: str, handle: str, username: str,
     conn.commit()
     return rid
 
+
 def list_signup_requests(conn, *, status: str = "pending", limit: int = 100):
     cur = conn.cursor()
     cur.execute(
@@ -249,10 +278,13 @@ def list_signup_requests(conn, *, status: str = "pending", limit: int = 100):
     rows = cur.fetchall()
     return [dict(id=r[0], name=r[1], handle=r[2], username=r[3], email=r[4], created=r[5], status=r[6]) for r in rows]
 
+
 def approve_signup_request(conn, *, request_id: int, admin_user_id: int) -> int:
     # promote into real user tables atomically
     cur = conn.cursor()
-    cur.execute("SELECT name, handle, username, email, pw_salt, pw_hash FROM signup_requests WHERE id=? AND status='pending'", (request_id,))
+    cur.execute(
+        "SELECT name, handle, username, email, pw_salt, pw_hash FROM signup_requests WHERE id=? AND status='pending'",
+        (request_id,))
     row = cur.fetchone()
     if not row:
         raise ValueError("Request not found or not pending")
@@ -276,24 +308,21 @@ def approve_signup_request(conn, *, request_id: int, admin_user_id: int) -> int:
         conn.rollback()
         raise
 
+
 def reject_signup_request(conn, *, request_id: int, admin_user_id: int, note: str = "") -> None:
     cur = conn.cursor()
     cur.execute("UPDATE signup_requests SET status='rejected', decided_by=?, decided_at=?, note=? "
                 "WHERE id=? AND status='pending'", (admin_user_id, _now(), note, request_id))
     conn.commit()
 
+
 def count_admins(conn) -> int:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM user_auth WHERE role='admin'")
     return int(cur.fetchone()[0])
 
+
 def delete_user_safe(conn, user_id: int) -> None:
-    # FK cascade chain: user_profiles.id → saved_conversations.user_id (ON DELETE CASCADE)
-    # → messages.conversation_id (ON DELETE CASCADE). user_auth.id and access_grants.grantee_user_id
-    # also cascade from user_profiles. files has no FK usage; attachments live in messages.metadata JSON.
-    # Deleting a user_profile cascades conversations/messages at the DB level, but attachment refcounts
-    # still need explicit cleanup if we add it here later.
-    # Don’t allow deletion of the last admin.
     # ToDo: Future - Check for custom AI profiles linked with this user and remove them
     cur = conn.cursor()
     cur.execute("SELECT role FROM user_auth WHERE id=?", (user_id,))
@@ -302,6 +331,7 @@ def delete_user_safe(conn, user_id: int) -> None:
         raise RuntimeError("Cannot delete the last admin.")
     cur.execute("DELETE FROM user_profiles WHERE id=?", (user_id,))
     conn.commit()
+
 
 # ---------- conversations & messages ----------
 
@@ -315,6 +345,7 @@ def create_conversation(conn, user_id: int, title: str) -> int:
     conn.commit()
     return conv_id
 
+
 def rename_conversation(conn, conversation_id: int, title: str) -> None:
     """
     Update the title of a saved conversation.
@@ -326,28 +357,19 @@ def rename_conversation(conn, conversation_id: int, title: str) -> None:
     )
     conn.commit()
 
-def delete_conversation(conn, conversation_id: int) -> None:
-    """
-    Delete a saved conversation and all of its messages.
-    """
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM messages WHERE conversation_id = ?", (int(conversation_id),))
-    rows = cur.fetchall()
-    for row in rows:
-        delete_message(conn, int(row[0]))
-    cur.execute("DELETE FROM saved_conversations WHERE id = ?", (int(conversation_id),))
-    conn.commit()
-    try:
-        orphan_sweep(cas_sweep=True)
-    except Exception:
-        log.exception("orphan_sweep failed after deleting conversation %s", conversation_id)
 
 def add_message(conn, conversation_id: int, sender_type: SenderType,
                 sender_id: Optional[int], content: str,
                 metadata: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Insert a message row and link any attachment files via message_files.
+    Returns the new messages.id.
+    """
     meta_json = json.dumps(metadata or {})
     mode = read_db_mode(conn)
     cur = conn.cursor()
+
+    # 1) Insert message row (encrypted or plaintext depending on mode)
     if mode == "strict":
         ct, nonce = encrypt_field(conn, content)
         cur.execute(
@@ -361,63 +383,76 @@ def add_message(conn, conversation_id: int, sender_type: SenderType,
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (conversation_id, sender_type, sender_id, content, None, None, None, meta_json, _now()),
         )
-    mid = cur.lastrowid
+
+    mid = int(cur.lastrowid)
+
+    # 2) Link attachments to files via message_files (triggers update ref_count)
+    if metadata and isinstance(metadata, dict):
+        attachments = metadata.get("attachments") or []
+        rows_to_insert = []
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            fid = att.get("file_id")
+            if fid is not None:
+                try:
+                    rows_to_insert.append((mid, int(fid), "attachment"))
+                except (TypeError, ValueError):
+                    pass
+            thumb_fid = att.get("thumb_file_id")
+            if thumb_fid is not None:
+                try:
+                    rows_to_insert.append((mid, int(thumb_fid), "thumb"))
+                except (TypeError, ValueError):
+                    pass
+
+        if rows_to_insert:
+            cur.executemany(
+                "INSERT OR IGNORE INTO message_files(message_id, file_id, role) VALUES(?,?,?)",
+                rows_to_insert,
+            )
+
     conn.commit()
     return mid
 
-def delete_message(conn, message_id: int) -> None:
+
+
+def delete_conversation(conn, conversation_id: int) -> None:
     """
-    Deletes a single message from the database
+    Delete a saved conversation and all of its messages.
+    Cascades remove messages and message_files; triggers maintain files.ref_count.
     """
     cur = conn.cursor()
-    cur.execute("SELECT metadata FROM messages WHERE id = ?", (int(message_id),))
-    row = cur.fetchone()
-    if not row:
-        return
-
-    metadata_raw = row[0]
+    cur.execute("DELETE FROM saved_conversations WHERE id = ?", (int(conversation_id),))
+    conn.commit()
     try:
-        metadata = json.loads(metadata_raw or "{}")
+        orphan_sweep(cas_sweep=True)
     except Exception:
-        metadata = {}
+        log.exception("orphan_sweep failed after deleting conversation %s", conversation_id)
 
-    attachments = metadata.get("attachments") if isinstance(metadata, dict) else []
-    if not isinstance(attachments, list):
-        attachments = []
 
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        for key in ("file_id", "thumb_file_id"):
-            fid = attachment.get(key)
-            try:
-                fid_int = int(fid)
-            except (TypeError, ValueError):
-                continue
-            cur.execute("UPDATE files SET ref_count = ref_count - 1 WHERE id = ?", (fid_int,))
-
+def delete_message(conn, message_id: int) -> None:
+    """
+    Delete a single message. Attachment ref_counts are maintained automatically
+    via message_files triggers.
+    """
+    cur = conn.cursor()
     cur.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
     conn.commit()
 
+
 def delete_many_messages(conn, conversation_id: int, message_id: int):
     """
-    Removes a message, and all messages in the conversation with a higher index.
-    First we get a list off all message IDs in the conversation.
-    Iterate over the list while index is > message_id sending their IDs to `delete_message` and appending "attachments"
-    Passes the arg `message_id` to `delete_message`
-    Finally - if "attachments" len > 0 run the `orphan_sweep` function
+    Removes all messages in the conversation with id > message_id.
     """
     if not conversation_id:
         return
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id ASC",
+        "SELECT id FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id ASC",
         (int(conversation_id), int(message_id)),
     )
     rows = cur.fetchall()
-    if not rows:
-        return
-
     for row in rows:
         delete_message(conn, int(row[0]))
 
@@ -426,51 +461,15 @@ def delete_many_messages(conn, conversation_id: int, message_id: int):
     except Exception:
         log.exception("orphan_sweep failed after truncating conversation %s", conversation_id)
 
+
 def orphan_sweep(cas_sweep: bool = False, mem_sweep: bool = False):
     """
-    Check the database and CAS for any orphaned files, or memories
+    Temporary skeleton: debug-only placeholder for sweeping orphaned CAS / memory records.
     """
     summary = {"cas_deleted": 0, "vectors_deleted": 0}
-
-    if not cas_sweep and not mem_sweep:
-        return summary
-
-    conn = None
-    try:
-        conn, _ = init_and_open()
-        cur = conn.cursor()
-
-        if cas_sweep:
-            cur.execute("SELECT id, sha256 FROM files WHERE ref_count <= 0")
-            rows = cur.fetchall()
-            cas_root = (_data_dir() / "cas").resolve()
-            for file_id, sha_blob in rows:
-                if isinstance(sha_blob, memoryview):
-                    sha_blob = sha_blob.tobytes()
-                sha_hex = bytes(sha_blob).hex()
-                candidate = (cas_root / sha_hex).resolve()
-                try:
-                    candidate.relative_to(cas_root)
-                except Exception:
-                    log.warning("Refusing to delete CAS file outside root: %s", candidate)
-                    continue
-
-                if candidate.exists():
-                    try:
-                        candidate.unlink()
-                    except OSError:
-                        log.exception("Failed to unlink CAS file %s", candidate)
-                cur.execute("DELETE FROM files WHERE id = ?", (int(file_id),))
-                summary["cas_deleted"] += 1
-            conn.commit()
-
-        if mem_sweep:
-            log.info("mem_sweep requested but vector/memory GC is not implemented yet (TODO).")
-    finally:
-        if conn:
-            conn.close()
-
+    # print(f"orphan_sweep() called with cas_sweep={cas_sweep}, mem_sweep={mem_sweep}")
     return summary
+
 
 def list_conversations(conn, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
     cur = conn.cursor()
@@ -480,6 +479,7 @@ def list_conversations(conn, user_id: int, limit: int = 50) -> List[Dict[str, An
     )
     rows = cur.fetchall()
     return [{"id": r[0], "title": r[1], "created": r[2]} for r in rows]
+
 
 def list_messages(conn, conversation_id: int, limit: int = 200) -> List[Dict[str, Any]]:
     mode = read_db_mode(conn)
@@ -509,6 +509,7 @@ def list_messages(conn, conversation_id: int, limit: int = 200) -> List[Dict[str
         })
     return out
 
+
 # ---------- tiny admin UX helpers ----------
 
 def read_db_mode(conn) -> str:
@@ -516,14 +517,16 @@ def read_db_mode(conn) -> str:
     cur.execute("SELECT value FROM meta WHERE key='db_mode'")
     return _one(cur) or "open"
 
+
 def read_schema_version(conn) -> str:
     cur = conn.cursor()
     cur.execute("SELECT value FROM meta WHERE key='schema_version'")
     return _one(cur) or "unknown"
 
+
 # ---------- boot glue you’ll call from app startup ----------
 
-def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str,str]] = None) -> Tuple[sqlite3.Connection, str]:
+def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str, str]] = None) -> Tuple[sqlite3.Connection, str]:
     """
     Ensure the DB is ready, open it, and (optionally) seed a first admin.
     maybe_admin_user: (username, password) to create if no admin exists yet.
@@ -533,6 +536,7 @@ def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str,str]] = None) -
         username, password = maybe_admin_user
         ensure_bootstrap_admin(conn, username=username, password=password)
     return conn, mode
+
 
 # ---------- Storage for attachments ----------
 
@@ -570,13 +574,14 @@ def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
     cur.execute(
         "INSERT OR IGNORE INTO files(kind, mime, sha256, size_bytes, width, height, page_count, duration_ms, exif_json, thumb_sha256, original_name, ref_count, created) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (kind, mime, sha_blob, size_bytes, None, None, None, None, None, None, original_name, 1, _now()),
+        (kind, mime, sha_blob, size_bytes, None, None, None, None, None, None, original_name, 0, _now()),
     )
     cur.execute("SELECT id FROM files WHERE sha256=?", (sha_blob,))
     row = cur.fetchone()
     if not row:
         raise RuntimeError("Failed to insert or retrieve file metadata.")
     return int(row[0])
+
 
 def cas_path_for_file(db, file_id: int) -> Optional[Path]:
     """

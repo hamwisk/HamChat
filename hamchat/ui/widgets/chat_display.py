@@ -138,6 +138,17 @@ class MessageListModel(QAbstractListModel):
         self._items.clear()
         self.endResetModel()
 
+    def truncate_from(self, start_row: int) -> None:
+        """
+        Remove all messages from start_row to the end of the model.
+        """
+        if not (0 <= start_row < len(self._items)):
+            return
+        end_row = len(self._items) - 1
+        self.beginRemoveRows(QModelIndex(), start_row, end_row)
+        del self._items[start_row:]
+        self.endRemoveRows()
+
     # small helper so ChatDisplay can peek
     def get_text(self, row: int) -> str:
         if 0 <= row < len(self._items):
@@ -356,6 +367,14 @@ class ChatDisplay(QWidget):
         self._model.clear()
         self._call_qml("ensureAtEnd")  # harmless even when empty
 
+    def truncate_messages_from(self, index: int) -> None:
+        """
+        Remove all visible bubbles from the given index to the end.
+        Used by resend/regenerate when truncating a conversation tail.
+        """
+        self._model.truncate_from(index)
+        self._call_qml("ensureAtEnd")
+
     # --- ChatDisplay: public helpers at class level
     def message_model(self):
         return self._model
@@ -410,19 +429,31 @@ class ChatDisplay(QWidget):
         attachments: list[str] = []
 
         if msg.role == "user":
+            # --- 1) Decide which logical user message this bubble belongs to ---
             if not text:
+                # Only walk back through *contiguous user bubbles*;
+                # stop as soon as we hit a non-user role (assistant/system/etc).
                 for i in range(index - 1, -1, -1):
                     prev = items[i]
-                    if prev.role == "user" and prev.text:
+                    if prev.role != "user":
+                        break
+                    if prev.text:
                         base_idx = i
                         text = prev.text
                         break
+
+            # --- 2) Collect thumbs from the clicked bubble (if any) ---
             if getattr(msg, "thumbs", None):
                 attachments.extend(msg.thumbs)
-            if 0 <= base_idx + 1 < len(items):
+
+            # --- 3) If we're on the base text bubble, also grab thumbs
+            #         from the immediate following user bubble (if it's
+            #         an image-only bubble).
+            if index == base_idx and 0 <= base_idx + 1 < len(items):
                 nxt = items[base_idx + 1]
                 if nxt.role == "user" and not nxt.text and getattr(nxt, "thumbs", None):
                     attachments.extend(nxt.thumbs)
+
             return {
                 "role": "user",
                 "text": text,
@@ -430,6 +461,7 @@ class ChatDisplay(QWidget):
                 "base_index": base_idx,
             }
 
+        # Non-user bubble: treat it as-is; attachments are always empty here.
         return {
             "role": msg.role,
             "text": text,

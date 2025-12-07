@@ -144,6 +144,10 @@ class MainWindow(QMainWindow):
             self.chat_controller.conversation_started.connect(self._on_conversation_started)
         except Exception:
             pass
+        try:    # When a conversation is forked, open it just like selecting from side panel
+            self.chat_controller.forked_conversation.connect(self._open_conversation)
+        except Exception:
+            pass
         try:    # Warn if non-vision model and user tried to send attachments
             self.chat_display.sig_send_payload.connect(self._on_send_payload_from_ui)
         except Exception:
@@ -441,8 +445,8 @@ class MainWindow(QMainWindow):
         uid, role, prefs = result
         self.session.load_user(uid, username, role, prefs or {})
         if self._new_chat(system_call=True):
-            # Active conversation needs to be stored with this uid
-            print('dumbug')
+            # ToDo: Active conversation needs to be stored with this uid
+            pass
         self.top_panel.close_panel()
 
     def _signup_user(self, username: str, password: str):
@@ -477,32 +481,6 @@ class MainWindow(QMainWindow):
         self.session.logout()
         self._new_chat()
 
-    def _on_bubble_action(self, action, index, role, text):
-        if action == "edit_resend":
-            payload = None
-            try:
-                payload = self.chat_display.get_user_payload(index)
-            except Exception:
-                payload = None
-            if not payload:
-                return
-            self.chat_display.input.setPlainText(payload.get("text") or "")
-            try:
-                self.chat_display.set_pending_attachments(payload.get("attachments") or [])
-            except Exception:
-                pass
-            return
-
-        if not hasattr(self, "chat_controller"):
-            return
-
-        if action == "resend":
-            self.chat_controller.resend_message(index)
-        elif action == "regenerate":
-            self.chat_controller.regenerate_from(index)
-        elif action == "fork":
-            self.chat_controller.fork_chat_at(index)
-
     # ----------------- Settings helpers -----------------
 
     def _open_test_form(self):
@@ -528,6 +506,89 @@ class MainWindow(QMainWindow):
         form = ModelManagerForm(models=models, current_model=current)
         form.sig_close.connect(self.top_panel.close_panel)
         self.top_panel.open_with(form)
+
+    # ----------------- Chat helpers -----------------
+
+    def _on_bubble_action(self, action, index, role, text):
+        # Guard rails: confirm destructive actions before touching history
+        if action in ("edit_resend", "resend", "regenerate"):
+            if not self._confirm_bubble_action(action, role):
+                return
+
+        if action == "edit_resend":
+            if not hasattr(self, "chat_controller"):
+                return
+            try:
+                payload = self.chat_controller.prepare_edit_resend(index)
+            except Exception:
+                payload = None
+            if not payload:
+                return
+
+            # Pre-fill the input and pending attachments
+            self.chat_display.input.setPlainText(payload.get("text") or "")
+            try:
+                self.chat_display.set_pending_attachments(payload.get("attachments") or [])
+            except Exception:
+                pass
+            return
+
+        if not hasattr(self, "chat_controller"):
+            return
+
+        if action == "resend":
+            self.chat_controller.resend_message(index)
+        elif action == "regenerate":
+            self.chat_controller.regenerate_from(index)
+        elif action == "fork":
+            self.chat_controller.fork_chat_at(index)
+
+    def _confirm_bubble_action(self, action: str, role: str) -> bool:
+        """
+        Ask the user to confirm destructive bubble actions like resend / edit-resend / regenerate.
+        Returns True if the user confirms, False otherwise.
+        """
+        # Default: non-destructive → no prompt
+        title: str
+        text: str
+
+        if action == "edit_resend":
+            title = "Edit and resend this turn?"
+            text = (
+                "This will delete this message and all later messages in this chat, "
+                "then move the text and any attachments back into the input so you can "
+                "edit and send it again.\n\n"
+                "The existing assistant reply and any later turns will be lost.\n\n"
+                "Do you want to continue?"
+            )
+        elif action == "resend":
+            title = "Resend this turn?"
+            text = (
+                "This will delete this message and all later messages in this chat, "
+                "then send the same text again.\n\n"
+                "The existing assistant reply and any later turns will be lost.\n\n"
+                "Do you want to continue?"
+            )
+        elif action == "regenerate":
+            title = "Regenerate this reply?"
+            text = (
+                "This will delete this assistant reply and all later messages in this chat, "
+                "then ask the assistant to answer the same user message again.\n\n"
+                "The existing reply and any later turns will be lost.\n\n"
+                "Do you want to continue?"
+            )
+        else:
+            # Non-destructive or unknown action → no confirmation
+            return True
+
+        resp = QMessageBox.question(
+            self,
+            title,
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return resp == QMessageBox.StandardButton.Yes
 
     def _rename_conversation(self, conv_id: int, new_title: str):
         from hamchat import db_ops as dbo

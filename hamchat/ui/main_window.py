@@ -3,13 +3,16 @@ from __future__ import annotations
 import sys, logging, json
 from typing import Optional
 from pathlib import Path
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStatusBar, QSplitter, QVBoxLayout, QHBoxLayout,
     QFrame, QLabel, QMessageBox
 )
 
 from hamchat.paths import settings_dir
+from hamchat.infra.llm.ollama_client import OllamaClient
+from hamchat.infra.llm.openai_client import OpenAIClient
 from hamchat.ui.theme import ensure_theme, select_variant, apply_theme, export_qml_tokens
 from hamchat.ui.menus import Menus
 from hamchat.core.settings import Settings
@@ -82,6 +85,8 @@ class MainWindow(QMainWindow):
         self._db_mode = db_mode
         self._db = db_conn  # ← hold sqlite/sqlcipher connection
         self._models_available = None
+        self._active_profile_id: Optional[int] = None
+        self._active_profile_name: Optional[str] = None
 
         self._build_ui()
         self._wire_signals()
@@ -100,7 +105,7 @@ class MainWindow(QMainWindow):
         # Side panel: provide loaders for user-specific lists
         self.side_panel.set_loaders(
             list_chats=self._load_user_chats,
-            # list_profiles can stay as default for now
+            list_profiles=self._load_user_profiles,
         )
 
         # initial apply
@@ -127,13 +132,12 @@ class MainWindow(QMainWindow):
         )
         self.menus.build()
 
-        from hamchat.infra.llm.ollama_client import OllamaClient
-        from hamchat.ui.chat_controller import ChatController
         model_id = self.session.get_model_id()
-        ollama = OllamaClient()  # uses http://127.0.0.1:11434 by default
+        model_client = self._make_model_client(model_id)
+
         self.chat_controller = ChatController(
             self.chat_display,
-            model_client=ollama,
+            model_client=model_client,
             model_name=model_id,
             parent=self,
             db=self._db,
@@ -193,7 +197,11 @@ class MainWindow(QMainWindow):
 
         # Right container: chat_panel + edge bar
         right_container = _hbox(self.inner_split)
-        self.chat_panel = ChatPanel(right_container, chat_display=self.chat_display)
+        self.chat_panel = ChatPanel(
+            right_container,
+            chat_display=self.chat_display,
+            attachments_loader=self._load_attachments_for_conversation,
+        )
         self.chat_panel.setMinimumWidth(260)
         self.right_edge = EdgeToggleBar("right", self.toggle_right_panel, right_container)
         right_container._lay.addWidget(self.chat_panel)
@@ -239,6 +247,35 @@ class MainWindow(QMainWindow):
         self.left_edge.setObjectName("EdgeBarLeft")
         self.right_edge.setObjectName("EdgeBarRight")
 
+    def _make_model_client(self, model_id: str):
+        """
+        Route model_id to the correct backend.
+
+        - If no backend is defined → use OllamaClient (local default).
+        - If backend is an import spec "pkg.module:ClassName" → import and instantiate that class.
+        """
+
+        try:
+            backend_spec = self.session.get_model_backend(model_id)
+        except Exception:
+            backend_spec = None
+
+        # No backend specified → local Ollama model
+        if not backend_spec:
+            return OllamaClient()
+
+        # Try dynamic import: "hamchat.infra.llm.openai_client:OpenAIClient"
+        try:
+            module_name, class_name = backend_spec.split(":", 1)
+            module = import_module(module_name)
+            ClientCls = getattr(module, class_name)
+            return ClientCls()
+        except Exception as exc:
+            # Fallback: log and use Ollama so the app still runs
+            logger.error("Failed to load backend %r for model %r: %s",
+                         backend_spec, model_id, exc)
+            return OllamaClient()
+
     def _apply_prefs(self, prefs):
         # theme
         self._variant = prefs.theme_variant
@@ -251,6 +288,7 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self):
         self.side_panel.sig_open_form.connect(self._open_test_form)
+        self.side_panel.ai_profiles_manager.connect(self._open_ai_profiles_manager)
         self.top_panel.sig_closed.connect(self._on_top_closed)
 
         self.side_panel.create_conversation.connect(self._new_chat)
@@ -262,10 +300,17 @@ class MainWindow(QMainWindow):
         self.side_panel.open_conversation.connect(self._open_conversation)
         self.side_panel.rename_conversation.connect(self._rename_conversation)
         self.side_panel.delete_conversation.connect(self._delete_conversation)
+        self.side_panel.profile_activated.connect(self._on_profile_activated)
 
         self.side_panel.request_login.connect(self._open_login_flow)
         self.side_panel.request_logout.connect(self._do_logout)
         self.chat_display.bubbleAction.connect(self._on_bubble_action)
+        try:
+            self.chat_panel.attachmentOpenRequested.connect(self._on_attachment_open_requested)
+            self.chat_panel.attachmentAttachRequested.connect(self._on_attachment_attach_requested)
+            self.chat_panel.attachmentScrollRequested.connect(self._on_attachment_scroll_requested)
+        except Exception:
+            pass
 
     def _init_theme(self):
         # Load + merge defaults (writes back if needed) then apply chosen variant
@@ -316,6 +361,17 @@ class MainWindow(QMainWindow):
                 parts.append("Modality: " + ("👁️‍🗨️" if self.session.current.vision else "💬"))
             except Exception:
                 pass
+
+        # NEW: assistant / persona label
+        if self._active_profile_id is not None:
+            label = None
+            if self._active_profile_id == 0:
+                # Synthetic default profile
+                label = self._active_profile_name or "Default"
+            else:
+                label = (self._active_profile_name or "").strip()
+            if label:
+                parts.append(f"Assistant: {label}")
 
         if isinstance(self._models_available, int):
             parts.append(f"Models: {self._models_available}")
@@ -479,6 +535,7 @@ class MainWindow(QMainWindow):
 
     def _do_logout(self):
         self.session.logout()
+        self.top_panel.close_panel()
         self._new_chat()
 
     # ----------------- Settings helpers -----------------
@@ -488,31 +545,71 @@ class MainWindow(QMainWindow):
 
     def _on_top_closed(self): pass
 
+    def _open_ai_profiles_manager(self):
+        """
+        Open the AI Profiles Manager in the top panel.
+        """
+        from .widgets.ai_profiles_manager import AIProfilesManager
+
+        form = AIProfilesManager(self._db, self.session, active_profile_id=self._active_profile_id)
+        form.sig_close.connect(self.top_panel.close_panel)
+        if hasattr(form, "sig_profile_activated"):
+            form.sig_profile_activated.connect(self._on_profile_activated)
+        if hasattr(form, "sig_profiles_changed"):
+            form.sig_profiles_changed.connect(self.side_panel.refresh_profiles)
+
+        self.top_panel.open_with(form)
+
     def _on_model_changed_from_menu(self, model_id: str) -> None:
         # 1) Update session + persist
         self.session.set_model_id(model_id)
 
-        # 2) Tell the ChatController if it supports dynamic model switching
-        if hasattr(self, "chat_controller") and hasattr(self.chat_controller, "set_model_name"):
-            self.chat_controller.set_model_name(model_id)
+        if hasattr(self, "chat_controller"):
+            # 2a) Swap backend client if the model implies a different backend
+            if hasattr(self.chat_controller, "set_model_client"):
+                new_client = self._make_model_client(model_id)
+                self.chat_controller.set_model_client(new_client)
 
-        # 3) Refresh status bar text
+            # 2b) Update the model name for the controller
+            if hasattr(self.chat_controller, "set_model_name"):
+                self.chat_controller.set_model_name(model_id)
+
+        # 3) Refresh status bar + menu state
         self._refresh_status()
+        self.menus.build()
 
-    def _open_model_manager(self):
-        from .widgets.model_manager import ModelManagerForm
+    def _open_model_manager(self, filters=None):
+        from .widgets.model_manager import ModelManager
         models = self.session.get_model_choices()
         current = self.session.get_model_id()
-        form = ModelManagerForm(models=models, current_model=current)
-        form.sig_close.connect(self.top_panel.close_panel)
-        self.top_panel.open_with(form)
+        panel = ModelManager(self.session, parent=self)
+
+        def _on_model_activated(mid: str):
+            # Switch session + controller to the chosen model
+            self.session.set_model_id(mid)
+            new_client = self._make_model_client(mid)
+            if hasattr(self.chat_controller, "set_model_client"):
+                self.chat_controller.set_model_client(new_client)
+            if hasattr(self.chat_controller, "set_model_name"):
+                self.chat_controller.set_model_name(mid)
+            self._refresh_status()
+            self.menus.build()
+            # Optional: auto-close panel when a model is picked
+            self.top_panel.close_panel()
+
+        panel.sig_model_activated.connect(_on_model_activated)
+        if filters:
+            panel.apply_vision_filter()
+
+        panel.sig_close.connect(self.top_panel.close_panel)
+        self.top_panel.open_with(panel)
 
     # ----------------- Chat helpers -----------------
 
     def _on_bubble_action(self, action, index, role, text):
         # Guard rails: confirm destructive actions before touching history
         if action in ("edit_resend", "resend", "regenerate"):
-            if not self._confirm_bubble_action(action, role):
+            if not self._confirm_bubble_action(action, index, role):
                 return
 
         if action == "edit_resend":
@@ -543,7 +640,7 @@ class MainWindow(QMainWindow):
         elif action == "fork":
             self.chat_controller.fork_chat_at(index)
 
-    def _confirm_bubble_action(self, action: str, role: str) -> bool:
+    def _confirm_bubble_action(self, action: str, index: int, role: str) -> bool:
         """
         Ask the user to confirm destructive bubble actions like resend / edit-resend / regenerate.
         Returns True if the user confirms, False otherwise.
@@ -551,6 +648,44 @@ class MainWindow(QMainWindow):
         # Default: non-destructive → no prompt
         title: str
         text: str
+
+        has_attachments = False
+        if action in ("resend", "regenerate") and hasattr(self, "chat_display"):
+            try:
+                payload = self.chat_display.get_user_payload(index)
+            except Exception:
+                payload = None
+            if payload and payload.get("role") == "user":
+                atts = payload.get("attachments") or []
+                has_attachments = bool(atts)
+
+        is_blind_model = not getattr(getattr(self.session, "current", None), "vision", False)
+
+        if action in ("resend", "regenerate") and has_attachments and is_blind_model:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Resend on a text-only model?")
+            box.setText(
+                "Your current model is blind; resending this turn will drop the attached image(s).\n\n"
+                "This will result in the loss of the attached image content for this turn.\n\n"
+                "This operation will also delete this message and all later messages in this chat before resending.\n\n"
+                "What would you like to do?"
+            )
+            drop_btn = box.addButton("Drop image(s) and continue", QMessageBox.ButtonRole.AcceptRole)
+            vision_btn = box.addButton("Show vision models…", QMessageBox.ButtonRole.ActionRole)
+            cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(drop_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
+                return False
+            if clicked is vision_btn:
+                try:
+                    self._open_model_manager(filters='vision')
+                except Exception:
+                    pass
+                return False
+            return True
 
         if action == "edit_resend":
             title = "Edit and resend this turn?"
@@ -647,6 +782,202 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_attachment_open_requested(self, file_id: int):
+        from hamchat import db_ops as dbo
+        if not self._db:
+            return
+        try:
+            path = dbo.cas_path_for_file(self._db, int(file_id))
+        except Exception as e:
+            log.exception("cas_path_for_file failed: %s", e)
+            path = None
+        if not path:
+            self.statusBar().showMessage("Attachment could not be opened.", 5000)
+            return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except Exception as e:
+            log.exception("openUrl failed: %s", e)
+            self.statusBar().showMessage("Attachment open failed.", 5000)
+
+    def _on_attachment_attach_requested(self, file_id: int):
+        from hamchat import db_ops as dbo
+        if not self._db or not hasattr(self, "chat_display"):
+            return
+        try:
+            path = dbo.cas_path_for_file(self._db, int(file_id))
+        except Exception as e:
+            log.exception("cas_path_for_file failed: %s", e)
+            path = None
+        if not path:
+            self.statusBar().showMessage("Attachment not available on disk.", 5000)
+            return
+        try:
+            if hasattr(self.chat_display, "add_pending_attachments_from_paths"):
+                self.chat_display.add_pending_attachments_from_paths([str(path)])
+            elif hasattr(self.chat_display, "set_pending_attachments"):
+                self.chat_display.set_pending_attachments([str(path)])
+        except Exception as e:
+            log.exception("Failed to attach file to prompt: %s", e)
+            self.statusBar().showMessage("Could not attach file to prompt.", 5000)
+
+    def _on_attachment_scroll_requested(self, file_id: int):
+        from hamchat import db_ops as dbo
+        if not self._db or not hasattr(self, "chat_controller"):
+            return
+        try:
+            conv_id = self.chat_controller.current_conversation_id()
+        except Exception:
+            conv_id = None
+        if not conv_id:
+            self.statusBar().showMessage("No saved conversation to scroll.", 5000)
+            return
+        try:
+            rows = dbo.list_file_occurrences(self._db, conversation_id=int(conv_id), file_id=int(file_id))
+        except Exception as e:
+            log.exception("list_file_occurrences failed: %s", e)
+            rows = []
+        if not rows:
+            self.statusBar().showMessage("No messages reference this attachment.", 5000)
+            return
+
+        target_index = None
+        for r in rows:
+            mid = r.get("message_id") or r.get("id")
+            if mid is None:
+                continue
+            try:
+                target_index = self.chat_controller.base_index_for_message_id(int(mid))
+            except Exception:
+                target_index = None
+            if target_index is not None:
+                break
+
+        if target_index is None:
+            self.statusBar().showMessage("Attachment message is not loaded in view.", 5000)
+            return
+
+        try:
+            if hasattr(self.chat_display, "scroll_to_base_index"):
+                self.chat_display.scroll_to_base_index(int(target_index))
+        except Exception as e:
+            log.exception("Failed to scroll to attachment message: %s", e)
+            self.statusBar().showMessage("Could not scroll to message.", 5000)
+
+    def _on_profile_activated(self, profile_id: int):
+        from hamchat import db_ops as dbo
+        pid = int(profile_id)
+        self._active_profile_id = pid
+
+        # Reflect in the session for the controller / LLM
+        try:
+            self.session.set_profile_id(pid)
+        except Exception:
+            pass
+
+        # Highlight in side panel
+        try:
+            self.side_panel.set_active_profile(pid)
+        except Exception:
+            pass
+
+        profile = None
+
+        if pid == 0:
+            # Synthetic default profile – no DB row
+            self._active_profile_name = "Default"
+        else:
+            if self._db:
+                try:
+                    profile = dbo.get_ai_profile(self._db, pid)
+                except Exception:
+                    profile = None
+            if profile:
+                name = (profile.get("display_name") or "").strip()
+                self._active_profile_name = name or f"Profile {pid}"
+            else:
+                self._active_profile_name = None
+
+        # Update status bar with the new assistant label
+        self._refresh_status()
+
+        # Apply any model-switch side effects for real profiles
+        self._apply_profile_side_effects(profile)
+
+    def _apply_profile_side_effects(self, profile: Optional[dict]) -> None:
+        if not profile:
+            return
+        default_model_id = profile.get("default_model_id")
+        if not default_model_id:
+            return
+        current_model = self.session.get_model_id()
+        if current_model == default_model_id:
+            return
+        choices = self.session.get_model_choices()
+        ids = {mid for mid, _ in choices}
+        if default_model_id not in ids:
+            return
+        try:
+            self._on_model_changed_from_menu(default_model_id)
+        except Exception:
+            pass
+
+    def _load_user_profiles(self):
+        """
+        Loader for SidePanel AI profiles.
+        """
+        from hamchat import db_ops as dbo
+        if not self._db:
+            return ()
+        role = getattr(self.session.current, "role", "guest")
+        if role == "guest":
+            return ()
+        uid = getattr(self.session.current, "user_id", None)
+        owner = None if role == "admin" else uid
+        include_builtin = True
+        try:
+            rows = dbo.list_ai_profiles(self._db, owner_user_id=owner, include_builtin=include_builtin)
+        except Exception as e:
+            log.exception("list_ai_profiles failed: %s", e)
+            return ()
+
+        items = []
+
+        # Synthetic default profile at the top, with its own tooltip
+        items.append(
+            (0, "Default", "Run the model with no special persona settings.")
+        )
+
+        for r in rows:
+            pid = r.get("id")
+            if pid is None:
+                continue
+            label = (r.get("display_name") or "").strip() or f"Profile {pid}"
+            tooltip = (r.get("short_description") or "").strip()  # comes from _profile_row_to_dict
+            items.append((int(pid), label, tooltip))
+
+        return items
+
+
+    def _load_attachments_for_conversation(self, conv_id: int) -> list[dict]:
+        """Fetch attachments for a saved conversation."""
+        if not self._db:
+            return []
+        role = getattr(self.session.current, "role", "guest")
+        if role != "user":
+            return []
+        try:
+            from hamchat import db_ops as dbo
+            rows = dbo.list_conversation_files(self._db, conversation_id=int(conv_id))
+        except Exception as e:
+            log.exception("list_conversation_files failed: %s", e)
+            return []
+
+        try:
+            return [dict(r) for r in rows] if rows else []
+        except Exception:
+            return []
+
     def _load_user_chats(self):
         """
         Loader for SidePanel "My Chats".
@@ -708,6 +1039,29 @@ class MainWindow(QMainWindow):
             log.exception("list_messages failed: %s", e)
             QMessageBox.critical(self, "Load failed", "Could not load this chat from the database.")
             return
+
+        # Restore the latest assistant profile if present
+        profile_id = None
+        for m in reversed(msgs):
+            if m.get("sender_type") == "assistant":
+                sid = m.get("sender_id")
+                # sid is None for default / persona-less messages
+                profile_id = sid
+                break
+
+        if profile_id is None:
+            # No persona in this conversation → select synthetic Default (0)
+            try:
+                self._on_profile_activated(0)
+            except Exception:
+                pass
+        else:
+            try:
+                prof = dbo.get_ai_profile(self._db, int(profile_id))
+                if prof:
+                    self._on_profile_activated(int(profile_id))
+            except Exception:
+                pass
 
         # Clear current UI messages (but don't pop the confirmation dialog here)
         self.chat_display.clear_messages()

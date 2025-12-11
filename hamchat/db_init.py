@@ -448,6 +448,31 @@ CREATE TABLE IF NOT EXISTS messages (
   created INTEGER
 );
 
+-- AI profiles (personas)
+CREATE TABLE IF NOT EXISTS ai_profiles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_user_id INTEGER NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
+  internal_name TEXT,
+  display_name TEXT NOT NULL,
+  short_description TEXT,
+  avatar TEXT,
+  system_prompt TEXT,
+  allowed_models TEXT,
+  default_model_id TEXT,
+  temperature REAL,
+  top_p REAL,
+  max_tokens INTEGER,
+  is_builtin INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_profiles_owner
+  ON ai_profiles(owner_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ai_profiles_builtin
+  ON ai_profiles(is_builtin);
+
 -- Persistent memory skeleton
 CREATE TABLE IF NOT EXISTS persistent_memory (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

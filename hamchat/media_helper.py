@@ -6,6 +6,7 @@ import hashlib, base64, imghdr, os, tempfile, shutil
 from PIL import Image  # Pillow
 
 THUMB_SIZE = 96  # square
+AVATAR_SIZE = 64  # default logical avatar size for profiles (square)
 
 def _sha256_file(p: str) -> str:
     h = hashlib.sha256()
@@ -81,3 +82,132 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
         results["thumbs"].append({"path": thumb_path, "w": THUMB_SIZE, "h": THUMB_SIZE, "file_id": thumb_file_id, "sha256": thumb_sha, "mime": thumb_mime})
         results["llm_parts"].append({"type": "image", "media_type": mime, "data_base64": b64})
     return results
+
+def store_profile_avatar(src: str, *, db, size: int = AVATAR_SIZE) -> str:
+    """
+    Normalise a user-selected avatar image into a square thumbnail, store it in CAS,
+    and return a filesystem path that the UI can load.
+
+    - src: path or file:// URL chosen by the user.
+    - db: open SQLite connection used by db_ops.
+    - size: final avatar square size in pixels.
+    """
+    if db is None:
+        # Fallback: just give back the original; avoids crashing in weird states.
+        return src
+
+    # Normalise source path (strip file:// for drag-drop style paths).
+    src_path = src[7:] if src.lower().startswith("file://") else src
+    if not os.path.exists(src_path):
+        return src
+
+    # 1) Create a temporary normalised thumbnail on disk.
+    tmp_dir = tempfile.mkdtemp(prefix="hamchat_avatar_")
+    tmp_avatar = os.path.join(tmp_dir, "avatar.png")
+    try:
+        # This does the square letterbox + resize; we override the default 96px here.
+        _make_thumb(src_path, tmp_avatar, size=size)
+
+        # 2) Push the normalised avatar into CAS so strict-mode encryption is honoured.
+        from hamchat import db_ops as dbo
+
+        sha = _sha256_file(tmp_avatar)
+        mime = _mime_guess(tmp_avatar)
+        file_id = dbo.cas_put(db, sha256=sha, mime=mime, src_path=tmp_avatar)
+
+        # 3) Resolve a readable path for the UI (handles strict vs lite).
+        cas_path = dbo.cas_path_for_file(db, file_id)
+        if cas_path is None:
+            # Fallback to original path if something went sideways.
+            return src_path
+        return str(cas_path)
+    finally:
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
+
+def cleanup_profile_avatar(db, old_avatar_path: str) -> None:
+    """
+    Best-effort cleanup for a *previous* avatar image that was stored in CAS.
+
+    - Only runs if the path looks like a CAS-style SHA filename.
+    - Never deletes if the underlying file is still referenced by:
+        * any message_files row, or
+        * any ai_profiles.avatar row.
+    - Deletes both cas/ and cas_tmp/ variants if safe, plus the files row.
+    """
+    if db is None or not old_avatar_path:
+        return
+
+    try:
+        from pathlib import Path
+        p = Path(old_avatar_path)
+        sha_hex = p.name
+        # Only touch if it looks like a 64-char hex SHA
+        if len(sha_hex) != 64:
+            return
+        try:
+            sha_bytes = bytes.fromhex(sha_hex)
+        except ValueError:
+            return
+
+        cur = db.cursor()
+        try:
+            # Find the CAS metadata row
+            cur.execute("SELECT id FROM files WHERE sha256 = ?", (sha_bytes,))
+            row = cur.fetchone()
+            if not row:
+                # No DB row; at most try to delete the on-disk file and bail.
+                base_dir = os.path.dirname(os.path.dirname(old_avatar_path))
+                cas_dirs = [
+                    os.path.join(base_dir, "cas"),
+                    os.path.join(base_dir, "cas_tmp"),
+                ]
+                for d in cas_dirs:
+                    candidate = os.path.join(d, sha_hex)
+                    try:
+                        if os.path.exists(candidate):
+                            os.remove(candidate)
+                    except Exception:
+                        pass
+                return
+
+            file_id = int(row[0])
+
+            # 1) Is any message still referencing this file?
+            cur.execute("SELECT COUNT(*) FROM message_files WHERE file_id = ?", (file_id,))
+            msg_count = cur.fetchone()[0] or 0
+
+            # 2) Is any profile still using this avatar path (other than the one we just updated)?
+            # We match on the SHA suffix to catch both cas/ and cas_tmp/ variants.
+            cur.execute("SELECT COUNT(*) FROM ai_profiles WHERE avatar LIKE ?", (f"%{sha_hex}",))
+            prof_count = cur.fetchone()[0] or 0
+
+            if msg_count > 0 or prof_count > 0:
+                # Still in use somewhere → do not delete.
+                return
+
+            # At this point, no messages and no profiles reference this SHA.
+            base_dir = os.path.dirname(os.path.dirname(old_avatar_path))
+            cas_dirs = [
+                os.path.join(base_dir, "cas"),
+                os.path.join(base_dir, "cas_tmp"),
+            ]
+            for d in cas_dirs:
+                candidate = os.path.join(d, sha_hex)
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                except Exception:
+                    # Best-effort only
+                    pass
+
+            # Remove metadata row
+            cur.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            db.commit()
+        finally:
+            cur.close()
+    except Exception:
+        # Absolutely non-critical; never let avatar cleanup crash the app.
+        pass

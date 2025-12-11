@@ -25,7 +25,8 @@ class SessionData:
     server_url: Optional[str] = None
     prefs: Preferences = Preferences()
     current_model: str = None
-    vision: bool = False                 # Is it 'False' though? Really... is it?
+    vision: bool = False
+    profile_id: Optional[int] = None
 
 
 class SessionManager(QObject):
@@ -118,6 +119,7 @@ class SessionManager(QObject):
         self.current.user_id = user_id
         self.current.username = username
         self.current.role = role
+        self.current.profile_id = None
         # merge user prefs (fallback to current)
         p = self.current.prefs
         p.theme_variant      = user_prefs.get("theme_variant", p.theme_variant)
@@ -146,6 +148,17 @@ class SessionManager(QObject):
         self.settings.set("locale", locale)
         self.prefsChanged.emit(self.current.prefs)
 
+    # --- Profile helpers ---
+    def get_profile_id(self) -> Optional[int]:
+        return getattr(self.current, "profile_id", None)
+
+    def set_profile_id(self, profile_id: Optional[int]) -> None:
+        try:
+            self.current.profile_id = int(profile_id) if profile_id is not None else None
+        except Exception:
+            self.current.profile_id = None
+        self.sessionChanged.emit(self.current)
+
     # --- Model helpers ---
 
     def get_model_id(self) -> str:
@@ -167,53 +180,86 @@ class SessionManager(QObject):
         caps = self.get_model_capabilities(model_id)
         self.current.vision = bool(caps.get("vision", False))
 
-    def get_model_choices(self) -> list[tuple[str, str]]:
+    def _load_all_models(self) -> list[dict]:
         """
-        Return a list of (model_id, label) tuples, based on the Ollama registry
-        in settings/models.json. Falls back to a small static list if anything
-        goes wrong.
+        Load and merge models from:
+          - settings/models.json      (Ollama registry, auto-generated)
+          - settings/models-x.json    (external/API models, user-managed)
+
+        Returns a flat list of model dicts.
+        """
+        base = settings_dir()
+        all_models: list[dict] = []
+
+        for fname in ("models.json", "models-x.json"):
+            path: Path = base.joinpath(fname)
+            try:
+                text = path.read_text("utf-8")
+                data = json.loads(text)
+            except Exception:
+                continue
+
+            models = data.get("models")
+            if isinstance(models, list):
+                all_models.extend(models)
+
+        return all_models
+
+    def get_model_backend(self, model_id: str) -> Optional[str]:
+        """
+        Return backend string for model_id, e.g. 'ollama' or 'openai'.
+        Returns None if not specified.
         """
         try:
-            models_path: Path = settings_dir().joinpath("models.json")
-            with models_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            for m in self._load_all_models():
+                if m.get("name") == model_id:
+                    backend = m.get("backend")
+                    if isinstance(backend, str) and backend.strip():
+                        return backend.strip().lower()
         except Exception:
-            # Fallback: static list so the UI doesn't explode
-            return [
-                ("gpt-oss:latest", "gpt-oss:latest"),
-                ("mistral:latest", "mistral:latest"),
-                ("phi:latest", "phi:latest"),
-            ]
+            pass
+        return None
+
+    def get_model_choices(self) -> list[tuple[str, str]]:
+        """
+        Return a list of (model_id, label) tuples, based on the merged registry:
+        - settings/models.json  (local/Ollama, auto-generated)
+        - settings/models-x.json (external/API models, user-managed)
+
+        Falls back to a small static list if anything goes wrong.
+        """
+        try:
+            models = self._load_all_models()
+        except Exception:
+            models = []
 
         result: list[tuple[str, str]] = []
-        for m in data.get("models", []):
-            if not m.get("available", False):
+        for m in models:
+            # external entries might omit 'available' → treat as True by default
+            if m.get("available", True) is False:
                 continue
 
             name = m.get("name")
             if not name:
                 continue
 
-            # Simple label for now – keep it boring and clear
-            # You *could* add family/context here, but let's stay minimal.
-            label = name
+            label = name  # keep it simple for now
             result.append((name, label))
 
         # Safety: don't ever return an empty list
         if not result:
             return [
                 ("gpt-oss:latest", "gpt-oss:latest"),
+                ("mistral:latest", "mistral:latest"),
+                ("phi:latest", "phi:latest"),
             ]
 
         return result
 
     def get_model_capabilities(self, model_id: str) -> dict:
-        """Return capabilities{} for model_id from settings/models.json, else {}."""
-        from pathlib import Path
-        models_path: Path = settings_dir().joinpath("models.json")
+        """Return capabilities{} for model_id from merged model registries, else {}."""
         try:
-            data = json.loads(models_path.read_text("utf-8"))
-            for m in data.get("models", []):
+            for m in self._load_all_models():
                 if m.get("name") == model_id:
                     return dict(m.get("capabilities") or {})
         except Exception:

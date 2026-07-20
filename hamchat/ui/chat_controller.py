@@ -1,5 +1,7 @@
 # hamchat/ui/chat_controller.py
 from __future__ import annotations
+import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -11,6 +13,13 @@ from hamchat.infra.llm.backend_adapter import make_stream_func_from_client
 from hamchat import db_ops as dbo  # persistence API (create_conversation, add_message)
 from hamchat.core.session import SessionManager
 from hamchat.media_helper import process_images
+from hamchat.infra.llm.base import ModelClient  # if you want to type-hint, optional
+
+log = logging.getLogger("ui.chat_controller")
+
+DEFAULT_GENERATION_OPTIONS = {"temperature": 0.7}
+_TEMPERATURE_RANGE = (0.0, 2.0)
+_TOP_P_RANGE = (0.0, 1.0)
 
 
 @dataclass
@@ -56,7 +65,7 @@ class ChatController(QObject):
         self._history: List[HistoryEntry] = []
         self._assistant_buf: List[str] = []
         self._max_turns: int = 512   # rolling window; adjust as needed
-        # ToDo set the max turns in the session, load it from app.json, or infer it from spec report maybe
+        # We should set the max turns in the session, load it from app.json, or infer it from spec report maybe
 
         # ---- Persistence context (optional; enabled only for role='user') ----
         self._db = db
@@ -77,6 +86,14 @@ class ChatController(QObject):
 
         self._active_row: Optional[int] = None
         self._active_ticket: int = -1
+
+    def set_model_client(self, model_client) -> None:
+        """
+        Swap out the underlying LLM backend (e.g. OllamaClient vs OpenAIClient).
+        Safe to call between requests; the new client will be used for the next prompt.
+        """
+        self._model_client = model_client
+        self._configure_stream()
 
     # ---------- Persistence helpers ----------
     def _save_enabled(self) -> bool:
@@ -193,14 +210,167 @@ class ChatController(QObject):
 
     # ---------- Configuration ----------
 
-    def _configure_stream(self) -> None:
+    def _get_active_profile_id(self) -> Optional[int]:
         """
-        (Re)build the stream_func with the current model.
-        Called on init and whenever set_model_name is used.
+        Best-effort lookup of the currently active AI profile id.
+
+        Returns:
+            - int id for a real profile
+            - 0 or None for the synthetic 'Default' / no persona
         """
+        try:
+            if self._session is None:
+                return None
+            if not hasattr(self._session, "get_profile_id"):
+                return None
+            pid = self._session.get_profile_id()
+            user_id = getattr(getattr(self._session, "current", None), "user_id", None)
+            log.debug(
+                "Profile request context: active_profile_id=%r (%s), user_id=%r (%s)",
+                pid,
+                type(pid).__name__,
+                user_id,
+                type(user_id).__name__,
+            )
+            try:
+                return int(pid) if pid is not None else None
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _get_active_profile_row(self) -> Optional[dict]:
+        """
+        Fetch the full ai_profiles row for the currently active profile,
+        or None if default / missing / DB unavailable.
+        """
+        if self._db is None or self._session is None:
+            return None
+
+        pid = self._get_active_profile_id()
+        if pid in (None, 0):
+            return None
+
+        try:
+            profile = dbo.get_ai_profile(self._db, int(pid))
+        except Exception:
+            log.debug("Active profile lookup failed for id=%r", pid, exc_info=True)
+            return None
+
+        if profile is None:
+            log.debug("Active profile lookup: id=%r found=False", pid)
+            return None
+
+        values = {key: type(value).__name__ for key, value in profile.items()}
+        raw_prompt = profile.get("system_prompt")
+        prompt_length = len(raw_prompt) if isinstance(raw_prompt, str) else None
+        log.debug(
+            "Active profile lookup: id=%r found=True keys=%s value_types=%s system_prompt_length=%r",
+            pid,
+            sorted(profile.keys()),
+            values,
+            prompt_length,
+        )
+        return profile
+
+    def system_injection_if_any(self) -> Optional[ChatMessage]:
+        """
+        Build a system-level 'rule injection' message for the active AI profile, if it has
+        a non-empty system_prompt. Returns None if there's nothing to inject.
+        """
+        profile = self._get_active_profile_row()
+        return self._system_injection_for_profile(profile)
+
+    def _system_injection_for_profile(self, profile: Optional[dict]) -> Optional[ChatMessage]:
+        if not profile:
+            return None
+
+        raw_prompt = (profile.get("system_prompt") or "").strip()
+        if not raw_prompt:
+            log.debug("Active profile system prompt resolved: present=False length=0")
+            return None
+
+        log.debug("Active profile system prompt resolved: present=True length=%d", len(raw_prompt))
+
+        meta = {
+            "kind": "rule_injection",
+            "hidden": True,
+            "profile_id": profile.get("id"),
+        }
+
+        return ChatMessage(role="system", content=raw_prompt, metadata=meta)
+
+    def _profile_float_option(
+        self,
+        profile: dict,
+        field: str,
+        minimum: float,
+        maximum: float,
+    ) -> Optional[float]:
+        raw_value = profile.get(field)
+        if raw_value is None:
+            return None
+        try:
+            if isinstance(raw_value, bool):
+                raise ValueError("boolean is not a numeric generation option")
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError("value is not finite")
+        except (TypeError, ValueError):
+            log.warning(
+                "Ignoring malformed profile generation option: profile_id=%r field=%s type=%s",
+                profile.get("id"),
+                field,
+                type(raw_value).__name__,
+            )
+            return None
+
+        clamped = max(minimum, min(maximum, value))
+        if clamped != value:
+            log.warning(
+                "Clamped profile generation option: profile_id=%r field=%s value=%s range=[%s, %s]",
+                profile.get("id"),
+                field,
+                value,
+                minimum,
+                maximum,
+            )
+        return clamped
+
+    def _resolve_active_profile_request(self) -> tuple[Optional[ChatMessage], Dict]:
+        """Resolve profile prompt and generation options on the GUI thread."""
+        profile = self._get_active_profile_row()
+        options = dict(DEFAULT_GENERATION_OPTIONS)
+        if not profile:
+            log.debug("Profile generation options resolved: %s", options)
+            return None, options
+
+        temperature = self._profile_float_option(
+            profile, "temperature", *_TEMPERATURE_RANGE
+        )
+        if temperature is not None:
+            options["temperature"] = temperature
+
+        top_p = self._profile_float_option(profile, "top_p", *_TOP_P_RANGE)
+        if top_p is not None:
+            options["top_p"] = top_p
+
+        log.debug(
+            "Profile generation options resolved: profile_id=%r options=%s",
+            profile.get("id"),
+            options,
+        )
+        return self._system_injection_for_profile(profile), options
+
+    def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None):
+        """Create a text-only stream using a prompt resolved on the GUI thread."""
+        request_options = dict(DEFAULT_GENERATION_OPTIONS if options is None else options)
 
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
+
+            if injection is not None:
+                hist.append(injection)
 
             for entry in self._history[-self._max_turns * 2:]:
                 m = entry.msg
@@ -216,17 +386,34 @@ class ChatController(QObject):
                     stub = self._attachment_stub_for_model(m.metadata["attachments"])
                     if stub:
                         hist.append(ChatMessage(role="user", content=stub))
+
+            system_messages = [message for message in hist if message.role == "system"]
+            log.debug(
+                "Text request built: client=%s roles=%s system_count=%d system_content_lengths=%s",
+                type(self._model_client).__name__,
+                [message.role for message in hist],
+                len(system_messages),
+                [len(message.content or "") for message in system_messages],
+            )
             return hist
 
         def _build_options() -> dict:
-            return {"temperature": 0.7}
+            return dict(request_options)
 
-        self.stream_func = make_stream_func_from_client(
+        return make_stream_func_from_client(
             self._model_client,
             model=self._model_name,
             build_messages=_build_messages,
             build_options=_build_options,
         )
+
+    def _configure_stream(self) -> None:
+        """
+        (Re)build the stream_func with the current model.
+        Called on init and whenever set_model_name is used.
+        """
+
+        self.stream_func = self._make_text_stream(None, DEFAULT_GENERATION_OPTIONS)
 
     def set_model_name(self, model_name: str) -> None:
         """
@@ -302,7 +489,9 @@ class ChatController(QObject):
         # Prepare UI row and kick off background job
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
-        self._active_ticket = self.broker.submit(self.stream_func, text)
+        injection, options = self._resolve_active_profile_request()
+        stream_func = self._make_text_stream(injection, options)
+        self._active_ticket = self.broker.submit(stream_func, text)
 
     def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
         """
@@ -334,14 +523,29 @@ class ChatController(QObject):
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
 
+        # Compute persona rule injection once, in the GUI thread
+        inj = self.system_injection_if_any()
+
         # submit a one-off stream function that wraps the standard messages/options
         def build_messages(prompt: str) -> List[ChatMessage]:
+            # Start from the raw history messages (we don't want stubs here; the
+            # images are passed via llm_parts instead)
             hist_entries = self._history[-self._max_turns * 2:]
             hist = [entry.msg for entry in hist_entries]
+
+            # Persona rule injection at the front, if any
+            prefix: List[ChatMessage] = [inj] if inj is not None else []
+
             # replace the last (just-appended) user turn with a copy that has .parts
             msg = ChatMessage(role="user", content=prompt)
             setattr(msg, "parts", llm_parts)  # <-- important: keep it an object
-            return [*hist[:-1], msg]
+
+            if hist:
+                hist = [*hist[:-1], msg]
+            else:
+                hist = [msg]
+
+            return [*prefix, *hist]
 
         def build_options() -> dict:
             return {"temperature": 0.7}
@@ -373,12 +577,22 @@ class ChatController(QObject):
             msg_db_id: Optional[int] = None
             if self._save_enabled() and self._conv_id:
                 try:
+                    prof_id = None
+                    try:
+                        prof_id = self._session.get_profile_id() if hasattr(self._session, "get_profile_id") else None
+                    except Exception:
+                        prof_id = None
+
+                    # Treat synthetic default (0) as "no profile" for storage
+                    if prof_id in (0, "0"):
+                        prof_id = None
+
                     msg_db_id = int(
                         dbo.add_message(
                             self._db,
                             conversation_id=int(self._conv_id),
                             sender_type="assistant",
-                            sender_id=None,
+                            sender_id=prof_id,
                             content=final_text,
                             metadata=None,
                         )
@@ -425,6 +639,21 @@ class ChatController(QObject):
     def current_conversation_id(self) -> Optional[int]:
         """Return the active conversation_id, or None if unsaved/guest/admin."""
         return self._conv_id
+
+    def base_index_for_message_id(self, message_id: int) -> Optional[int]:
+        """
+        Return the in-memory history index for a given DB message id.
+        """
+        if message_id is None:
+            return None
+        try:
+            needle = int(message_id)
+        except Exception:
+            return None
+        for idx, entry in enumerate(self._history):
+            if entry.db_id is not None and int(entry.db_id) == needle:
+                return idx
+        return None
 
     def load_conversation(self, conversation_id: int, messages: list[dict]) -> None:
         """
@@ -507,7 +736,7 @@ class ChatController(QObject):
             return
 
         text = payload.get("text") or ""
-        attachments = payload.get("attachments") or []
+        attachments = self._resolve_attachment_paths(payload)
         msg_id = payload.get("message_id")
         base_index = payload.get("base_index")
 
@@ -571,7 +800,7 @@ class ChatController(QObject):
             return None
 
         text = payload.get("text") or ""
-        attachments = payload.get("attachments") or []
+        attachments = self._resolve_attachment_paths(payload)
         msg_id = payload.get("message_id")
         base_index = payload.get("base_index")
 
@@ -719,7 +948,7 @@ class ChatController(QObject):
         # pre-fill the input and pending attachments, but don't send yet.
         if role == "user" and user_payload:
             text = user_payload.get("text") or ""
-            attachments = user_payload.get("attachments") or []
+            attachments = self._resolve_attachment_paths(user_payload)
             try:
                 self.chat.input.setPlainText(text)
             except Exception:
@@ -827,8 +1056,50 @@ class ChatController(QObject):
                 if entry.db_id is not None:
                     # Attach the DB id so callers can use it.
                     payload["message_id"] = entry.db_id
+                meta = getattr(entry.msg, "metadata", None) or {}
+                try:
+                    atts_meta = meta.get("attachments")
+                    if atts_meta:
+                        payload["attachments_meta"] = atts_meta
+                except Exception:
+                    pass
 
         return payload
+
+    def _resolve_attachment_paths(self, payload: dict) -> list[str]:
+        """
+        Resolve filesystem paths for original attachments, preferring DB-backed metadata.
+        """
+        paths: list[str] = []
+        try:
+            atts_meta = payload.get("attachments_meta")
+        except Exception:
+            atts_meta = None
+
+        if isinstance(atts_meta, list):
+            for att in atts_meta:
+                if not isinstance(att, dict):
+                    continue
+                fid = att.get("file_id")
+                if fid is None or self._db is None:
+                    continue
+                try:
+                    path = dbo.cas_path_for_file(self._db, int(fid))
+                except Exception:
+                    path = None
+                if path:
+                    paths.append(str(path))
+
+        if not paths:
+            try:
+                fallback = payload.get("attachments") or []
+            except Exception:
+                fallback = []
+            for att in fallback:
+                if isinstance(att, str):
+                    paths.append(str(att))
+
+        return paths
 
     def _send_with_attachments(self, text: str, attachments: list[str]) -> None:
         if not attachments:
@@ -880,8 +1151,15 @@ class ChatController(QObject):
             )
         )
 
+        inj = self.system_injection_if_any()
+
         def _build_messages(_prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
+
+            # --- persona rule injection (same as _configure_stream) ---
+            if inj is not None:
+                hist.append(inj)
+
             for entry in self._history[-self._max_turns * 2:]:
                 m = entry.msg
                 has_attachments = bool(m.metadata and m.metadata.get("attachments"))

@@ -469,6 +469,36 @@ class ChatDisplay(QWidget):
             "base_index": base_idx,
         }
 
+    def scroll_to_base_index(self, base_index: int) -> None:
+        """
+        Scroll the chat view to the given base index (UI row).
+        """
+        try:
+            idx = int(base_index)
+        except Exception:
+            return
+        if idx < 0 or idx >= self._model.rowCount():
+            return
+
+        root = self.qml.rootObject()
+        if not root:
+            return
+        children = getattr(root, "children", lambda: [])()
+        if not children:
+            return
+        view = children[0]
+        try:
+            view.stickToBottom = False
+        except Exception:
+            pass
+        try:
+            view.positionViewAtIndex(idx, 0)
+        except Exception:
+            try:
+                view.positionViewAtIndex(idx)
+            except Exception:
+                pass
+
     def get_user_payload(self, index: int) -> Optional[dict]:
         payload = self.get_message_payload(index)
         if payload and payload.get("role") == "user":
@@ -486,3 +516,15 @@ class ChatDisplay(QWidget):
             if not self._attachments.contains(p):
                 self._attachments.append_path(p)
         self._call_qml("ensureAtEnd")
+
+    def add_pending_attachments_from_paths(self, paths: list[str]) -> None:
+        """
+        Append attachments to the pending list, deduping existing entries.
+        """
+        updated = False
+        for p in self._normalize_paths(paths or []):
+            if not self._attachments.contains(p):
+                self._attachments.append_path(p)
+                updated = True
+        if updated:
+            self._call_qml("ensureAtEnd")

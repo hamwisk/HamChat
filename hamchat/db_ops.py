@@ -1,5 +1,5 @@
 # hamchat/db_ops.py
-# from __future__ import annotations
+from __future__ import annotations
 import os, sqlite3, json, time, hashlib, hmac, secrets, logging
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Literal
@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from hamchat.paths import settings_dir
 from hamchat.db_init import ensure_database_ready  # reuse your creator/validator
 from hamchat import db_init as _dbi  # to reach _get_or_create_db_key()
+from hamchat import media_helper
 
 log = logging.getLogger("db.ops")
 
@@ -323,14 +324,31 @@ def count_admins(conn) -> int:
 
 
 def delete_user_safe(conn, user_id: int) -> None:
-    # ToDo: Future - Check for custom AI profiles linked with this user and remove them
+    """
+    Safely delete a user:
+      - refuse to delete the last admin
+      - delete the user’s custom AI profiles (and their avatars)
+      - rely on FKs to cascade conversations/messages, etc.
+    """
     cur = conn.cursor()
     cur.execute("SELECT role FROM user_auth WHERE id=?", (user_id,))
     row = cur.fetchone()
     if row and row[0] == "admin" and count_admins(conn) <= 1:
         raise RuntimeError("Cannot delete the last admin.")
-    cur.execute("DELETE FROM user_profiles WHERE id=?", (user_id,))
+
+    # Remove this user's custom AI profiles first (built-in/admin profiles are owner_user_id NULL).
+    cur.execute("SELECT id FROM ai_profiles WHERE owner_user_id=?", (int(user_id),))
+    rows = cur.fetchall()
+    for (pid,) in rows:
+        try:
+            delete_ai_profile(conn, int(pid))
+        except Exception:
+            log.exception("Failed to delete AI profile %s while deleting user %s", pid, user_id)
+
+    # Now delete the user profile (FKs handle auth, conversations, etc.)
+    cur.execute("DELETE FROM user_profiles WHERE id=?", (int(user_id),))
     conn.commit()
+
 
 
 # ---------- conversations & messages ----------
@@ -538,6 +556,169 @@ def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str, str]] = None) 
     return conn, mode
 
 
+# ---------- AI profiles ----------
+
+def _profile_row_to_dict(row) -> Dict[str, Any]:
+    cols = [
+        "id", "owner_user_id", "internal_name", "display_name", "short_description",
+        "avatar", "system_prompt", "allowed_models", "default_model_id",
+        "temperature", "top_p", "max_tokens", "is_builtin", "created", "updated",
+    ]
+    data = dict(zip(cols, row))
+    if data.get("allowed_models"):
+        try:
+            data["allowed_models"] = json.loads(data["allowed_models"])
+        except Exception:
+            data["allowed_models"] = []
+    else:
+        data["allowed_models"] = None
+    return data
+
+
+def create_ai_profile(conn, *, owner_user_id: Optional[int], internal_name: str, display_name: str,
+                      short_description: str = "", avatar: str = "", system_prompt: str = "",
+                      allowed_models: Optional[list[str]] = None, default_model_id: Optional[str] = None,
+                      temperature: Optional[float] = None, top_p: Optional[float] = None,
+                      max_tokens: Optional[int] = None, is_builtin: bool = False) -> int:
+    cur = conn.cursor()
+    ts = _now()
+    allowed_json = json.dumps(allowed_models) if allowed_models is not None else None
+    cur.execute(
+        """
+        INSERT INTO ai_profiles(owner_user_id, internal_name, display_name, short_description, avatar,
+                                system_prompt, allowed_models, default_model_id, temperature, top_p,
+                                max_tokens, is_builtin, created, updated)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (owner_user_id, internal_name, display_name, short_description, avatar, system_prompt,
+         allowed_json, default_model_id, temperature, top_p, max_tokens,
+         1 if is_builtin else 0, ts, ts),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_ai_profile(conn, profile_id: int, **fields) -> None:
+    if not fields:
+        return
+    cur = conn.cursor()
+    assignments = []
+    params = []
+    for key, val in fields.items():
+        if key == "allowed_models":
+            val = json.dumps(val) if val is not None else None
+        assignments.append(f"{key}=?")
+        params.append(val)
+    assignments.append("updated=?")
+    params.append(_now())
+    params.append(int(profile_id))
+    cur.execute(f"UPDATE ai_profiles SET {', '.join(assignments)} WHERE id=?", params)
+    conn.commit()
+
+
+def get_ai_profile(conn, profile_id: int) -> Optional[Dict[str, Any]]:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM ai_profiles WHERE id=?", (int(profile_id),))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return _profile_row_to_dict(row)
+
+
+def list_ai_profiles(conn, *, owner_user_id: Optional[int], include_builtin: bool = True) -> List[Dict[str, Any]]:
+    cur = conn.cursor()
+    if owner_user_id is None:
+        cur.execute(
+            "SELECT * FROM ai_profiles ORDER BY display_name ASC, id ASC"
+        )
+    else:
+        if include_builtin:
+            cur.execute(
+                "SELECT * FROM ai_profiles WHERE owner_user_id=? OR is_builtin=1 "
+                "ORDER BY display_name ASC, id ASC",
+                (int(owner_user_id),),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM ai_profiles WHERE owner_user_id=? "
+                "ORDER BY display_name ASC, id ASC",
+                (int(owner_user_id),),
+            )
+    rows = cur.fetchall()
+    return [_profile_row_to_dict(r) for r in rows]
+
+
+def delete_ai_profile(conn, profile_id: int) -> None:
+    """
+    Delete a non-default AI profile and, if it had a CAS-backed avatar that is no longer
+    referenced anywhere, clean up that avatar file as well.
+    """
+    cur = conn.cursor()
+
+    # Don’t allow deleting the default profile; mirror the previous behaviour.
+    cur.execute("SELECT avatar FROM ai_profiles WHERE id=?", (int(profile_id),))
+    row = cur.fetchone()
+    avatar = row[0] if row else None
+
+    cur.execute("DELETE FROM ai_profiles WHERE id=?", (int(profile_id),))
+    conn.commit()
+
+    # Best-effort CAS cleanup for the old avatar.
+    if avatar:
+        try:
+            media_helper.cleanup_profile_avatar(conn, avatar)
+        except Exception:
+            log.exception("Failed to clean up avatar for deleted profile %s", profile_id)
+
+
+
+def export_ai_profile(conn, profile_id: int) -> Dict[str, Any]:
+    profile = get_ai_profile(conn, profile_id)
+    if not profile:
+        raise ValueError("Profile not found")
+    data = dict(profile)
+    data["hamchat_profile_version"] = 1
+    return data
+
+
+def import_ai_profile(conn, *, owner_user_id: Optional[int], data: Dict[str, Any], is_builtin: bool = False) -> int:
+    display_name = (data.get("display_name") or "Imported profile").strip()
+    internal_name = (data.get("internal_name") or display_name.lower().replace(" ", "_")).strip()
+    allowed_models = data.get("allowed_models")
+    default_model_id = data.get("default_model_id")
+    temperature = data.get("temperature")
+    top_p = data.get("top_p")
+    max_tokens = data.get("max_tokens")
+    short_description = data.get("short_description") or ""
+    avatar = data.get("avatar") or ""
+    system_prompt = data.get("system_prompt") or ""
+
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM ai_profiles WHERE internal_name=?", (internal_name,))
+    if _one(cur):
+        internal_name = f"{internal_name}_import"
+    cur.execute("SELECT COUNT(*) FROM ai_profiles WHERE display_name=?", (display_name,))
+    if _one(cur):
+        display_name = f"{display_name} (import)"
+
+    profile_id = create_ai_profile(
+        conn,
+        owner_user_id=owner_user_id,
+        internal_name=internal_name,
+        display_name=display_name,
+        short_description=short_description,
+        avatar=avatar,
+        system_prompt=system_prompt,
+        allowed_models=allowed_models,
+        default_model_id=default_model_id,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        is_builtin=is_builtin,
+    )
+    return profile_id
+
+
 # ---------- Storage for attachments ----------
 
 def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
@@ -560,16 +741,23 @@ def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
 
     sha_blob = bytes.fromhex(sha256)
     cur = db.cursor()
-    cur.execute("SELECT id FROM files WHERE sha256=?", (sha_blob,))
+    original_name = Path(src_path).name
+    cur.execute("SELECT id, original_name FROM files WHERE sha256=?", (sha_blob,))
     row = cur.fetchone()
     if row:
-        return int(row[0])
+        file_id = int(row[0])
+        existing_name = row[1] if len(row) > 1 else None
+        if (existing_name is None or str(existing_name).strip() == "") and original_name:
+            try:
+                cur.execute("UPDATE files SET original_name=? WHERE id=?", (original_name, file_id))
+            except Exception:
+                log.exception("Failed to backfill original_name for file %s", file_id)
+        return file_id
 
     if raw_bytes is None:
         raw_bytes = Path(src_path).read_bytes()
     size_bytes = len(raw_bytes)
     kind = "image" if mime.startswith("image/") else "other"
-    original_name = Path(src_path).name
 
     cur.execute(
         "INSERT OR IGNORE INTO files(kind, mime, sha256, size_bytes, width, height, page_count, duration_ms, exif_json, thumb_sha256, original_name, ref_count, created) "
@@ -621,3 +809,56 @@ def cas_path_for_file(db, file_id: int) -> Optional[Path]:
     tmp_path = tmp_root / sha_hex
     tmp_path.write_bytes(raw_bytes)
     return tmp_path
+
+
+def list_conversation_files(db, conversation_id: int) -> List[Dict[str, Any]]:
+    """
+    Return unique files referenced by any message in a conversation, along with usage count.
+    """
+    cur = db.cursor()
+    cur.execute(
+        """
+        SELECT
+            f.id AS file_id,
+            f.original_name,
+            f.mime,
+            f.kind,
+            COUNT(*) AS ref_count,
+            MIN(m.created) AS first_used,
+            f.created
+        FROM messages AS m
+        JOIN message_files AS mf ON mf.message_id = m.id
+        JOIN files AS f ON f.id = mf.file_id
+        WHERE m.conversation_id = ? AND mf.role = 'attachment'
+        GROUP BY f.id, f.original_name, f.mime, f.kind, f.created
+        ORDER BY first_used ASC, f.created ASC, f.id ASC
+        """,
+        (int(conversation_id),),
+    )
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description] if cur.description else []
+    if not cols:
+        return []
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def list_file_occurrences(db, conversation_id: int, file_id: int) -> List[Dict[str, Any]]:
+    """
+    Return messages in the conversation that reference the given file as an attachment.
+    """
+    cur = db.cursor()
+    cur.execute(
+        """
+        SELECT m.id AS message_id, m.sender_type, m.created
+        FROM messages AS m
+        JOIN message_files AS mf ON mf.message_id = m.id
+        WHERE m.conversation_id = ? AND mf.file_id = ? AND mf.role = 'attachment'
+        ORDER BY m.created ASC, m.id ASC
+        """,
+        (int(conversation_id), int(file_id)),
+    )
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description] if cur.description else []
+    if not cols:
+        return []
+    return [dict(zip(cols, r)) for r in rows]

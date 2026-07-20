@@ -4,10 +4,11 @@
   "families_multimodal": [
     "mllama",
     "gemma3",
+    "gemma4",
     "idefics",
     "qwen3",
     "qwen2.5vl",
-    "llama4",   
+    "llama4",
     "granite3.2",
     "mistral-small3",
     "moondream"
@@ -26,15 +27,17 @@
   "regex_multimodal": [
     ".*llama3\\.[12]-vision.*",
     ".*gemma3.*",
-    ".*qwen3-vl.*",  
-    ".*qwen2\\.5vl.*",   
-    ".*llama4.*",    
+    "(?i).*gemma[-_ ]?4(?!.*mlx).*",
+    ".*qwen3-vl.*",
+    ".*qwen2\\.5vl.*",
+    ".*llama4.*",
     ".*granite3\\.2-vision.*",
-    ".*mistral-small3\\.1.*", 
+    ".*mistral-small3\\.1.*",
     ".*minicpm-v.*",
     ".*deepseek-ocr.*"
   ],
   "model_overrides": {
+    "maxwellb/gemma4-12b-it-oym:q4_K_S": "multimodal",
     "gemma3:latest": "multimodal",
     "llama3.2-vision:latest": "multimodal",
     "qwen3-vl:latest": "multimodal",   

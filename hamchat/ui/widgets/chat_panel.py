@@ -1,12 +1,15 @@
 # hamchat/ui/widgets/chat_panel.py
 from __future__ import annotations
-import json
+import json, logging
 from typing import List, Dict, Any
-from PyQt6.QtCore import Qt, QDateTime
+from PyQt6.QtCore import Qt, QDateTime, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, QToolButton, QFrame, QFormLayout,
-    QFileDialog, QMessageBox, QHBoxLayout, QSizePolicy
+    QFileDialog, QMessageBox, QHBoxLayout, QSizePolicy, QListWidget, QListWidgetItem,
+    QAbstractItemView, QMenu
 )
+
+log = logging.getLogger("ui.chat_panel")
 
 # Simple collapsible expander (same feel as SidePanel)
 class Expander(QFrame):
@@ -44,7 +47,11 @@ class ChatPanel(QWidget):
     Right-hand panel showing attachments (stub), conversation metadata, and export.
     Expects a ChatDisplay instance so we can read messages/updates.
     """
-    def __init__(self, parent=None, *, chat_display=None):
+    attachmentOpenRequested = pyqtSignal(int)
+    attachmentAttachRequested = pyqtSignal(int)
+    attachmentScrollRequested = pyqtSignal(int)
+
+    def __init__(self, parent=None, *, chat_display=None, attachments_loader=None):
         super().__init__(parent)
         self._cd = chat_display  # ChatDisplay
         self._created = QDateTime.currentDateTime()
@@ -52,6 +59,7 @@ class ChatPanel(QWidget):
         self._conv_id: int | None = None
         self._saved: bool = False
         self._title: str = ""
+        self._attachments_loader = attachments_loader
 
         root = QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(10)
 
@@ -71,6 +79,16 @@ class ChatPanel(QWidget):
         self._att_placeholder = QLabel("No attachments yet.")
         self._att_placeholder.setStyleSheet("color:#8b8f97; font-size:12px;")
         att_lay.addWidget(self._att_placeholder)
+        self._att_list = QListWidget(att_body)
+        self._att_list.setFrameShape(QFrame.Shape.NoFrame)
+        self._att_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._att_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._att_list.setUniformItemSizes(True)
+        self._att_list.setVisible(False)
+        self._att_list.itemDoubleClicked.connect(self._on_attachment_item_activated)
+        self._att_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._att_list.customContextMenuRequested.connect(self._on_attachment_context_menu)
+        att_lay.addWidget(self._att_list)
         att.set_content(att_body)
         root.addWidget(att)
 
@@ -130,6 +148,37 @@ class ChatPanel(QWidget):
         self._saved = False
         self._refresh_meta()
 
+    def set_attachments(self, rows: List[Dict[str, Any]]) -> None:
+        """Update the attachments list UI from DB rows."""
+        normalized: List[Dict[str, Any]] = []
+        self._att_list.clear()
+
+        for r in rows or []:
+            try:
+                row = dict(r)
+            except Exception:
+                if isinstance(r, dict):
+                    row = r
+                else:
+                    continue
+            normalized.append(row)
+            name = row.get("original_name") or "(unnamed file)"
+            ref_count = row.get("ref_count")
+            label = name
+            if isinstance(ref_count, (int, float)) and ref_count > 1:
+                label = f"{name} (x{int(ref_count)})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, row.get("file_id"))
+            self._att_list.addItem(item)
+
+        self._attachments = normalized
+        if not normalized:
+            self._att_placeholder.setVisible(True)
+            self._att_list.setVisible(False)
+        else:
+            self._att_placeholder.setVisible(False)
+            self._att_list.setVisible(True)
+
     # -------- internals ----------
     def _connect_model_signals(self):
         if not self._cd:
@@ -139,6 +188,56 @@ class ChatPanel(QWidget):
         model.rowsInserted.connect(lambda *_: self._refresh_meta())
         model.rowsRemoved.connect(lambda *_: self._refresh_meta())
         model.modelReset.connect(lambda *_: self._refresh_meta())
+
+    def _file_id_from_item(self, item: QListWidgetItem) -> int | None:
+        if item is None:
+            return None
+        val = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def _on_attachment_item_activated(self, item: QListWidgetItem):
+        file_id = self._file_id_from_item(item)
+        if file_id is not None:
+            self.attachmentOpenRequested.emit(int(file_id))
+
+    def _on_attachment_context_menu(self, pos):
+        item = self._att_list.itemAt(pos)
+        file_id = self._file_id_from_item(item)
+        if file_id is None:
+            return
+
+        menu = QMenu(self)
+        act_open = menu.addAction("Open")
+        act_attach = menu.addAction("Attach to prompt")
+        act_scroll = menu.addAction("Scroll to message…")
+        chosen = menu.exec(self._att_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_open:
+            self.attachmentOpenRequested.emit(int(file_id))
+        elif chosen == act_attach:
+            self.attachmentAttachRequested.emit(int(file_id))
+        elif chosen == act_scroll:
+            self.attachmentScrollRequested.emit(int(file_id))
+
+    def _refresh_attachments_from_loader(self) -> None:
+        """Ask the loader for attachments for the current conversation."""
+        if not callable(self._attachments_loader) or self._conv_id is None:
+            self.set_attachments([])
+            return
+        try:
+            rows = self._attachments_loader(int(self._conv_id))
+        except Exception:
+            log.exception("Attachment loader failed for conversation %s", self._conv_id)
+            self.set_attachments([])
+            return
+        try:
+            self.set_attachments(rows or [])
+        except Exception:
+            self.set_attachments([])
 
     def _refresh_meta(self):
         self._lbl_created.setText(self._created.toString(Qt.DateFormat.ISODate))
@@ -152,6 +251,7 @@ class ChatPanel(QWidget):
         self._lbl_status.setText("Saved" if self._saved and self._conv_id is not None else "Unsaved")
         self._lbl_conv_id.setText(str(self._conv_id) if self._conv_id is not None else "—")
         self._lbl_title.setText(self._title or "—")
+        self._refresh_attachments_from_loader()
 
     def _on_export_clicked(self):
         include_attachments = False
@@ -186,8 +286,10 @@ class ChatPanel(QWidget):
             "messages": messages,
         }
         if include_attachments:
-            # TODO: fill with real attachment export later
-            payload["attachments"] = []  # stub
+            try:
+                payload["attachments"] = [dict(a) for a in self._attachments] if self._attachments else []
+            except Exception:
+                payload["attachments"] = []
 
         try:
             with open(path, "w", encoding="utf-8") as f:

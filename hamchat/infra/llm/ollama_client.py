@@ -1,10 +1,11 @@
 # hamchat/infra/llm/ollama_client.py
 from __future__ import annotations
-import json, requests
+import json, logging, requests
 from typing import Iterator, List, Dict
 from .base import ModelClient, ChatMessage, StreamEvent
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"  # mirrors your registry default
+log = logging.getLogger("llm.ollama")
 
 class OllamaClient(ModelClient):
     def __init__(self, base_url: str = DEFAULT_OLLAMA, timeout: int = 269):
@@ -13,6 +14,13 @@ class OllamaClient(ModelClient):
 
     def stream_chat(self, *, model: str, messages: List[ChatMessage], options: Dict) -> Iterator[StreamEvent]:
         # Build wire messages; translate our internal .parts → Ollama's "images"
+        system_messages = [message for message in messages if message.role == "system"]
+        log.debug(
+            "Ollama request input: roles=%s system_count=%d system_content_lengths=%s",
+            [message.role for message in messages],
+            len(system_messages),
+            [len(message.content or "") for message in system_messages],
+        )
         wire = []
         for m in messages:
             md = {
@@ -33,6 +41,15 @@ class OllamaClient(ModelClient):
                 if images:
                     md["images"] = images
             wire.append(md)
+
+        wire_system_messages = [message for message in wire if message["role"] == "system"]
+        log.debug(
+            "Ollama request wire payload: roles=%s system_count=%d system_content_lengths=%s options=%s",
+            [message["role"] for message in wire],
+            len(wire_system_messages),
+            [len(message["content"] or "") for message in wire_system_messages],
+            options or {},
+        )
 
         payload = {
             "model": model,

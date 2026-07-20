@@ -68,8 +68,9 @@ class SidePanel(QWidget):
     request_logout = pyqtSignal()
 
     # New intents (wire up as you add features)
-    create_profile = pyqtSignal()
+    ai_profiles_manager = pyqtSignal()
     open_profile = pyqtSignal(int)
+    profile_activated = pyqtSignal(int)
     create_conversation = pyqtSignal()
     open_conversation = pyqtSignal(int)
     open_memory_view = pyqtSignal()
@@ -104,6 +105,7 @@ class SidePanel(QWidget):
         self._btn_auth = None          # NEW
 
         self._active_chat_id: Optional[int] = None
+        self._active_profile_id: Optional[int] = None
 
         # Keep handles to expanders so we can enable/disable/show/hide by role
         self._exp_profiles = None
@@ -155,13 +157,13 @@ class SidePanel(QWidget):
         self._exp_profiles = profs
         self._prof_list = QListWidget()
         self._prof_list.itemActivated.connect(
-            lambda it: self.open_profile.emit(int(it.data(Qt.ItemDataRole.UserRole)))
+            lambda it: self.profile_activated.emit(int(it.data(Qt.ItemDataRole.UserRole)))
         )
         self._prof_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._prof_list.customContextMenuRequested.connect(self._on_profiles_ctx_menu)
 
-        btn_new_prof = QPushButton("New profile")
-        btn_new_prof.clicked.connect(self.create_profile.emit)
+        btn_new_prof = QPushButton("AI-Profiles Manager")
+        btn_new_prof.clicked.connect(self.ai_profiles_manager.emit)
 
         pf_wrap = QWidget(); pfl = QVBoxLayout(pf_wrap); pfl.setContentsMargins(0, 0, 0, 0)
         pfl.addWidget(self._prof_list); pfl.addWidget(btn_new_prof)
@@ -259,13 +261,22 @@ class SidePanel(QWidget):
         is_user = role == "user"
         is_admin = role == "admin"
 
-        # My AI Profiles / My Chats / Memory
-        for exp in (self._exp_profiles, self._exp_chats, self._exp_mem):
+        # My AI Profiles
+        if self._exp_profiles:
+            if is_guest:
+                self._exp_profiles.setVisible(True)
+                self._exp_profiles.setEnabled(False)
+            else:
+                self._exp_profiles.setVisible(True)
+                self._exp_profiles.setEnabled(True)
+
+        # My Chats / Memory
+        for exp in (self._exp_chats, self._exp_mem):
             if not exp:
                 continue
             if is_guest:
                 exp.setVisible(True)
-                exp.setEnabled(False)   # teaser: visible but faded / inactive
+                exp.setEnabled(False)
             elif is_user:
                 exp.setVisible(True)
                 exp.setEnabled(True)
@@ -305,14 +316,21 @@ class SidePanel(QWidget):
             username = getattr(state, "username", "Guest")
             user_id = getattr(state, "user_id", None)
             role = getattr(state, "role", "guest")
+            profile_id = getattr(state, "profile_id", None)
         except Exception:
-            username, user_id, role = "Guest", None, "guest"
+            username, user_id, role, profile_id = "Guest", None, "guest", None
+
+        # Treat "no profile stored yet" as the synthetic Default (id 0)
+        self._active_profile_id = 0 if profile_id is None else profile_id
+
         if self._name_lbl:
             self._name_lbl.setText(username or "Guest")
         if self._btn_auth:
             self._btn_auth.setText("Logout" if user_id else "Login")
+
         # Apply role-specific UI
         self._apply_role_mode(role)
+
         # Refresh role-dependent lists
         self.refresh_profiles()
         self.refresh_chats()
@@ -405,22 +423,63 @@ class SidePanel(QWidget):
         except Exception as e:
             log.exception("List loader failed: %s", e)
             items = ()
+
         is_chat_list = (widget is self._chat_list)
-        active_id = self._active_chat_id if is_chat_list else None
+        is_profile_list = (widget is self._prof_list)
+        active_id = self._active_chat_id if is_chat_list else (self._active_profile_id if is_profile_list else None)
         selected_item = None
-        for item_id, label in items:
+
+        for raw in items:
+            # Support (id, label) or (id, label, tooltip)
+            if len(raw) == 3:
+                item_id, label, tooltip = raw
+            else:
+                item_id, label = raw
+                tooltip = ""
+
             display = label
             it = QListWidgetItem()
             it.setData(Qt.ItemDataRole.UserRole, int(item_id))
+            if tooltip:
+                it.setToolTip(tooltip)
             if is_chat_list and active_id is not None and int(item_id) == int(active_id):
                 # Mark active chat visually
                 display = f"● {label}"
+                f = it.font(); f.setBold(True); it.setFont(f)
+                selected_item = it
+            if is_profile_list and active_id is not None and int(item_id) == int(active_id):
+                display = f"★ {label}"
                 f = it.font(); f.setBold(True); it.setFont(f)
                 selected_item = it
             it.setText(display)
             widget.addItem(it)
             if selected_item is not None:
                 widget.setCurrentItem(selected_item)
+
+    def set_active_profile(self, profile_id: Optional[int]) -> None:
+        """Highlight the active AI profile."""
+        self._active_profile_id = profile_id
+        if not self._prof_list:
+            return
+        lst = self._prof_list
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            it = lst.item(i)
+            label = it.text()
+            if label.startswith("★ "):
+                it.setText(label[2:])
+            f = it.font(); f.setBold(False); it.setFont(f)
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            try:
+                pid = int(pid)
+            except Exception:
+                pid = None
+            if profile_id is not None and pid is not None and int(pid) == int(profile_id):
+                if not it.text().startswith("★ "):
+                    it.setText(f"★ {it.text()}")
+                f = it.font(); f.setBold(True); it.setFont(f)
+                lst.setCurrentItem(it)
+        lst.blockSignals(False)
 
     def _apply_filter(self, text: str):
         text = (text or "").lower().strip()
@@ -439,23 +498,11 @@ class SidePanel(QWidget):
             return
         menu = QMenu(self)
         act_use = QAction("Set as active", self)
-        # For now we just visually star it; you can pair with a session setter later.
-        act_use.triggered.connect(lambda: self._star_profile_item(item))
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        if pid is not None:
+            act_use.triggered.connect(lambda: self.profile_activated.emit(int(pid)))
         menu.addAction(act_use)
         menu.exec(self._prof_list.mapToGlobal(pos))
-
-    def _star_profile_item(self, it: QListWidgetItem):
-        # strip any existing star
-        for i in range(self._prof_list.count()):
-            cur = self._prof_list.item(i)
-            label = cur.text()
-            if label.startswith("★ "):
-                cur.setText(label[2:])
-            f = cur.font(); f.setBold(False); cur.setFont(f)
-        label = it.text()
-        if not label.startswith("★ "):
-            it.setText(f"★ {label}")
-        f = it.font(); f.setBold(True); it.setFont(f)
 
     def _on_chats_ctx_menu(self, pos: QPoint):
         if not self._chat_list:

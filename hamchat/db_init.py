@@ -1,6 +1,6 @@
 # hamchat/db_init.py
 from __future__ import annotations
-import logging, os, sys, json, stat
+import logging, os, sys, json, stat, re, time
 from pathlib import Path
 from typing import Optional, Tuple
 from .paths import settings_dir
@@ -91,6 +91,7 @@ def ensure_database_ready(data_dir: Path, *, update_settings: bool = True) -> in
             if db_mode in ("secure", "strict") and detected == "open":
                 log.error("Engine mismatch: meta says %s, but file opens as plaintext.", db_mode)
                 return 1
+            _migrate_existing_schema(conn, db_mode)
             # Reflect actual db_mode into settings if missing/stale
             if update_settings:
                 cfg = load_settings(settings_path) if settings_path.exists() else {}
@@ -379,6 +380,54 @@ def _get_or_create_field_key(existing_only: bool = False) -> Optional[bytes]:
 
 # ------------------------- schema -------------------------
 
+MEMORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS persistent_memory (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_user_id INTEGER NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL CHECK(scope IN ('user','chat','profile','admin','global')),
+  conversation_id INTEGER NULL REFERENCES saved_conversations(id) ON DELETE CASCADE,
+  profile_id INTEGER NULL REFERENCES ai_profiles(id) ON DELETE CASCADE,
+  subject TEXT,
+  content TEXT NULL,
+  content_ct BLOB NULL,
+  content_nonce BLOB NULL,
+  content_key_id INTEGER NULL,
+  weight REAL NOT NULL DEFAULT 0.5 CHECK(weight >= 0.0 AND weight <= 1.0),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  retention_until INTEGER,
+  embedding_ref TEXT,
+  embedding_model TEXT,
+  embedding_updated INTEGER,
+  CHECK(
+    (scope='chat' AND conversation_id IS NOT NULL AND profile_id IS NULL) OR
+    (scope='profile' AND profile_id IS NOT NULL AND conversation_id IS NULL) OR
+    (scope IN ('user','admin','global') AND conversation_id IS NULL AND profile_id IS NULL)
+  )
+)
+"""
+
+MEMORY_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_memory_owner_scope ON persistent_memory(owner_user_id, scope, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_conversation ON persistent_memory(conversation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_profile ON persistent_memory(profile_id)",
+)
+
+MEMORY_EMBEDDING_SQL = """
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+  memory_id INTEGER PRIMARY KEY REFERENCES persistent_memory(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  format_version INTEGER NOT NULL,
+  dimension INTEGER NOT NULL CHECK(dimension > 0),
+  vector BLOB NOT NULL,
+  content_fingerprint TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+)
+"""
+
 DDL_CORE = f"""
 PRAGMA foreign_keys=ON;
 
@@ -473,23 +522,13 @@ CREATE INDEX IF NOT EXISTS idx_ai_profiles_owner
 CREATE INDEX IF NOT EXISTS idx_ai_profiles_builtin
   ON ai_profiles(is_builtin);
 
--- Persistent memory skeleton
-CREATE TABLE IF NOT EXISTS persistent_memory (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope TEXT CHECK(scope IN ('user','conversation','global')),
-  user_id INTEGER NULL,
-  conversation_id INTEGER NULL,
-  subject TEXT,
-  content TEXT NULL,
-  content_ct BLOB NULL,
-  content_nonce BLOB NULL,
-  content_key_id INTEGER NULL,
-  importance INTEGER DEFAULT 0,
-  reinforced_at INTEGER,
-  created INTEGER,
-  vector_ref TEXT,
-  retention_until INTEGER
-);
+-- Persistent memory (manual HamMem foundation)
+{MEMORY_TABLE_SQL};
+CREATE INDEX IF NOT EXISTS idx_memory_owner_scope ON persistent_memory(owner_user_id, scope, enabled);
+CREATE INDEX IF NOT EXISTS idx_memory_conversation ON persistent_memory(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_memory_profile ON persistent_memory(profile_id);
+{MEMORY_EMBEDDING_SQL};
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_identity ON memory_embeddings(provider, model, format_version, dimension);
 
 -- File metadata (payloads are stored in encrypted CAS outside DB)
 CREATE TABLE IF NOT EXISTS files (
@@ -601,3 +640,142 @@ def _create_schema(conn, mode: str) -> None:
         cur.executescript(DDL_STRICT_TRIGGERS)
     # ref_count maintenance for files via message_files
     cur.executescript(DDL_REFCOUNT_TRIGGERS)
+
+
+def _version_key(value: str) -> tuple[int, int, int, int]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\.(\d+)", str(value or ""))
+    if not match:
+        raise RuntimeError(f"Unsupported database schema version {value!r}; manual recovery is required.")
+    return tuple(int(part) for part in match.groups())
+
+
+def _read_schema_version(conn) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if not row or not row[0]:
+        raise RuntimeError("Database meta.schema_version is missing; cannot migrate safely.")
+    return str(row[0])
+
+
+def _create_memory_objects(cur) -> None:
+    cur.execute(MEMORY_TABLE_SQL)
+    for statement in MEMORY_INDEX_SQL:
+        cur.execute(statement)
+
+
+def _create_embedding_objects(cur) -> None:
+    cur.execute(MEMORY_EMBEDDING_SQL)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_embeddings_identity ON memory_embeddings(provider, model, format_version, dimension)")
+
+
+def _create_memory_strict_triggers(cur) -> None:
+    cur.execute("""CREATE TRIGGER IF NOT EXISTS trg_memory_strict_ins
+    BEFORE INSERT ON persistent_memory
+    WHEN (SELECT value FROM meta WHERE key='db_mode')='strict' AND NEW.content IS NOT NULL
+    BEGIN SELECT RAISE(ABORT, 'strict mode requires encrypted content'); END""")
+    cur.execute("""CREATE TRIGGER IF NOT EXISTS trg_memory_strict_upd
+    BEFORE UPDATE ON persistent_memory
+    WHEN (SELECT value FROM meta WHERE key='db_mode')='strict' AND NEW.content IS NOT NULL
+    BEGIN SELECT RAISE(ABORT, 'strict mode requires encrypted content'); END""")
+
+
+def _memory_table_is_current(cur) -> bool:
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(persistent_memory)")}
+    return {"owner_user_id", "profile_id", "weight", "enabled", "updated"}.issubset(cols)
+
+
+def _legacy_memory_rows(cur, mode: str) -> tuple[int, int]:
+    """Copy only legacy records whose owner, scope, target, and storage are provable."""
+    columns = [row[1] for row in cur.execute("PRAGMA table_info(persistent_memory_legacy)")]
+    rows = cur.execute("SELECT * FROM persistent_memory_legacy").fetchall()
+    copied = skipped = 0
+    now = int(time.time())
+    for row in rows:
+        legacy = dict(zip(columns, row))
+        scope = {"user": "user", "conversation": "chat", "global": "global"}.get(legacy.get("scope"))
+        owner = legacy.get("user_id")
+        if scope is None or not isinstance(owner, int):
+            skipped += 1
+            continue
+        role_row = cur.execute("SELECT role FROM user_auth WHERE id=?", (owner,)).fetchone()
+        if not role_row or (scope in {"user", "chat"} and role_row[0] != "user") or (scope == "global" and role_row[0] != "admin"):
+            skipped += 1
+            continue
+        conversation_id = legacy.get("conversation_id") if scope == "chat" else None
+        if scope == "chat":
+            target = cur.execute("SELECT 1 FROM saved_conversations WHERE id=? AND user_id=?", (conversation_id, owner)).fetchone()
+            if not isinstance(conversation_id, int) or not target:
+                skipped += 1
+                continue
+        content = legacy.get("content")
+        content_ct, nonce = legacy.get("content_ct"), legacy.get("content_nonce")
+        if mode == "strict":
+            if content is not None or not content_ct or not nonce:
+                skipped += 1
+                continue
+            content = None
+        elif not isinstance(content, str):
+            skipped += 1
+            continue
+        importance = legacy.get("importance", 0.5)
+        try:
+            weight = float(importance)
+        except (TypeError, ValueError):
+            weight = 0.5
+        if not 0.0 <= weight <= 1.0:
+            weight = 0.5
+        created = legacy.get("created") if isinstance(legacy.get("created"), int) else now
+        cur.execute(
+            "INSERT INTO persistent_memory(owner_user_id, scope, conversation_id, profile_id, subject, content, content_ct, content_nonce, content_key_id, weight, enabled, created, updated, retention_until, embedding_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (owner, scope, conversation_id, None, legacy.get("subject"), content, content_ct, nonce,
+             legacy.get("content_key_id"), weight, 1, created, created,
+             legacy.get("retention_until"), legacy.get("vector_ref")),
+        )
+        copied += 1
+    return copied, skipped
+
+
+def _migrate_memory_table(cur, mode: str) -> None:
+    exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='persistent_memory'").fetchone()
+    if not exists:
+        _create_memory_objects(cur)
+        return
+    if _memory_table_is_current(cur):
+        _create_memory_objects(cur)
+        return
+    cur.execute("DROP TRIGGER IF EXISTS trg_memory_strict_ins")
+    cur.execute("DROP TRIGGER IF EXISTS trg_memory_strict_upd")
+    cur.execute("ALTER TABLE persistent_memory RENAME TO persistent_memory_legacy")
+    _create_memory_objects(cur)
+    copied, skipped = _legacy_memory_rows(cur, mode)
+    cur.execute("DROP TABLE persistent_memory_legacy")
+    log.info("Migrated provisional persistent_memory records: copied=%s skipped=%s", copied, skipped)
+
+
+def _migrate_existing_schema(conn, mode: str) -> None:
+    current = _read_schema_version(conn)
+    current_key, target_key = _version_key(current), _version_key(SCHEMA_VERSION)
+    if current_key > target_key:
+        log.warning("Database schema %s is newer than this application (%s); leaving it untouched.", current, SCHEMA_VERSION)
+        return
+    if current_key == target_key:
+        return
+    migrations = (("2026-07-28.0", _migrate_memory_table), ("2026-07-28.1", lambda cur, mode: _create_embedding_objects(cur)))
+    for version, migration in migrations:
+        if current_key >= _version_key(version):
+            continue
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            migration(cur, mode)
+            if mode == "strict":
+                _create_memory_strict_triggers(cur)
+            cur.execute("UPDATE meta SET value=? WHERE key='schema_version'", (version,))
+            if cur.rowcount != 1:
+                raise RuntimeError("Unable to update meta.schema_version during migration.")
+            cur.execute("UPDATE meta SET value=strftime('%s','now') WHERE key='updated'")
+            conn.commit()
+            current_key = _version_key(version)
+            log.info("Migrated database schema to %s.", version)
+        except Exception as exc:
+            conn.rollback()
+            raise RuntimeError(f"Schema migration to {version} failed; database was rolled back.") from exc

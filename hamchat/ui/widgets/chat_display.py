@@ -5,7 +5,7 @@ import time
 
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Any, Optional
+from typing import Callable, List, Any, Optional
 from PyQt6.QtCore import pyqtSlot, Qt, QUrl, pyqtSignal, QAbstractListModel, QModelIndex, QVariant, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLineEdit, QPushButton
@@ -171,8 +171,9 @@ class ChatDisplay(QWidget):
     sig_file_detected = pyqtSignal(str, str)
     bubbleAction = pyqtSignal(str, int, str, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, local_command_handler: Optional[Callable[[str], bool]] = None):
         super().__init__(parent)
+        self._local_command_handler = local_command_handler
         self.PLACEHOLDER = "Thinking\u2026"
         self._qml_tokens = {}
         self._model = MessageListModel([])
@@ -242,6 +243,15 @@ class ChatDisplay(QWidget):
         # Don't allow submitting while streaming a response
         if self._streaming:
             return
+
+        if self._local_command_handler:
+            try:
+                if self._local_command_handler(text):
+                    self.input.clear()
+                    QTimer.singleShot(0, self.clear_attachments)
+                    return
+            except Exception:
+                pass
 
         # Take a snapshot of attachments *before* we decide to bail
         attachments = self._attachments.snapshot()

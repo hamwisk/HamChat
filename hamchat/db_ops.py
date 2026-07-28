@@ -1,6 +1,7 @@
 # hamchat/db_ops.py
 from __future__ import annotations
-import os, sqlite3, json, time, hashlib, hmac, secrets, logging
+import os, sqlite3, json, time, hashlib, hmac, secrets, logging, math
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Literal
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -17,6 +18,7 @@ CAS_MAGIC = b"HCAS1"
 
 Role = Literal["user", "admin"]
 SenderType = Literal["user", "assistant", "system", "tool"]
+MemoryScope = Literal["user", "chat", "profile", "admin", "global"]
 
 
 # ---------- password hashing (scrypt) ----------
@@ -364,6 +366,81 @@ def create_conversation(conn, user_id: int, title: str) -> int:
     return conv_id
 
 
+def _export_created_to_epoch(value: Any) -> Optional[int]:
+    """Convert an exported chat timestamp to the schema's epoch-seconds format."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Invalid chat created timestamp.")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        raise ValueError("Invalid chat created timestamp.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Invalid chat created timestamp.") from exc
+    return int(parsed.timestamp())
+
+
+def import_chat_export(conn, *, user_id: int, payload: Dict[str, Any]) -> int:
+    """Atomically import a ChatPanel JSON export for one local user."""
+    if not isinstance(payload, dict):
+        raise ValueError("Chat export must be a JSON object.")
+
+    title = payload.get("title")
+    messages = payload.get("messages")
+    if not isinstance(title, str) or not isinstance(messages, list):
+        raise ValueError("Chat export is missing a valid title or messages list.")
+    created = _export_created_to_epoch(payload.get("created"))
+
+    normalized_messages: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
+    valid_roles = {"user", "assistant", "system", "tool"}
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("Chat export contains an invalid message.")
+        role = message.get("role")
+        text = message.get("text")
+        if role not in valid_roles or not isinstance(text, str):
+            raise ValueError("Chat export contains an invalid message.")
+        thumbs = message.get("thumbs", [])
+        if not isinstance(thumbs, list) or not all(isinstance(thumb, str) for thumb in thumbs):
+            raise ValueError("Chat export contains invalid thumbnail data.")
+        normalized_messages.append((role, text, {"thumbs": thumbs} if thumbs else None))
+
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN")
+        cur.execute(
+            "INSERT INTO saved_conversations(user_id, title, created) VALUES(?,?,?)",
+            (int(user_id), title, created if created is not None else _now()),
+        )
+        conversation_id = int(cur.lastrowid)
+        mode = read_db_mode(conn)
+
+        for role, text, metadata in normalized_messages:
+            metadata_json = json.dumps(metadata or {})
+            if mode == "strict":
+                ct, nonce = encrypt_field(conn, text)
+                cur.execute(
+                    "INSERT INTO messages(conversation_id, sender_type, sender_id, content, content_ct, content_nonce, content_key_id, metadata, created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (conversation_id, role, None, None, ct, nonce, 1, metadata_json, _now()),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO messages(conversation_id, sender_type, sender_id, content, content_ct, content_nonce, content_key_id, metadata, created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (conversation_id, role, None, text, None, None, None, metadata_json, _now()),
+                )
+
+        conn.commit()
+        return conversation_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def rename_conversation(conn, conversation_id: int, title: str) -> None:
     """
     Update the title of a saved conversation.
@@ -540,6 +617,124 @@ def read_schema_version(conn) -> str:
     cur = conn.cursor()
     cur.execute("SELECT value FROM meta WHERE key='schema_version'")
     return _one(cur) or "unknown"
+
+
+# ---------- persistent memories ----------
+
+def _memory_role(conn, owner_user_id: int) -> str:
+    row = conn.execute("SELECT role FROM user_auth WHERE id=?", (int(owner_user_id),)).fetchone()
+    if not row or row[0] not in {"user", "admin"}:
+        raise PermissionError("Memory owner is not an active account.")
+    return str(row[0])
+
+
+def _validate_memory(conn, *, owner_user_id: int, scope: str,
+                     conversation_id: Optional[int], profile_id: Optional[int],
+                     weight: Any) -> tuple[str, Optional[int], Optional[int], float]:
+    role = _memory_role(conn, owner_user_id)
+    scope = str(scope or "").strip().lower()
+    allowed = {"user", "chat", "profile"} if role == "user" else {"admin", "global"}
+    if scope not in allowed:
+        raise PermissionError("That memory scope is not available to this account.")
+    if isinstance(weight, bool):
+        raise ValueError("Memory weight must be a number from 0.0 to 1.0.")
+    try:
+        value = float(weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Memory weight must be a number from 0.0 to 1.0.") from exc
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("Memory weight must be from 0.0 to 1.0.")
+    conversation_id = int(conversation_id) if conversation_id is not None else None
+    profile_id = int(profile_id) if profile_id is not None else None
+    if scope == "chat":
+        if conversation_id is None or profile_id is not None:
+            raise ValueError("Chat memories require exactly one chat target.")
+        if not conn.execute("SELECT 1 FROM saved_conversations WHERE id=? AND user_id=?", (conversation_id, owner_user_id)).fetchone():
+            raise PermissionError("The selected chat is not accessible to this account.")
+    elif scope == "profile":
+        if profile_id is None or conversation_id is not None:
+            raise ValueError("Profile memories require exactly one AI profile target.")
+        if not conn.execute("SELECT 1 FROM ai_profiles WHERE id=? AND (owner_user_id=? OR is_builtin=1)", (profile_id, owner_user_id)).fetchone():
+            raise PermissionError("The selected AI profile is not accessible to this account.")
+    elif conversation_id is not None or profile_id is not None:
+        raise ValueError("This memory scope cannot have a chat or profile target.")
+    return scope, conversation_id, profile_id, value
+
+
+def _memory_row_to_dict(conn, row) -> Dict[str, Any]:
+    cols = ("id", "owner_user_id", "scope", "conversation_id", "profile_id", "subject", "content",
+            "content_ct", "content_nonce", "content_key_id", "weight", "enabled", "created", "updated",
+            "retention_until", "embedding_ref", "embedding_model", "embedding_updated")
+    data = dict(zip(cols, row))
+    if read_db_mode(conn) == "strict":
+        try:
+            data["content"] = decrypt_field(conn, bytes(data["content_ct"]), bytes(data["content_nonce"]))
+        except Exception as exc:
+            log.warning("Could not decrypt memory id=%s", data.get("id"))
+            raise RuntimeError("Could not decrypt stored memory content.") from exc
+    data.pop("content_ct", None)
+    data.pop("content_nonce", None)
+    data.pop("content_key_id", None)
+    return data
+
+
+def list_memories(conn, *, owner_user_id: int) -> List[Dict[str, Any]]:
+    _memory_role(conn, owner_user_id)
+    rows = conn.execute("SELECT * FROM persistent_memory WHERE owner_user_id=? ORDER BY updated DESC, id DESC", (int(owner_user_id),)).fetchall()
+    return [_memory_row_to_dict(conn, row) for row in rows]
+
+
+def get_memory(conn, *, owner_user_id: int, memory_id: int) -> Optional[Dict[str, Any]]:
+    _memory_role(conn, owner_user_id)
+    row = conn.execute("SELECT * FROM persistent_memory WHERE id=? AND owner_user_id=?", (int(memory_id), int(owner_user_id))).fetchone()
+    return _memory_row_to_dict(conn, row) if row else None
+
+
+def create_memory(conn, *, owner_user_id: int, content: str, scope: str,
+                  conversation_id: Optional[int] = None, profile_id: Optional[int] = None,
+                  weight: Any = 0.5, enabled: bool = True) -> int:
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Memory content cannot be empty.")
+    scope, conversation_id, profile_id, weight = _validate_memory(
+        conn, owner_user_id=owner_user_id, scope=scope, conversation_id=conversation_id,
+        profile_id=profile_id, weight=weight)
+    ts, mode = _now(), read_db_mode(conn)
+    if mode == "strict":
+        ct, nonce = encrypt_field(conn, content)
+        values = (owner_user_id, scope, conversation_id, profile_id, ct, nonce, 1, weight, int(bool(enabled)), ts, ts)
+        sql = "INSERT INTO persistent_memory(owner_user_id,scope,conversation_id,profile_id,content,content_ct,content_nonce,content_key_id,weight,enabled,created,updated) VALUES(?,?,?,?,NULL,?,?,?,?,?,?,?)"
+    else:
+        values = (owner_user_id, scope, conversation_id, profile_id, content, weight, int(bool(enabled)), ts, ts)
+        sql = "INSERT INTO persistent_memory(owner_user_id,scope,conversation_id,profile_id,content,weight,enabled,created,updated) VALUES(?,?,?,?,?,?,?,?,?)"
+    cur = conn.cursor(); cur.execute(sql, values); conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_memory(conn, *, owner_user_id: int, memory_id: int, content: str, scope: str,
+                  conversation_id: Optional[int] = None, profile_id: Optional[int] = None,
+                  weight: Any = 0.5, enabled: bool = True) -> None:
+    if not get_memory(conn, owner_user_id=owner_user_id, memory_id=memory_id):
+        raise PermissionError("Memory not found or not owned by this account.")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Memory content cannot be empty.")
+    scope, conversation_id, profile_id, weight = _validate_memory(conn, owner_user_id=owner_user_id, scope=scope, conversation_id=conversation_id, profile_id=profile_id, weight=weight)
+    ts, mode = _now(), read_db_mode(conn)
+    # Derived vectors are never authoritative; invalidate before changing source content.
+    conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (int(memory_id),))
+    if mode == "strict":
+        ct, nonce = encrypt_field(conn, content)
+        conn.execute("UPDATE persistent_memory SET scope=?,conversation_id=?,profile_id=?,content=NULL,content_ct=?,content_nonce=?,content_key_id=1,weight=?,enabled=?,updated=? WHERE id=? AND owner_user_id=?", (scope, conversation_id, profile_id, ct, nonce, weight, int(bool(enabled)), ts, int(memory_id), int(owner_user_id)))
+    else:
+        conn.execute("UPDATE persistent_memory SET scope=?,conversation_id=?,profile_id=?,content=?,content_ct=NULL,content_nonce=NULL,content_key_id=NULL,weight=?,enabled=?,updated=? WHERE id=? AND owner_user_id=?", (scope, conversation_id, profile_id, content, weight, int(bool(enabled)), ts, int(memory_id), int(owner_user_id)))
+    conn.commit()
+
+
+def delete_memory(conn, *, owner_user_id: int, memory_id: int) -> None:
+    _memory_role(conn, owner_user_id)
+    cur = conn.execute("DELETE FROM persistent_memory WHERE id=? AND owner_user_id=?", (int(memory_id), int(owner_user_id)))
+    conn.commit()
+    if cur.rowcount != 1:
+        raise PermissionError("Memory not found or not owned by this account.")
 
 
 # ---------- boot glue you’ll call from app startup ----------

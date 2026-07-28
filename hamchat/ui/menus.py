@@ -20,6 +20,7 @@ class Menus:
         set_variant: Callable[[str], None],
         # file actions
         new_chat: Callable[[], None],
+        import_chat: Callable[[], None],
         app_exit: Callable[[], None],
         toggle_side_panel: Callable[[], None],
         # model (NEW)
@@ -37,6 +38,7 @@ class Menus:
         self._get_variant = get_variant
         self._set_variant = set_variant
         self._new_chat = new_chat
+        self._import_chat = import_chat
         self._exit = app_exit
         self._toggle_side = toggle_side_panel
 
@@ -57,6 +59,7 @@ class Menus:
         m = self.mb.addMenu("&File")
         act_new = m.addAction("New Chat", self._new_chat)
         act_new.setShortcut(QKeySequence("Ctrl+N"))
+        m.addAction("Import chat…", self._import_chat)
         m.addSeparator()
         act_exit = m.addAction("Exit", self._exit)
         act_exit.setShortcut(QKeySequence("Ctrl+Q"))

@@ -4,7 +4,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Callable, Optional, List, Dict
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 from hamchat.infra.llm.thread_broker import ThreadBroker
@@ -14,6 +14,7 @@ from hamchat import db_ops as dbo  # persistence API (create_conversation, add_m
 from hamchat.core.session import SessionManager
 from hamchat.media_helper import process_images
 from hamchat.infra.llm.base import ModelClient  # if you want to type-hint, optional
+from hamchat.memory_embeddings import MemoryEmbeddingService, OllamaEmbeddingProvider
 
 log = logging.getLogger("ui.chat_controller")
 
@@ -43,6 +44,7 @@ class ChatController(QObject):
     conversation_started = pyqtSignal(int)  # conversation_id
     # Fired when we programmatically create a forked conversation and want the UI to open it
     forked_conversation = pyqtSignal(int)   # conversation_id
+    ham_mem_status = pyqtSignal(str)
 
     def __init__(        self,
         chat_display,
@@ -52,6 +54,7 @@ class ChatController(QObject):
         parent: Optional[QObject] = None,
         db=None,
         session: Optional[SessionManager] = None,
+        local_command_handler: Optional[Callable[[str], bool]] = None,
     ):
         super().__init__(parent)
         self.chat = chat_display
@@ -70,7 +73,14 @@ class ChatController(QObject):
         # ---- Persistence context (optional; enabled only for role='user') ----
         self._db = db
         self._session = session
+        self._local_command_handler = local_command_handler
         self._conv_id: Optional[int] = None  # lazily created on first user msg
+        memory_cfg = getattr(session, "settings", None).get("ham_mem", {}) if session is not None else {}
+        embedding_model = (memory_cfg.get("embedding_model") or "nomic-embed-text").strip() if isinstance(memory_cfg, dict) else "nomic-embed-text"
+        if not embedding_model:
+            embedding_model = "nomic-embed-text"
+        self._memory_provider = OllamaEmbeddingProvider(model_id=embedding_model)
+        self._memory_service = MemoryEmbeddingService(db, self._memory_provider) if db is not None else None
 
         # Build the initial streaming function for the starting model
         self._configure_stream()
@@ -362,15 +372,36 @@ class ChatController(QObject):
         )
         return self._system_injection_for_profile(profile), options
 
-    def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None):
+    def _memory_snapshot(self):
+        if not self._memory_service or not self._session or not self._session.current.user_id:
+            return ([], [])
+        try:
+            return self._memory_service.snapshot_context(user_id=int(self._session.current.user_id), role=self._session.current.role, conversation_id=self._conv_id, profile_id=self._get_active_profile_id())
+        except Exception:
+            log.debug("HamMem snapshot unavailable", exc_info=True); return ([], [])
+
+    def _report_ham_mem(self, status: str) -> None:
+        """Non-persisted diagnostic hook for status bars/developer tooling."""
+        log.debug("%s", status)
+        self.ham_mem_status.emit(status)
+
+    def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None, memory_snapshot=None):
         """Create a text-only stream using a prompt resolved on the GUI thread."""
         request_options = dict(DEFAULT_GENERATION_OPTIONS if options is None else options)
 
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
 
-            if injection is not None:
-                hist.append(injection)
+            memory_context, memory_status = MemoryEmbeddingService.format_context(prompt, self._memory_provider, memory_snapshot or ([], []))
+            if memory_context and memory_context.startswith("[HamMem administrative"):
+                # Keep admin context ahead of persona; relevant memory remains safely delimited.
+                global_part, _, relevant_part = memory_context.partition("\n\n[HamMem relevant memory]")
+                hist.append(ChatMessage(role="system", content=global_part))
+            else: relevant_part = memory_context or ""
+            if injection is not None: hist.append(injection)
+            if relevant_part:
+                hist.append(ChatMessage(role="system", content=("[HamMem relevant memory]" + relevant_part if not relevant_part.startswith("[HamMem") else relevant_part)))
+            self._report_ham_mem(memory_status)
 
             for entry in self._history[-self._max_turns * 2:]:
                 m = entry.msg
@@ -437,6 +468,13 @@ class ChatController(QObject):
         - Persists to DB first (if enabled) and captures the message row id.
         - Appends a ChatMessage with metadata for attachments.
         """
+        if self._local_command_handler:
+            try:
+                if self._local_command_handler(text):
+                    return
+            except Exception:
+                log.exception("Local command handling failed")
+
         # Reset assistant buffer for this turn
         self._assistant_buf = []
 
@@ -490,7 +528,7 @@ class ChatController(QObject):
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
         injection, options = self._resolve_active_profile_request()
-        stream_func = self._make_text_stream(injection, options)
+        stream_func = self._make_text_stream(injection, options, self._memory_snapshot())
         self._active_ticket = self.broker.submit(stream_func, text)
 
     def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
@@ -525,6 +563,7 @@ class ChatController(QObject):
 
         # Compute persona rule injection once, in the GUI thread
         inj = self.system_injection_if_any()
+        memory_snapshot = self._memory_snapshot()
 
         # submit a one-off stream function that wraps the standard messages/options
         def build_messages(prompt: str) -> List[ChatMessage]:
@@ -534,7 +573,15 @@ class ChatController(QObject):
             hist = [entry.msg for entry in hist_entries]
 
             # Persona rule injection at the front, if any
-            prefix: List[ChatMessage] = [inj] if inj is not None else []
+            memory_context, _ = MemoryEmbeddingService.format_context(prompt, self._memory_provider, memory_snapshot)
+            prefix: List[ChatMessage] = []
+            if memory_context and memory_context.startswith("[HamMem administrative"):
+                global_part, _, relevant = memory_context.partition("\n\n[HamMem relevant memory]")
+                prefix.append(ChatMessage(role="system", content=global_part))
+            else:
+                relevant = memory_context or ""
+            if inj is not None: prefix.append(inj)
+            if relevant: prefix.append(ChatMessage(role="system", content=("[HamMem relevant memory]" + relevant if not relevant.startswith("[HamMem") else relevant)))
 
             # replace the last (just-appended) user turn with a copy that has .parts
             msg = ChatMessage(role="user", content=prompt)
@@ -561,6 +608,11 @@ class ChatController(QObject):
 
     def _on_stop(self):
         self.broker.stop_active()
+
+    def clear_memory_vectors(self) -> None:
+        """Clear strict-mode derived state when the session ends or DB closes."""
+        if self._memory_service:
+            self._memory_service.clear_strict_vectors()
 
     def _on_job_token(self, ticket: int, chunk: str):
         if ticket == self._active_ticket and self._active_row is not None:
@@ -1152,36 +1204,7 @@ class ChatController(QObject):
         )
 
         inj = self.system_injection_if_any()
-
-        def _build_messages(_prompt: str) -> List[ChatMessage]:
-            hist: List[ChatMessage] = []
-
-            # --- persona rule injection (same as _configure_stream) ---
-            if inj is not None:
-                hist.append(inj)
-
-            for entry in self._history[-self._max_turns * 2:]:
-                m = entry.msg
-                has_attachments = bool(m.metadata and m.metadata.get("attachments"))
-                has_text = bool(m.content)
-
-                if has_text:
-                    hist.append(ChatMessage(role=m.role, content=m.content))
-                if has_attachments:
-                    stub = self._attachment_stub_for_model(m.metadata["attachments"])
-                    if stub:
-                        hist.append(ChatMessage(role="user", content=stub))
-            return hist
-
-        def _build_options() -> dict:
-            return {"temperature": 0.7}
-
-        stream_func = make_stream_func_from_client(
-            self._model_client,
-            model=self._model_name,
-            build_messages=_build_messages,
-            build_options=_build_options,
-        )
+        stream_func = self._make_text_stream(inj, {"temperature": 0.7}, self._memory_snapshot())
         self._assistant_buf = []
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)

@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt, QSize, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStatusBar, QSplitter, QVBoxLayout, QHBoxLayout,
-    QFrame, QLabel, QMessageBox
+    QFrame, QLabel, QMessageBox, QFileDialog
 )
 
 from hamchat.paths import settings_dir
@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
             get_variant=lambda: self.session.current.prefs.theme_variant,
             set_variant=self.session.set_theme_variant,
             new_chat=self._new_chat,
+            import_chat=self._import_chat,
             app_exit=self.close,
             toggle_side_panel=self.toggle_left_panel,
             # NEW: model menu wiring
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
             parent=self,
             db=self._db,
             session=self.session,
+            local_command_handler=self._handle_local_command,
         )
 
         try:    # When the controller lazily creates a new saved conversation, refresh the side panel list
@@ -152,6 +154,7 @@ class MainWindow(QMainWindow):
             self.chat_controller.forked_conversation.connect(self._open_conversation)
         except Exception:
             pass
+        self.chat_controller.ham_mem_status.connect(self._show_ham_mem_status)
         try:    # Warn if non-vision model and user tried to send attachments
             self.chat_display.sig_send_payload.connect(self._on_send_payload_from_ui)
         except Exception:
@@ -180,19 +183,21 @@ class MainWindow(QMainWindow):
         left_container._lay.addWidget(self.left_edge)
         left_container._lay.addWidget(self.side_panel)
 
-        # --- CHAT AREA (center column): TopPanel + inner splitter(ChatDisplay | right_container)
-        chat_area = _vbox(self.outer_split)
-
-        # Top panel lives *inside* chat_area now (won't affect left panel)
-        self.top_panel = TopPanel(parent=chat_area)
-        chat_area._lay.addWidget(self.top_panel)
+        # --- CHAT AREA: vertical splitter [TopPanel | chat/right splitter]
+        self.chat_split = QSplitter(Qt.Orientation.Vertical, self.outer_split)
+        self._top_saved_h = 240
+        self.top_panel = TopPanel(parent=self.chat_split, expanded_height=self._top_saved_h)
+        self.chat_split.addWidget(self.top_panel)
 
         # Inner splitter: [ ChatDisplay ] | [ right_container ]
-        self.inner_split = QSplitter(Qt.Orientation.Horizontal, chat_area)
-        chat_area._lay.addWidget(self.inner_split, 1)
+        self.inner_split = QSplitter(Qt.Orientation.Horizontal, self.chat_split)
+        self.chat_split.addWidget(self.inner_split)
 
         # Center chat view
-        self.chat_display = ChatDisplay(self.inner_split)
+        self.chat_display = ChatDisplay(
+            self.inner_split,
+            local_command_handler=self._handle_local_command,
+        )
         self.inner_split.addWidget(self.chat_display)
 
         # Right container: chat_panel + edge bar
@@ -211,7 +216,7 @@ class MainWindow(QMainWindow):
         # Splitter policies / stretch
         # Left rail should not steal stretch; center owns it; right is optional
         self.outer_split.addWidget(left_container)
-        self.outer_split.addWidget(chat_area)
+        self.outer_split.addWidget(self.chat_split)
         self.outer_split.setCollapsible(0, False)
         self.outer_split.setCollapsible(1, False)
         self.outer_split.setStretchFactor(0, 0)
@@ -221,6 +226,11 @@ class MainWindow(QMainWindow):
         self.inner_split.setCollapsible(1, False)  # right panel container
         self.inner_split.setStretchFactor(0, 1)
         self.inner_split.setStretchFactor(1, 0)
+        self.chat_split.setCollapsible(0, True)
+        self.chat_split.setCollapsible(1, False)
+        self.chat_split.setStretchFactor(0, 0)
+        self.chat_split.setStretchFactor(1, 1)
+        self.chat_split.splitterMoved.connect(self._on_top_split_moved)
 
         # saved widths (panel-only; edge bar is separate)
         self._left_saved_w = 240  # default side panel width
@@ -235,6 +245,7 @@ class MainWindow(QMainWindow):
         self._right_open = False
         self.chat_panel.setVisible(self._right_open)  # ensure hidden at start
         self._apply_split_sizes(initial=True)
+        self.chat_split.setSizes([0, 1])
 
         # Status bar
         self.setStatusBar(QStatusBar(self))
@@ -290,16 +301,18 @@ class MainWindow(QMainWindow):
         self.side_panel.sig_open_form.connect(self._open_test_form)
         self.side_panel.ai_profiles_manager.connect(self._open_ai_profiles_manager)
         self.top_panel.sig_closed.connect(self._on_top_closed)
+        self.top_panel.sig_opened.connect(self._restore_top_panel_height)
 
         self.side_panel.create_conversation.connect(self._new_chat)
         self.side_panel.open_user_settings.connect(self._open_test_form)   # placeholder
-        self.side_panel.open_memory_view.connect(self._open_test_form)     # placeholder
+        self.side_panel.open_memory_view.connect(self._open_memory_manager)
         self.side_panel.open_theme_manager.connect(self._open_test_form)   # placeholder
 
         # Open a saved conversation when the user activates a chat item
         self.side_panel.open_conversation.connect(self._open_conversation)
         self.side_panel.rename_conversation.connect(self._rename_conversation)
         self.side_panel.delete_conversation.connect(self._delete_conversation)
+        self.side_panel.import_conversation.connect(self._import_chat)
         self.side_panel.profile_activated.connect(self._on_profile_activated)
 
         self.side_panel.request_login.connect(self._open_login_flow)
@@ -345,6 +358,10 @@ class MainWindow(QMainWindow):
 
     def set_models_available(self, count: Optional[int]) -> None:
         self._models_available = count; self._refresh_status()
+
+    def _show_ham_mem_status(self, status: str) -> None:
+        """Transient, non-persisted HamMem request diagnostic."""
+        self.statusBar().showMessage(status, 8000)
 
     def _refresh_status(self) -> None:
         parts = [f"Mode: {self.runtime_mode.upper()}"]
@@ -442,6 +459,16 @@ class MainWindow(QMainWindow):
         # panel width = container minus edge bar
         self._right_saved_w = max(0, right_container_w - EDGE_WIDTH)
 
+    def _on_top_split_moved(self, pos: int, index: int):
+        top_height = self.chat_split.sizes()[0]
+        if self.top_panel.isVisible() and top_height >= 80:
+            self._top_saved_h = top_height
+
+    def _restore_top_panel_height(self):
+        total = max(1, sum(self.chat_split.sizes()))
+        height = min(max(80, self._top_saved_h), max(80, total - 120))
+        self.chat_split.setSizes([height, max(1, total - height)])
+
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._apply_split_sizes()
@@ -534,6 +561,10 @@ class MainWindow(QMainWindow):
         self.top_panel.close_panel()
 
     def _do_logout(self):
+        try:
+            self.chat_controller.clear_memory_vectors()
+        except Exception:
+            pass
         self.session.logout()
         self.top_panel.close_panel()
         self._new_chat()
@@ -543,7 +574,21 @@ class MainWindow(QMainWindow):
     def _open_test_form(self):
         form = TestForm(); form.sig_close.connect(self.top_panel.close_panel); self.top_panel.open_with(form)
 
-    def _on_top_closed(self): pass
+    def _on_top_closed(self):
+        self.chat_split.setSizes([0, max(1, sum(self.chat_split.sizes()))])
+
+    def _open_memory_manager(self) -> None:
+        from .widgets.memory_manager import MemoryManager
+
+        form = MemoryManager(self._db, self.session)
+        form.sig_close.connect(self.top_panel.close_panel)
+        self.top_panel.open_with(form)
+
+    def _handle_local_command(self, text: str) -> bool:
+        if (text or "").strip().casefold() != "/mem":
+            return False
+        self._open_memory_manager()
+        return True
 
     def _open_ai_profiles_manager(self):
         """
@@ -957,6 +1002,46 @@ class MainWindow(QMainWindow):
         except Exception:
             return []
 
+    def _import_chat(self) -> None:
+        """Import a ChatPanel JSON export into a new conversation for this user."""
+        if not self._db:
+            QMessageBox.critical(self, "Import failed", "Chat storage is unavailable.")
+            return
+
+        current = getattr(self.session, "current", None)
+        user_id = getattr(current, "user_id", None)
+        if user_id is None or getattr(current, "role", "guest") != "user":
+            QMessageBox.information(self, "Import chat", "Sign in to import a chat.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import chat", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+            from hamchat import db_ops as dbo
+            conversation_id = dbo.import_chat_export(
+                self._db,
+                user_id=int(user_id),
+                payload=payload,
+            )
+        except Exception as exc:
+            log.exception("Chat import failed: %s", exc)
+            QMessageBox.critical(
+                self,
+                "Import failed",
+                "Could not import this chat. Check that the JSON export is valid.",
+            )
+            return
+
+        self.side_panel.refresh_chats()
+        self._open_conversation(int(conversation_id))
+
     def _load_user_chats(self):
         """
         Loader for SidePanel "My Chats".
@@ -1201,6 +1286,7 @@ class MainWindow(QMainWindow):
         try:
             ctrl = getattr(self, "chat_controller", None)
             if ctrl is not None:
+                ctrl.clear_memory_vectors()
                 ok = bool(ctrl.hard_kill())
         except Exception as e:
             log.exception("hard_kill failed: %s", e)

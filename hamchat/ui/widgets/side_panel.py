@@ -78,6 +78,7 @@ class SidePanel(QWidget):
     open_theme_manager = pyqtSignal()
     rename_conversation = pyqtSignal(int, str)
     delete_conversation = pyqtSignal(int)
+    import_conversation = pyqtSignal()
 
     # Admin-only intents
     open_admin_user = pyqtSignal(int)   # open user overview in top panel
@@ -281,7 +282,8 @@ class SidePanel(QWidget):
                 exp.setVisible(True)
                 exp.setEnabled(True)
             elif is_admin:
-                exp.setVisible(False)
+                exp.setVisible(exp is self._exp_mem)
+                exp.setEnabled(exp is self._exp_mem)
 
         # Settings: visible but disabled for guest, enabled otherwise
         if self._exp_settings:
@@ -508,10 +510,18 @@ class SidePanel(QWidget):
         if not self._chat_list:
             return
         item = self._chat_list.itemAt(pos)
-        if not item:
-            return
-        conv_id = int(item.data(Qt.ItemDataRole.UserRole))
         menu = QMenu(self)
+
+        act_import = QAction("Import chat…", self)
+        act_import.triggered.connect(self.import_conversation.emit)
+        menu.addAction(act_import)
+
+        if not item:
+            menu.exec(self._chat_list.mapToGlobal(pos))
+            return
+
+        conv_id = int(item.data(Qt.ItemDataRole.UserRole))
+        menu.addSeparator()
 
         act_open = QAction("Open", self)
         act_open.triggered.connect(lambda: self.open_conversation.emit(conv_id))

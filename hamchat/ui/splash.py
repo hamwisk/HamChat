@@ -95,7 +95,7 @@ FUN_LINES = [
     "Assembling the sacred order of async tasks…",
     "Staring meaningfully into the void…",
     "Debugging the concept of time…",
-    "Negotiating with entropy over API limits…"
+    "Negotiating with entropy over API limits…",
     "Recompiling the universe with extra bacon support…",
     "Teaching gravity to chill…",
     "Refactoring time… again…",
@@ -125,7 +125,7 @@ FUN_LINES = [
     "Rendering the concept of hope…",
     "Bootstrapping sentience… again…",
     "Overclocking the soul engine…",
-    "Invoking ham compression algorithm v∞…"
+    "Invoking ham compression algorithm v∞…",
     "Simulating user patience curve…",
     "Stubbing out emotional dependencies…",
     "Mocking production environment (for real this time)…",

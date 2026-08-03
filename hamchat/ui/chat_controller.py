@@ -105,6 +105,13 @@ class ChatController(QObject):
         self._model_client = model_client
         self._configure_stream()
 
+    def get_active_runtime_context(self, options: Optional[Dict] = None):
+        """Return known Ollama runtime context without doing network I/O on the GUI thread."""
+        get_runtime_context = getattr(self._model_client, "get_runtime_context", None)
+        if callable(get_runtime_context):
+            return get_runtime_context(model=self._model_name, options=options or {})
+        return None
+
     # ---------- Persistence helpers ----------
     def _save_enabled(self) -> bool:
         """
@@ -418,14 +425,6 @@ class ChatController(QObject):
                     if stub:
                         hist.append(ChatMessage(role="user", content=stub))
 
-            system_messages = [message for message in hist if message.role == "system"]
-            log.debug(
-                "Text request built: client=%s roles=%s system_count=%d system_content_lengths=%s",
-                type(self._model_client).__name__,
-                [message.role for message in hist],
-                len(system_messages),
-                [len(message.content or "") for message in system_messages],
-            )
             return hist
 
         def _build_options() -> dict:
@@ -455,6 +454,9 @@ class ChatController(QObject):
         """
         if model_name == self._model_name:
             return
+        invalidate_runtime_context = getattr(self._model_client, "invalidate_runtime_context", None)
+        if callable(invalidate_runtime_context):
+            invalidate_runtime_context()
         self._model_name = model_name
         self._configure_stream()
 
@@ -624,7 +626,7 @@ class ChatController(QObject):
             self.chat.end_assistant_stream(self._active_row)
 
         # Commit assistant turn iff we received any content
-        if self._assistant_buf:
+        if status == "ok" and self._assistant_buf:
             final_text = "".join(self._assistant_buf)
             msg_db_id: Optional[int] = None
             if self._save_enabled() and self._conv_id:
@@ -667,12 +669,9 @@ class ChatController(QObject):
 
     def _on_job_error(self, ticket: int, message: str):
         if ticket == self._active_ticket and self._active_row is not None:
-            self.chat.stream_chunk(self._active_row, f"\n[error] {message}")
-        # Do not record an assistant turn on error (unless you want partials)
-        self._assistant_buf = []
-        self.chat.set_streaming(False)
-        self._active_row = None
-        self._active_ticket = -1
+            # Keep visible deltas in the row, but do not add this marker to the
+            # assistant buffer: errored output is never persisted as a response.
+            self.chat.stream_chunk(self._active_row, f"\n[interrupted] {message}")
 
     # ---- Optional helpers ----
     def reset_history(self):

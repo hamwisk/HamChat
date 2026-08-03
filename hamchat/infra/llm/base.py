@@ -19,6 +19,10 @@ class StreamEvent:
     error: Optional[str] = None
 
 
+class StreamError(RuntimeError):
+    """A backend stream failed after zero or more visible deltas."""
+
+
 class ModelClient:
     """Abstract client."""
     def stream_chat(self, *, model: str, messages: List[ChatMessage], options: Dict) -> Iterator[StreamEvent]:

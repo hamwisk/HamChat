@@ -8,6 +8,7 @@ import requests
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 from .base import ModelClient, ChatMessage, StreamEvent
+from .ollama_planner import RequestTooLargeError, plan_ollama_request
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"  # mirrors your registry default
 FALLBACK_CONTEXT_LENGTH = 4096
@@ -44,6 +45,37 @@ class OllamaClient(ModelClient):
     ) -> Iterator[StreamEvent]:
         request_id = request_id or uuid.uuid4().hex[:8]
         effective_options = dict(options or {})
+        resolved_context = prepared_context or self.prepare_runtime_context(
+            model=model, options=effective_options, request_id=request_id,
+        )
+
+        try:
+            plan = plan_ollama_request(
+                messages=messages, options=effective_options,
+                context_length=resolved_context.context_length,
+            )
+        except RequestTooLargeError as exc:
+            log.warning(
+                "Ollama request plan rejected request_id=%s model=%s context_length=%d source=%s error=%s",
+                request_id, model, resolved_context.context_length, resolved_context.source, exc,
+            )
+            yield StreamEvent(type="error", error=str(exc))
+            return
+
+        effective_options = plan.options
+        messages = plan.messages
+        log.info(
+            "Ollama request plan request_id=%s model=%s context_length=%d context_source=%s "
+            "original_message_count=%d final_message_count=%d original_input_tokens=%d "
+            "final_input_tokens=%d template_reserve=%d reasoning_reserve=%d "
+            "visible_response_reserve=%d num_predict=%d omitted_turn_count=%d "
+            "omitted_message_count=%d outcome=%s",
+            request_id, model, resolved_context.context_length, resolved_context.source,
+            plan.original_message_count, len(messages), plan.original_input_tokens,
+            plan.final_input_tokens, plan.template_reserve, plan.reasoning_reserve,
+            plan.visible_response_reserve, plan.num_predict, plan.omitted_turn_count,
+            plan.omitted_message_count, plan.outcome,
+        )
 
         # Build wire messages; translate our internal .parts → Ollama's "images".
         wire = []
@@ -73,9 +105,6 @@ class OllamaClient(ModelClient):
         # This deliberately coarse estimate is diagnostic-only; it is not a tokenizer.
         approx_input_token_count = (text_char_count + 3) // 4
         requested_num_ctx = effective_options.get("num_ctx")
-        resolved_context = prepared_context or self.prepare_runtime_context(
-            model=model, options=effective_options, request_id=request_id,
-        )
         log.info(
             "Ollama request request_id=%s model=%s options=%s message_count=%d "
             "text_char_count=%d image_count=%d approx_input_token_count=%d "

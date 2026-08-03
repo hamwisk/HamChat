@@ -423,7 +423,12 @@ class ChatController(QObject):
                 if has_attachments:
                     stub = self._attachment_stub_for_model(m.metadata["attachments"])
                     if stub:
-                        hist.append(ChatMessage(role="user", content=stub))
+                        # Keep the descriptive history stub coupled to its text
+                        # user turn so outbound context planning cannot trim one
+                        # without the other. Image-only turns remain a standalone
+                        # user message because there is no text parent to retain.
+                        stub_metadata = {"attachment_stub_parent": True} if has_text else None
+                        hist.append(ChatMessage(role="user", content=stub, metadata=stub_metadata))
 
             return hist
 

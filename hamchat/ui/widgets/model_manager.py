@@ -276,11 +276,18 @@ class ModelManager(QWidget):
         self.detail_backend = QLabel("Backend: —", self)
         self.detail_context = QLabel("Context: —", self)
         self.detail_caps = QLabel("Capabilities: —", self)
+        self.context_allocation = QComboBox(self)
+        self.context_allocation.addItem("Auto — Ollama default", "auto")
+        self.context_allocation.addItem("Low — 4K", "low")
+        self.context_allocation.addItem("Mid — 8K", "mid")
+        self.context_allocation.addItem("High — 16K", "high")
 
         right.addWidget(self.detail_name)
         right.addWidget(self.detail_backend)
         right.addWidget(self.detail_context)
         right.addWidget(self.detail_caps)
+        right.addWidget(QLabel("Runtime context allocation:", self))
+        right.addWidget(self.context_allocation)
         right.addStretch(1)
 
         self.btn_activate = QPushButton("Activate model", self)
@@ -295,6 +302,7 @@ class ModelManager(QWidget):
         self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         self.vision_only_chk.toggled.connect(self._proxy.set_vision_only)
         self.table.selectionModel().currentChanged.connect(self._on_selection_changed)
+        self.context_allocation.currentIndexChanged.connect(self._on_context_allocation_changed)
 
     # ------------------------------------------------------------------ #
     # Data loading
@@ -398,12 +406,30 @@ class ModelManager(QWidget):
         self.detail_backend.setText(f"Backend: {backend}")
         self.detail_context.setText(f"Context: {ctx if ctx is not None else 'unknown'}")
         self.detail_caps.setText(f"Capabilities: {cap_str}")
+        is_ollama = not hasattr(self._session, "is_ollama_model") or self._session.is_ollama_model(model_id)
+        self.context_allocation.setEnabled(is_ollama)
+        if is_ollama:
+            mode = self._session.get_model_context_allocation(model_id)
+            combo_index = self.context_allocation.findData(mode)
+            self.context_allocation.blockSignals(True)
+            self.context_allocation.setCurrentIndex(max(0, combo_index))
+            self.context_allocation.blockSignals(False)
+        else:
+            self.context_allocation.setCurrentIndex(0)
 
     def _clear_details(self) -> None:
         self.detail_name.setText("Name: —")
         self.detail_backend.setText("Backend: —")
         self.detail_context.setText("Context: —")
         self.detail_caps.setText("Capabilities: —")
+        self.context_allocation.setEnabled(False)
+        self.context_allocation.setCurrentIndex(0)
+
+    def _on_context_allocation_changed(self, _index: int) -> None:
+        model_id = self._get_current_model_id()
+        if not model_id or not hasattr(self._session, "set_model_context_allocation"):
+            return
+        self._session.set_model_context_allocation(model_id, self.context_allocation.currentData())
 
     # ------------------------------------------------------------------ #
     # Activation

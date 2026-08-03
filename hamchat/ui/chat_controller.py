@@ -112,6 +112,15 @@ class ChatController(QObject):
             return get_runtime_context(model=self._model_name, options=options or {})
         return None
 
+    def on_model_context_allocation_changed(self, model_id: str, _mode: str) -> None:
+        """Forget only the active runtime's confirmed context; no GUI-thread I/O."""
+        if model_id != self._model_name:
+            return
+        invalidate_runtime_context = getattr(self._model_client, "invalidate_runtime_context", None)
+        if callable(invalidate_runtime_context):
+            invalidate_runtime_context(model=model_id)
+        self._configure_stream()
+
     # ---------- Persistence helpers ----------
     def _save_enabled(self) -> bool:
         """
@@ -395,6 +404,7 @@ class ChatController(QObject):
     def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None, memory_snapshot=None):
         """Create a text-only stream using a prompt resolved on the GUI thread."""
         request_options = dict(DEFAULT_GENERATION_OPTIONS if options is None else options)
+        self._apply_model_context_allocation(request_options)
 
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
@@ -441,6 +451,18 @@ class ChatController(QObject):
             build_messages=_build_messages,
             build_options=_build_options,
         )
+
+    def _apply_model_context_allocation(self, options: Dict) -> None:
+        """Apply the saved Ollama tier before background preparation begins."""
+        if self._session is None or not hasattr(self._session, "get_model_context_num_ctx"):
+            return
+        if not hasattr(self._model_client, "prepare_runtime_context"):
+            return
+        num_ctx = self._session.get_model_context_num_ctx(self._model_name)
+        if num_ctx is None:
+            options.pop("num_ctx", None)
+        else:
+            options["num_ctx"] = num_ctx
 
     def _configure_stream(self) -> None:
         """
@@ -571,6 +593,8 @@ class ChatController(QObject):
         # Compute persona rule injection once, in the GUI thread
         inj = self.system_injection_if_any()
         memory_snapshot = self._memory_snapshot()
+        media_request_options = {"temperature": 0.7}
+        self._apply_model_context_allocation(media_request_options)
 
         # submit a one-off stream function that wraps the standard messages/options
         def build_messages(prompt: str) -> List[ChatMessage]:
@@ -602,7 +626,7 @@ class ChatController(QObject):
             return [*prefix, *hist]
 
         def build_options() -> dict:
-            return {"temperature": 0.7}
+            return dict(media_request_options)
 
         stream_func = make_stream_func_from_client(
             self._model_client,

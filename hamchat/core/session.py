@@ -32,6 +32,14 @@ class SessionData:
 class SessionManager(QObject):
     sessionChanged = pyqtSignal(object)   # emits SessionData
     prefsChanged   = pyqtSignal(object)   # emits Preferences
+    modelContextAllocationChanged = pyqtSignal(str, str)  # model_id, allocation mode
+
+    OLLAMA_CONTEXT_ALLOCATIONS = {
+        "auto": None,
+        "low": 4096,
+        "mid": 8192,
+        "high": 16384,
+    }
 
     def __init__(self, settings: Settings, runtime_mode: str, server_url: Optional[str]):
         super().__init__()
@@ -170,6 +178,33 @@ class SessionManager(QObject):
         caps = self.get_model_capabilities(model_id)
         self.set_model_vision(bool(caps.get("vision", False)))
         self.prefsChanged.emit(self.current.prefs)
+
+    def is_ollama_model(self, model_id: str) -> bool:
+        """Models without an explicit backend retain HamChat's local-Ollama default."""
+        return (self.get_model_backend(model_id) or "ollama") == "ollama"
+
+    def get_model_context_allocation(self, model_id: str) -> str:
+        if not self.is_ollama_model(model_id):
+            return "auto"
+        saved = self.settings.get("ollama_context_allocations", {}) or {}
+        mode = saved.get(model_id, "auto") if isinstance(saved, dict) else "auto"
+        return mode if mode in self.OLLAMA_CONTEXT_ALLOCATIONS else "auto"
+
+    def get_model_context_num_ctx(self, model_id: str) -> Optional[int]:
+        return self.OLLAMA_CONTEXT_ALLOCATIONS[self.get_model_context_allocation(model_id)]
+
+    def set_model_context_allocation(self, model_id: str, mode: str) -> None:
+        if not self.is_ollama_model(model_id):
+            return
+        if mode not in self.OLLAMA_CONTEXT_ALLOCATIONS:
+            raise ValueError(f"Unknown Ollama context allocation: {mode}")
+        saved = self.settings.get("ollama_context_allocations", {}) or {}
+        saved = dict(saved) if isinstance(saved, dict) else {}
+        if saved.get(model_id, "auto") == mode:
+            return
+        saved[model_id] = mode
+        self.settings.set("ollama_context_allocations", saved)
+        self.modelContextAllocationChanged.emit(model_id, mode)
 
     def _refresh_current_capabilities(self) -> None:
         """

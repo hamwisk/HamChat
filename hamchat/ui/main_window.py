@@ -155,6 +155,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.chat_controller.ham_mem_status.connect(self._show_ham_mem_status)
+        self.session.modelContextAllocationChanged.connect(
+            self.chat_controller.on_model_context_allocation_changed
+        )
         try:    # Warn if non-vision model and user tried to send attachments
             self.chat_display.sig_send_payload.connect(self._on_send_payload_from_ui)
         except Exception:

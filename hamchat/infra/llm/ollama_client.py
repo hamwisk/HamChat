@@ -105,12 +105,16 @@ class OllamaClient(ModelClient):
         # This deliberately coarse estimate is diagnostic-only; it is not a tokenizer.
         approx_input_token_count = (text_char_count + 3) // 4
         requested_num_ctx = effective_options.get("num_ctx")
+        allocation_mode = {None: "auto", 4096: "low", 8192: "mid", 16384: "high"}.get(
+            requested_num_ctx, "custom",
+        )
         log.info(
             "Ollama request request_id=%s model=%s options=%s message_count=%d "
             "text_char_count=%d image_count=%d approx_input_token_count=%d "
-            "requested_num_ctx=%r effective_context_length=%d effective_context_source=%s",
+            "allocation_mode=%s requested_num_ctx=%r effective_context_length=%d effective_context_source=%s",
             request_id, model, effective_options, len(wire), text_char_count,
-            image_count, approx_input_token_count, requested_num_ctx,
+            image_count, approx_input_token_count, allocation_mode,
+            requested_num_ctx,
             resolved_context.context_length, resolved_context.source,
         )
 
@@ -236,7 +240,7 @@ class OllamaClient(ModelClient):
         try:
             preload = requests.post(
                 f"{self.base_url}/api/generate",
-                json={"model": model, "prompt": "", "stream": False},
+                json={"model": model, "prompt": "", "stream": False, "options": effective_options},
                 timeout=(PREPARATION_CONNECT_TIMEOUT, PREPARATION_READ_TIMEOUT),
             )
             preload.raise_for_status()

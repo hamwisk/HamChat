@@ -13,6 +13,7 @@ from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtQml import QQmlContext
 
 from .prompt_input import PromptInput
+from hamchat.media_helper import normalize_image_file, ImageValidationError
 
 
 # --- tiny model for attachments ---
@@ -169,6 +170,7 @@ class ChatDisplay(QWidget):
     sig_stop_requested = pyqtSignal()
     sig_file_dropped = pyqtSignal(str)
     sig_file_detected = pyqtSignal(str, str)
+    attachmentRejected = pyqtSignal(str)
     bubbleAction = pyqtSignal(str, int, str, str)
 
     def __init__(self, parent=None, *, local_command_handler: Optional[Callable[[str], bool]] = None):
@@ -318,9 +320,13 @@ class ChatDisplay(QWidget):
     # Direct, internal handler for detected files  NEW
     @pyqtSlot(str, str)
     def _on_file_detected(self, path: str, kind: str):
-        if kind != "image":
-            return
         norm = path[7:] if path.lower().startswith("file://") else path
+        try:
+            normalize_image_file(norm)
+        except ImageValidationError:
+            if kind == "image":
+                self.attachmentRejected.emit("HamChat couldn’t read this image. The file may be corrupt or use an unsupported format.")
+            return
         if not self._attachments.contains(norm):
             self._attachments.append_path(norm)
             self._call_qml("ensureAtEnd")

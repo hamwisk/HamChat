@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QDateTime, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, QToolButton, QFrame, QFormLayout,
     QFileDialog, QMessageBox, QHBoxLayout, QSizePolicy, QListWidget, QListWidgetItem,
-    QAbstractItemView, QMenu, QPlainTextEdit, QComboBox
+    QAbstractItemView, QMenu, QPlainTextEdit, QComboBox, QCheckBox
 )
 from PyQt6.QtGui import QTextCursor
 
@@ -52,6 +52,7 @@ class ChatPanel(QWidget):
     attachmentAttachRequested = pyqtSignal(int)
     attachmentScrollRequested = pyqtSignal(int)
     thinkingModeChanged = pyqtSignal(str)
+    hamMemChanged = pyqtSignal(bool)
 
     def __init__(self, parent=None, *, chat_display=None, attachments_loader=None):
         super().__init__(parent)
@@ -132,6 +133,25 @@ class ChatPanel(QWidget):
         thinking_layout.addWidget(self._thinking_view)
         thinking.set_content(thinking_body)
         root.addWidget(thinking)
+
+        memory = Expander("Memory", expanded=False)
+        memory_body = QWidget(memory)
+        memory_layout = QVBoxLayout(memory_body)
+        memory_layout.setContentsMargins(0, 0, 0, 0)
+        memory_layout.setSpacing(6)
+        self._use_ham_mem = QCheckBox("Use HamMem", memory_body)
+        self._use_ham_mem.setChecked(True)
+        self._use_ham_mem.setToolTip("Controls whether HamMem memories are retrieved and included in the next request.")
+        self._use_ham_mem.toggled.connect(self.hamMemChanged)
+        memory_layout.addWidget(self._use_ham_mem)
+        self._memory_view = QPlainTextEdit(memory_body)
+        self._memory_view.setReadOnly(True)
+        self._memory_view.setPlainText("")
+        self._memory_view.setMaximumHeight(220)
+        self._memory_view.setPlaceholderText("")
+        memory_layout.addWidget(self._memory_view)
+        memory.set_content(memory_body)
+        root.addWidget(memory)
 
         # Metadata expander
         meta = Expander("Conversation details", expanded=True)
@@ -269,6 +289,24 @@ class ChatPanel(QWidget):
     def thinking_text(self) -> str:
         """Small test/diagnostic accessor; not used for persistence or export."""
         return self._thinking_view.toPlainText()
+
+    def set_use_ham_mem(self, enabled: bool, *, control_enabled: bool | None = None) -> None:
+        self._use_ham_mem.blockSignals(True)
+        self._use_ham_mem.setChecked(bool(enabled))
+        if control_enabled is not None:
+            self._use_ham_mem.setEnabled(control_enabled)
+        self._use_ham_mem.blockSignals(False)
+
+    def clear_memory_snapshot(self) -> None:
+        self._memory_view.clear()
+        self._memory_view.verticalScrollBar().setValue(0)
+
+    def set_memory_snapshot(self, text: str) -> None:
+        self._memory_view.setPlainText(text or "")
+        self._memory_view.verticalScrollBar().setValue(0)
+
+    def memory_snapshot_text(self) -> str:
+        return self._memory_view.toPlainText()
 
     # -------- internals ----------
     def _connect_model_signals(self):

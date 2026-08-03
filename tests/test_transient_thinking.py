@@ -48,8 +48,10 @@ class FakeChat:
 
 class ControllerState:
     _clear_thinking = ChatController._clear_thinking
+    _clear_memory_snapshot = ChatController._clear_memory_snapshot
     clear_transient_thinking = ChatController.clear_transient_thinking
     _refresh_thinking_controls = lambda self: None
+    _refresh_ham_mem_control = lambda self: None
 
 
 def _stream_for(events):

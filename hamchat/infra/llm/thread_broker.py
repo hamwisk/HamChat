@@ -32,6 +32,7 @@ class _Worker(QObject):
     token    = pyqtSignal(int, str)     # (ticket, chunk)
     thinking = pyqtSignal(int, str)     # (ticket, transient reasoning chunk)
     notice   = pyqtSignal(int, str, str)  # (ticket, event type, mode)
+    memory_snapshot = pyqtSignal(int, str)
     finished = pyqtSignal(int, str)     # (ticket, status) status: "ok"|"cancelled"|"error"
     error    = pyqtSignal(int, str)     # (ticket, message)
 
@@ -71,8 +72,12 @@ class _Worker(QObject):
                         break
                     if isinstance(chunk, StreamChunk) and chunk.type == "thinking":
                         self.thinking.emit(ticket, chunk.text)
-                    elif isinstance(chunk, StreamChunk) and chunk.type in {"thinking_forced_low", "thinking_rejected"}:
+                    elif isinstance(chunk, StreamChunk) and chunk.type in {
+                        "thinking_forced_low", "thinking_rejected", "output_limit",
+                    }:
                         self.notice.emit(ticket, chunk.type, chunk.text)
+                    elif isinstance(chunk, StreamChunk) and chunk.type == "memory_snapshot":
+                        self.memory_snapshot.emit(ticket, chunk.text)
                     else:
                         self.token.emit(ticket, str(chunk.text if isinstance(chunk, StreamChunk) else chunk))
         except Exception as exc:
@@ -98,6 +103,7 @@ class ThreadBroker(QObject):
     job_token    = pyqtSignal(int, str)     # (ticket, chunk)
     job_thinking = pyqtSignal(int, str)     # (ticket, transient reasoning chunk)
     job_notice   = pyqtSignal(int, str, str)  # (ticket, event type, mode)
+    job_memory_snapshot = pyqtSignal(int, str)
     job_finished = pyqtSignal(int, str)     # (ticket, status)
     job_error    = pyqtSignal(int, str)     # (ticket, message)
     queue_changed = pyqtSignal(int, int)    # (active_ticket or -1, queued_count)
@@ -158,6 +164,7 @@ class ThreadBroker(QObject):
         self._worker.token.connect(self.job_token, Qt.ConnectionType.QueuedConnection)
         self._worker.thinking.connect(self.job_thinking, Qt.ConnectionType.QueuedConnection)
         self._worker.notice.connect(self.job_notice, Qt.ConnectionType.QueuedConnection)
+        self._worker.memory_snapshot.connect(self.job_memory_snapshot, Qt.ConnectionType.QueuedConnection)
         self._worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self._worker.error.connect(self.job_error, Qt.ConnectionType.QueuedConnection)
 

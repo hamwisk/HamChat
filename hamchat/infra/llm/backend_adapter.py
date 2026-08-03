@@ -8,6 +8,7 @@ from .thread_broker import StreamChunk
 MessagesBuilder = Callable[[str], List[ChatMessage]]
 OptionsBuilder  = Callable[[], Dict]
 ThinkingBuilder = Callable[[], Optional[str]]
+FinalMessagesCallback = Callable[[List[ChatMessage]], Optional[str]]
 
 def make_stream_func_from_client(
     client: ModelClient,
@@ -17,6 +18,7 @@ def make_stream_func_from_client(
     build_options: Optional[OptionsBuilder] = None,
     build_thinking: Optional[ThinkingBuilder] = None,
     build_requested_thinking: Optional[ThinkingBuilder] = None,
+    on_final_messages: Optional[FinalMessagesCallback] = None,
 ) -> Callable[..., Iterator[str]]:
     """
     Returns a StreamFunc(prompt, *, stop_fn) -> Iterator[str]
@@ -33,6 +35,15 @@ def make_stream_func_from_client(
             if callable(prepare_runtime_context) else None
         )
         msgs = build_messages(prompt)
+        pending_memory_snapshot: list[str] = []
+
+        def capture_final_messages(final_messages: List[ChatMessage]) -> None:
+            if on_final_messages is None:
+                return
+            snapshot = on_final_messages(final_messages)
+            if snapshot:
+                pending_memory_snapshot.append(snapshot)
+
         if prepared_context is not None:
             stream_kwargs = dict(
                 model=model, messages=msgs, options=opts,
@@ -41,12 +52,17 @@ def make_stream_func_from_client(
             if thinking_mode is not None:
                 stream_kwargs["thinking_mode"] = thinking_mode
                 stream_kwargs["requested_thinking_mode"] = requested_thinking_mode
+            if getattr(client, "supports_final_message_callback", False):
+                stream_kwargs["final_messages_callback"] = capture_final_messages
+            else:
+                capture_final_messages(msgs)
             it = client.stream_chat(**stream_kwargs)
         else:
             stream_kwargs = dict(model=model, messages=msgs, options=opts)
             if thinking_mode is not None:
                 stream_kwargs["thinking_mode"] = thinking_mode
                 stream_kwargs["requested_thinking_mode"] = requested_thinking_mode
+            capture_final_messages(msgs)
             it = client.stream_chat(**stream_kwargs)
         thinking_parts: list[str] = []
         last_thinking_flush = time.monotonic()
@@ -60,6 +76,8 @@ def make_stream_func_from_client(
                 yield StreamChunk(type="thinking", text=text)
 
         for ev in it:
+            while pending_memory_snapshot:
+                yield StreamChunk(type="memory_snapshot", text=pending_memory_snapshot.pop(0))
             if stop_fn():
                 break
             if ev.type == "thinking" and ev.text:
@@ -80,6 +98,13 @@ def make_stream_func_from_client(
                 raise StreamError(ev.error or "LLM stream failed")
             elif ev.type == "end":
                 yield from flush_thinking()
+                # A terminal length stop is a successful, complete protocol
+                # exchange, but the visible response may be incomplete.  Keep
+                # it distinct from transport/protocol failures.
+                if (ev.finish_reason or "").lower() in {
+                    "length", "max_tokens", "max_tokens_reached",
+                }:
+                    yield StreamChunk(type="output_limit", text="")
                 break
         yield from flush_thinking()
         # generator ends naturally; worker will still call .close() if present

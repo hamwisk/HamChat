@@ -482,7 +482,8 @@ CREATE TABLE IF NOT EXISTS saved_conversations (
   title TEXT,
   created INTEGER,
   thinking_mode TEXT NOT NULL DEFAULT 'medium'
-    CHECK(thinking_mode IN ('off', 'low', 'medium', 'high'))
+    CHECK(thinking_mode IN ('off', 'low', 'medium', 'high')),
+  use_ham_mem INTEGER NOT NULL DEFAULT 1 CHECK(use_ham_mem IN (0,1))
 );
 
 -- Messages: single schema supports plain or AEAD fields
@@ -769,10 +770,16 @@ def _migrate_existing_schema(conn, mode: str) -> None:
                 "DEFAULT 'medium' CHECK(thinking_mode IN ('off', 'low', 'medium', 'high'))"
             )
 
+    def _add_conversation_ham_mem_setting(cur, _mode: str) -> None:
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(saved_conversations)")}
+        if "use_ham_mem" not in columns:
+            cur.execute("ALTER TABLE saved_conversations ADD COLUMN use_ham_mem INTEGER NOT NULL DEFAULT 1 CHECK(use_ham_mem IN (0,1))")
+
     migrations = (
         ("2026-07-28.0", _migrate_memory_table),
         ("2026-07-28.1", lambda cur, mode: _create_embedding_objects(cur)),
         ("2026-08-03.1", _add_conversation_thinking_mode),
+        ("2026-08-03.2", _add_conversation_ham_mem_setting),
     )
     for version, migration in migrations:
         if current_key >= _version_key(version):

@@ -355,12 +355,12 @@ def delete_user_safe(conn, user_id: int) -> None:
 
 # ---------- conversations & messages ----------
 
-def create_conversation(conn, user_id: int, title: str, *, thinking_mode: str = "medium") -> int:
+def create_conversation(conn, user_id: int, title: str, *, thinking_mode: str = "medium", use_ham_mem: bool = True) -> int:
     thinking_mode = thinking_mode if thinking_mode in {"off", "low", "medium", "high"} else "medium"
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO saved_conversations(user_id, title, created, thinking_mode) VALUES(?,?,?,?)",
-        (user_id, title, _now(), thinking_mode),
+        "INSERT INTO saved_conversations(user_id, title, created, thinking_mode, use_ham_mem) VALUES(?,?,?,?,?)",
+        (user_id, title, _now(), thinking_mode, int(bool(use_ham_mem))),
     )
     conv_id = cur.lastrowid
     conn.commit()
@@ -468,6 +468,16 @@ def set_conversation_thinking_mode(conn, conversation_id: int, mode: str) -> Non
     conn.execute(
         "UPDATE saved_conversations SET thinking_mode=? WHERE id=?", (mode, int(conversation_id))
     )
+    conn.commit()
+
+
+def get_conversation_use_ham_mem(conn, conversation_id: int) -> bool:
+    row = conn.execute("SELECT use_ham_mem FROM saved_conversations WHERE id=?", (int(conversation_id),)).fetchone()
+    return True if not row else bool(row[0])
+
+
+def set_conversation_use_ham_mem(conn, conversation_id: int, enabled: bool) -> None:
+    conn.execute("UPDATE saved_conversations SET use_ham_mem=? WHERE id=?", (int(bool(enabled)), int(conversation_id)))
     conn.commit()
 
 

@@ -78,6 +78,7 @@ class ChatController(QObject):
         self._thinking_panel = thinking_panel
         self._thinking_mode = "medium"
         self._thinking_notice_shown = False
+        self._use_ham_mem = True
         self._conv_id: Optional[int] = None  # lazily created on first user msg
         memory_cfg = getattr(session, "settings", None).get("ham_mem", {}) if session is not None else {}
         embedding_model = (memory_cfg.get("embedding_model") or "nomic-embed-text").strip() if isinstance(memory_cfg, dict) else "nomic-embed-text"
@@ -96,11 +97,13 @@ class ChatController(QObject):
             self._thinking_panel.thinkingModeChanged.connect(
                 self._on_thinking_mode_changed, Qt.ConnectionType.QueuedConnection,
             )
+            self._thinking_panel.hamMemChanged.connect(self._on_use_ham_mem_changed, Qt.ConnectionType.QueuedConnection)
 
         # Broker → UI
         self.broker.job_token.connect(self._on_job_token, Qt.ConnectionType.QueuedConnection)
         self.broker.job_thinking.connect(self._on_job_thinking, Qt.ConnectionType.QueuedConnection)
         self.broker.job_notice.connect(self._on_job_notice, Qt.ConnectionType.QueuedConnection)
+        self.broker.job_memory_snapshot.connect(self._on_job_memory_snapshot, Qt.ConnectionType.QueuedConnection)
         self.broker.job_finished.connect(self._on_job_finished, Qt.ConnectionType.QueuedConnection)
         self.broker.job_error.connect(self._on_job_error, Qt.ConnectionType.QueuedConnection)
 
@@ -110,6 +113,7 @@ class ChatController(QObject):
         # necessarily delivered all queued cross-thread signals.
         self._thinking_ticket: int = -1
         self._refresh_thinking_controls()
+        self._refresh_ham_mem_control()
 
     def _clear_thinking(self) -> None:
         if self._thinking_panel is not None:
@@ -118,16 +122,41 @@ class ChatController(QObject):
     def _begin_thinking_generation(self) -> None:
         self._thinking_ticket = -1
         self._clear_thinking()
+        self._clear_memory_snapshot()
         log.debug("Transient thinking cleared for new generation")
 
     def _activate_thinking_for_ticket(self, ticket: int) -> None:
         self._thinking_ticket = ticket
         self._refresh_thinking_controls()
+        self._refresh_ham_mem_control()
 
     def clear_transient_thinking(self) -> None:
         """Forget non-persistent reasoning when the active session is unloaded."""
         self._thinking_ticket = -1
         self._clear_thinking()
+        self._clear_memory_snapshot()
+
+    def reset_chat_memory_preferences(self) -> None:
+        """Reset the unsaved/new-chat HamMem choice when a session is unloaded."""
+        self._use_ham_mem = True
+        self._refresh_ham_mem_control()
+
+    def _clear_memory_snapshot(self) -> None:
+        if self._thinking_panel is not None and hasattr(self._thinking_panel, "clear_memory_snapshot"):
+            self._thinking_panel.clear_memory_snapshot()
+
+    def _refresh_ham_mem_control(self) -> None:
+        if self._thinking_panel is not None:
+            if hasattr(self._thinking_panel, "set_use_ham_mem"):
+                self._thinking_panel.set_use_ham_mem(self._use_ham_mem, control_enabled=self._active_ticket == -1)
+
+    def _on_use_ham_mem_changed(self, enabled: bool) -> None:
+        self._use_ham_mem = bool(enabled)
+        if self._conv_id and self._save_enabled():
+            try:
+                dbo.set_conversation_use_ham_mem(self._db, self._conv_id, self._use_ham_mem)
+            except Exception:
+                log.exception("Could not save conversation HamMem setting")
 
     def _thinking_model_info(self) -> tuple[bool, bool, bool]:
         """Return (controls_enabled, requires_thinking, support_unverified)."""
@@ -232,7 +261,7 @@ class ChatController(QObject):
         try:
             uid = int(self._session.current.user_id)  # type: ignore
             self._conv_id = dbo.create_conversation(
-                self._db, user_id=uid, title=safe_title, thinking_mode=self._thinking_mode,
+                self._db, user_id=uid, title=safe_title, thinking_mode=self._thinking_mode, use_ham_mem=self._use_ham_mem,
             )
             # Notify listeners (e.g., MainWindow → SidePanel) that a new convo exists
             self.conversation_started.emit(int(self._conv_id))
@@ -476,8 +505,8 @@ class ChatController(QObject):
         )
         return self._system_injection_for_profile(profile), options
 
-    def _memory_snapshot(self):
-        if not self._memory_service or not self._session or not self._session.current.user_id:
+    def _memory_snapshot(self, enabled: bool = True):
+        if not enabled or not self._memory_service or not self._session or not self._session.current.user_id:
             return ([], [])
         try:
             return self._memory_service.snapshot_context(user_id=int(self._session.current.user_id), role=self._session.current.role, conversation_id=self._conv_id, profile_id=self._get_active_profile_id())
@@ -489,6 +518,34 @@ class ChatController(QObject):
         log.debug("%s", status)
         self.ham_mem_status.emit(status)
 
+    def _memory_prefix(self, prompt: str, snapshot, injection: Optional[ChatMessage]) -> List[ChatMessage]:
+        if snapshot == ([], []):
+            return [injection] if injection is not None else []
+        memory_context, memory_status, details = MemoryEmbeddingService.format_context(
+            prompt, self._memory_provider, snapshot, return_details=True,
+        )
+        self._report_ham_mem(memory_status)
+        prefix: List[ChatMessage] = []
+        role = str(getattr(getattr(self._session, "current", None), "role", "")).lower()
+        if memory_context and memory_context.startswith("[HamMem administrative"):
+            global_part, _, relevant_part = memory_context.partition("\n\n[HamMem relevant memory]")
+            managed = details["managed"]
+            marker = {"ham_mem_view": global_part if role == "admin" else f"{len(managed)} managed memor{'y' if len(managed) == 1 else 'ies'} included"}
+            prefix.append(ChatMessage(role="system", content=global_part, metadata=marker))
+        else:
+            relevant_part = memory_context or ""
+        if injection is not None:
+            prefix.append(injection)
+        if relevant_part:
+            content = "[HamMem relevant memory]" + relevant_part if not relevant_part.startswith("[HamMem") else relevant_part
+            prefix.append(ChatMessage(role="system", content=content, metadata={"ham_mem_view": content}))
+        return prefix
+
+    @staticmethod
+    def _final_memory_snapshot(messages: List[ChatMessage]) -> Optional[str]:
+        parts = [str(message.metadata["ham_mem_view"]) for message in messages if message.metadata and message.metadata.get("ham_mem_view")]
+        return "\n\n".join(parts) if parts else None
+
     def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None, memory_snapshot=None):
         """Create a text-only stream using a prompt resolved on the GUI thread."""
         request_options = dict(DEFAULT_GENERATION_OPTIONS if options is None else options)
@@ -498,16 +555,7 @@ class ChatController(QObject):
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
 
-            memory_context, memory_status = MemoryEmbeddingService.format_context(prompt, self._memory_provider, memory_snapshot or ([], []))
-            if memory_context and memory_context.startswith("[HamMem administrative"):
-                # Keep admin context ahead of persona; relevant memory remains safely delimited.
-                global_part, _, relevant_part = memory_context.partition("\n\n[HamMem relevant memory]")
-                hist.append(ChatMessage(role="system", content=global_part))
-            else: relevant_part = memory_context or ""
-            if injection is not None: hist.append(injection)
-            if relevant_part:
-                hist.append(ChatMessage(role="system", content=("[HamMem relevant memory]" + relevant_part if not relevant_part.startswith("[HamMem") else relevant_part)))
-            self._report_ham_mem(memory_status)
+            hist.extend(self._memory_prefix(prompt, memory_snapshot or ([], []), injection))
 
             for entry in self._history[-self._max_turns * 2:]:
                 m = entry.msg
@@ -541,6 +589,7 @@ class ChatController(QObject):
             build_options=_build_options,
             build_thinking=lambda: thinking_mode,
             build_requested_thinking=lambda: requested_thinking_mode,
+            on_final_messages=self._final_memory_snapshot,
         )
 
     def _apply_model_context_allocation(self, options: Dict) -> None:
@@ -650,7 +699,7 @@ class ChatController(QObject):
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
         injection, options = self._resolve_active_profile_request()
-        stream_func = self._make_text_stream(injection, options, self._memory_snapshot())
+        stream_func = self._make_text_stream(injection, options, self._memory_snapshot(self._use_ham_mem))
         self._active_ticket = self.broker.submit(stream_func, text)
         self._activate_thinking_for_ticket(self._active_ticket)
 
@@ -687,7 +736,8 @@ class ChatController(QObject):
 
         # Compute persona rule injection once, in the GUI thread
         inj = self.system_injection_if_any()
-        memory_snapshot = self._memory_snapshot()
+        use_ham_mem = self._use_ham_mem
+        memory_snapshot = self._memory_snapshot(use_ham_mem)
         media_request_options = {"temperature": 0.7}
         self._apply_model_context_allocation(media_request_options)
         requested_thinking_mode, thinking_mode = self._request_thinking_modes()
@@ -699,16 +749,7 @@ class ChatController(QObject):
             hist_entries = self._history[-self._max_turns * 2:]
             hist = [entry.msg for entry in hist_entries]
 
-            # Persona rule injection at the front, if any
-            memory_context, _ = MemoryEmbeddingService.format_context(prompt, self._memory_provider, memory_snapshot)
-            prefix: List[ChatMessage] = []
-            if memory_context and memory_context.startswith("[HamMem administrative"):
-                global_part, _, relevant = memory_context.partition("\n\n[HamMem relevant memory]")
-                prefix.append(ChatMessage(role="system", content=global_part))
-            else:
-                relevant = memory_context or ""
-            if inj is not None: prefix.append(inj)
-            if relevant: prefix.append(ChatMessage(role="system", content=("[HamMem relevant memory]" + relevant if not relevant.startswith("[HamMem") else relevant)))
+            prefix = self._memory_prefix(prompt, memory_snapshot, inj)
 
             # replace the last (just-appended) user turn with a copy that has .parts
             msg = ChatMessage(role="user", content=prompt)
@@ -731,6 +772,7 @@ class ChatController(QObject):
             build_options=build_options,
             build_thinking=lambda: thinking_mode,
             build_requested_thinking=lambda: requested_thinking_mode,
+            on_final_messages=self._final_memory_snapshot,
         )
 
         self._active_ticket = self.broker.submit(stream_func, text)
@@ -772,6 +814,22 @@ class ChatController(QObject):
             self._thinking_panel.show_thinking_notice(
                 f"Ollama rejected the {mode.title()} thinking effort. Choose another effort and retry."
             )
+        elif event_type == "output_limit" and self._active_row is not None:
+            # This is display-only: retain and persist any visible model text,
+            # but never make the explanatory marker part of its response.
+            self.chat.stream_chunk(
+                self._active_row,
+                "\n[output limit] The model reached its output limit. Any partial response has "
+                "been kept. If Thinking consumed the budget before an answer appeared, try "
+                "lowering or disabling Thinking in the Chat Panel. You can also request a "
+                "shorter response and regenerate.",
+            )
+
+    def _on_job_memory_snapshot(self, ticket: int, snapshot: str) -> None:
+        if ticket != self._active_ticket or self._thinking_panel is None:
+            log.debug("Ignoring stale HamMem snapshot ticket=%s active_ticket=%s", ticket, self._active_ticket)
+            return
+        self._thinking_panel.set_memory_snapshot(snapshot)
 
     def _on_job_finished(self, ticket: int, status: str):
         if ticket == self._active_ticket and self._active_row is not None:
@@ -820,6 +878,7 @@ class ChatController(QObject):
         self._active_ticket = -1
         self._thinking_ticket = -1
         self._refresh_thinking_controls()
+        self._refresh_ham_mem_control()
 
     def _on_job_error(self, ticket: int, message: str):
         if ticket == self._active_ticket and self._active_row is not None:
@@ -834,8 +893,10 @@ class ChatController(QObject):
         self._assistant_buf = []
         self.clear_transient_thinking()
         self._thinking_mode = "medium"
+        self._use_ham_mem = True
         self._thinking_notice_shown = False
         self._refresh_thinking_controls()
+        self._refresh_ham_mem_control()
         # Drop the persisted-conversation handle; next user msg will create a new one
         self._conv_id = None
         self._clear_thinking()
@@ -876,10 +937,13 @@ class ChatController(QObject):
         self.clear_transient_thinking()
         try:
             self._thinking_mode = dbo.get_conversation_thinking_mode(self._db, self._conv_id) if self._db else "medium"
+            self._use_ham_mem = dbo.get_conversation_use_ham_mem(self._db, self._conv_id) if self._db else True
         except Exception:
             self._thinking_mode = "medium"
+            self._use_ham_mem = True
         self._thinking_notice_shown = False
         self._refresh_thinking_controls()
+        self._refresh_ham_mem_control()
 
         insert_offset = 0  # tracks extra rows added for thumbs so indices stay aligned
         ui_row = -1
@@ -1118,7 +1182,7 @@ class ChatController(QObject):
         new_title = self._make_fork_title()
         try:
             new_conv_id = dbo.create_conversation(
-                self._db, user_id=uid, title=new_title, thinking_mode=self._thinking_mode,
+                self._db, user_id=uid, title=new_title, thinking_mode=self._thinking_mode, use_ham_mem=self._use_ham_mem,
             )
         except Exception:
             return
@@ -1371,7 +1435,7 @@ class ChatController(QObject):
         )
 
         inj = self.system_injection_if_any()
-        stream_func = self._make_text_stream(inj, {"temperature": 0.7}, self._memory_snapshot())
+        stream_func = self._make_text_stream(inj, {"temperature": 0.7}, self._memory_snapshot(self._use_ham_mem))
         self._assistant_buf = []
         self._begin_thinking_generation()
         self._active_row = self.chat.begin_assistant_stream()

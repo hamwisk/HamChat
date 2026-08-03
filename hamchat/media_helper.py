@@ -2,11 +2,26 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
-import hashlib, base64, imghdr, os, tempfile, shutil
-from PIL import Image  # Pillow
+import hashlib, base64, os, tempfile, shutil, io, math, warnings
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 THUMB_SIZE = 96  # square
 AVATAR_SIZE = 64  # default logical avatar size for profiles (square)
+MAX_INFERENCE_PIXELS = 1_000_000
+MAX_DECODED_PIXELS = 40_000_000
+Image.MAX_IMAGE_PIXELS = MAX_DECODED_PIXELS
+
+
+class ImageValidationError(ValueError):
+    """Safe, user-facing image validation failure without decoder internals."""
+
+
+@dataclass(frozen=True)
+class NormalizedImage:
+    png_bytes: bytes
+    width: int
+    height: int
+    source_mime: str
 
 def _sha256_file(p: str) -> str:
     h = hashlib.sha256()
@@ -16,8 +31,60 @@ def _sha256_file(p: str) -> str:
     return h.hexdigest()
 
 def _mime_guess(p: str) -> str:
-    kind = imghdr.what(p) or ""
-    return {"png":"image/png","jpeg":"image/jpeg","gif":"image/gif","bmp":"image/bmp","tiff":"image/tiff"}.get(kind, "application/octet-stream")
+    try:
+        return normalize_image_file(p).source_mime
+    except ImageValidationError:
+        return "application/octet-stream"
+
+
+def _source_mime(image: Image.Image) -> str:
+    return {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif", "BMP": "image/bmp", "TIFF": "image/tiff"}.get((image.format or "").upper(), "application/octet-stream")
+
+
+def normalize_image_bytes(raw: bytes) -> NormalizedImage:
+    """Decode a safe raster image and produce a deterministic metadata-free RGB PNG."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as opened:
+                source_mime = _source_mime(opened)
+                if source_mime == "application/octet-stream":
+                    raise ImageValidationError("unsupported")
+                opened.seek(0)  # animated sources deliberately use only frame zero
+                image = ImageOps.exif_transpose(opened).copy()
+                if image.width < 1 or image.height < 1 or image.width * image.height > MAX_DECODED_PIXELS:
+                    raise ImageValidationError("unsafe dimensions")
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning, ImageValidationError) as exc:
+        raise ImageValidationError("unreadable image") from exc
+
+    if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (245, 245, 245, 255))
+        background.alpha_composite(rgba)
+        image = background.convert("RGB")
+    else:
+        image = image.convert("RGB")
+    if image.width * image.height > MAX_INFERENCE_PIXELS:
+        scale = math.sqrt(MAX_INFERENCE_PIXELS / (image.width * image.height))
+        width, height = max(1, int(image.width * scale)), max(1, int(image.height * scale))
+        while width * height > MAX_INFERENCE_PIXELS:
+            if width >= height:
+                width -= 1
+            else:
+                height -= 1
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    image.save(out, format="PNG", optimize=False)
+    return NormalizedImage(out.getvalue(), image.width, image.height, source_mime)
+
+
+def normalize_image_file(path: str) -> NormalizedImage:
+    source = path[7:] if path.lower().startswith("file://") else path
+    try:
+        with open(source, "rb") as handle:
+            return normalize_image_bytes(handle.read())
+    except (OSError, ImageValidationError) as exc:
+        raise ImageValidationError("unreadable image") from exc
 
 def _make_thumb(src: str, dst: str, size: int = THUMB_SIZE) -> Tuple[int,int]:
     im = Image.open(src).convert("RGBA")
@@ -49,8 +116,9 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
 
     for idx, p in enumerate(paths):
         src = p[7:] if p.lower().startswith("file://") else p
+        normalized = normalize_image_file(src)  # validate before any CAS mutation
         sha = _sha256_file(src)
-        mime = _mime_guess(src)
+        mime = normalized.source_mime
 
         if ephemeral:
             # copy into our temp vault
@@ -77,10 +145,10 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
             thumb_file_id = None
 
         # llm part (base64 from the stored copy if ephemeral; else from src or cas fetch)
-        b64 = _to_base64(src)  # CAS fetch raw if you prefer
+        b64 = base64.b64encode(normalized.png_bytes).decode("ascii")
         results["stored"].append({"file_id": file_id, "tmp_path": stored_path, "sha256": sha, "mime": mime})
         results["thumbs"].append({"path": thumb_path, "w": THUMB_SIZE, "h": THUMB_SIZE, "file_id": thumb_file_id, "sha256": thumb_sha, "mime": thumb_mime})
-        results["llm_parts"].append({"type": "image", "media_type": mime, "data_base64": b64})
+        results["llm_parts"].append({"type": "image", "media_type": "image/png", "data_base64": b64, "width": normalized.width, "height": normalized.height})
     return results
 
 def store_profile_avatar(src: str, *, db, size: int = AVATAR_SIZE) -> str:

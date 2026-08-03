@@ -155,7 +155,8 @@ def _older_turn_groups(messages: List[ChatMessage]) -> List[List[int]]:
 
 def _too_large(context_length: int) -> RequestTooLargeError:
     return RequestTooLargeError(
-        f"This request cannot fit within the active model’s {context_length:,}-token context, "
-        "even without older chat history. Shorten the AI Profile or newest message, remove "
-        "attachments, or use a model with a larger runtime context."
+        "This request cannot fit within the model’s active context. Increase Context "
+        "allocation in Model → Model Manager—higher allocations use more memory—or reduce "
+        "the input by shortening the newest message or AI Profile, removing attachments, "
+        "or temporarily disabling Use HamMem in the Chat Panel."
     )

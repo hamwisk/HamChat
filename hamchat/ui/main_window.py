@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
         )
         try:    # Warn if non-vision model and user tried to send attachments
             self.chat_display.sig_send_payload.connect(self._on_send_payload_from_ui)
+            self.chat_display.attachmentRejected.connect(lambda message: self.statusBar().showMessage(message, 6000))
         except Exception:
             pass
 
@@ -568,6 +569,7 @@ class MainWindow(QMainWindow):
         try:
             self.chat_controller.clear_memory_vectors()
             self.chat_controller.clear_transient_thinking()
+            self.chat_controller.reset_chat_memory_preferences()
         except Exception:
             pass
         self.session.logout()

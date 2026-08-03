@@ -15,10 +15,21 @@ class OpenAIClient(ModelClient):
         self.timeout = timeout
 
     def stream_chat(self, *, model: str, messages: List[ChatMessage], options: Dict) -> Iterator[StreamEvent]:
-        wire_messages = [
-            {"role": m.role, "content": m.content}
-            for m in messages
-        ]
+        wire_messages = []
+        for message in messages:
+            parts = getattr(message, "parts", None) or []
+            if not parts:
+                wire_messages.append({"role": message.role, "content": message.content})
+                continue
+            content = [{"type": "text", "text": message.content or ""}]
+            for part in parts:
+                if not isinstance(part, dict) or part.get("type") != "image":
+                    continue
+                data = part.get("data_base64") or part.get("image") or part.get("data")
+                if data:
+                    # process_images supplies a normalized metadata-free PNG.
+                    content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}})
+            wire_messages.append({"role": message.role, "content": content})
 
         # You can merge options into the call (temperature, etc.)
         stream = self.client.chat.completions.create(

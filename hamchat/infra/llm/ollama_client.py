@@ -29,6 +29,7 @@ class RuntimeContext:
 
 
 class OllamaClient(ModelClient):
+    supports_final_message_callback = True
     def __init__(self, base_url: str = DEFAULT_OLLAMA, timeout: int = 269):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -45,6 +46,7 @@ class OllamaClient(ModelClient):
         thinking_mode: Optional[str] = None,
         requested_thinking_mode: Optional[str] = None,
         _thinking_retry_attempt: int = 0,
+        final_messages_callback=None,
     ) -> Iterator[StreamEvent]:
         request_id = request_id or uuid.uuid4().hex[:8]
         effective_options = dict(options or {})
@@ -67,6 +69,8 @@ class OllamaClient(ModelClient):
 
         effective_options = plan.options
         messages = plan.messages
+        if final_messages_callback is not None:
+            final_messages_callback(messages)
         log.info(
             "Ollama request plan request_id=%s model=%s context_length=%d context_source=%s "
             "original_message_count=%d final_message_count=%d original_input_tokens=%d "

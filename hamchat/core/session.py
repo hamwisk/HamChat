@@ -301,6 +301,16 @@ class SessionManager(QObject):
             pass
         return {}
 
+    def get_model_metadata(self, model_id: str) -> dict:
+        """Return registry metadata, including Ollama's reported family when known."""
+        try:
+            for model in self._load_all_models():
+                if model.get("name") == model_id:
+                    return dict(model)
+        except Exception:
+            pass
+        return {}
+
     def set_model_vision(self, enabled: bool):
         self.current.vision = bool(enabled)
         self.sessionChanged.emit(self.current)

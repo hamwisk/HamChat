@@ -12,6 +12,13 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 StreamFunc = Callable[..., Iterator[str]]
 StopFn     = Callable[[], bool]
 
+
+@dataclass(frozen=True, slots=True)
+class StreamChunk:
+    """A typed transient stream update; visible text remains the default."""
+    type: str
+    text: str
+
 @dataclass(slots=True)
 class Job:
     ticket: int
@@ -23,6 +30,8 @@ class Job:
 # ---------- Worker ----------
 class _Worker(QObject):
     token    = pyqtSignal(int, str)     # (ticket, chunk)
+    thinking = pyqtSignal(int, str)     # (ticket, transient reasoning chunk)
+    notice   = pyqtSignal(int, str, str)  # (ticket, event type, mode)
     finished = pyqtSignal(int, str)     # (ticket, status) status: "ok"|"cancelled"|"error"
     error    = pyqtSignal(int, str)     # (ticket, message)
 
@@ -60,7 +69,12 @@ class _Worker(QObject):
                     if self._should_stop:
                         status = "cancelled"
                         break
-                    self.token.emit(ticket, str(chunk))
+                    if isinstance(chunk, StreamChunk) and chunk.type == "thinking":
+                        self.thinking.emit(ticket, chunk.text)
+                    elif isinstance(chunk, StreamChunk) and chunk.type in {"thinking_forced_low", "thinking_rejected"}:
+                        self.notice.emit(ticket, chunk.type, chunk.text)
+                    else:
+                        self.token.emit(ticket, str(chunk.text if isinstance(chunk, StreamChunk) else chunk))
         except Exception as exc:
             status = "error"
             self.error.emit(ticket, f"{type(exc).__name__}: {exc}")
@@ -82,6 +96,8 @@ class ThreadBroker(QObject):
     """
     job_started  = pyqtSignal(int)          # ticket
     job_token    = pyqtSignal(int, str)     # (ticket, chunk)
+    job_thinking = pyqtSignal(int, str)     # (ticket, transient reasoning chunk)
+    job_notice   = pyqtSignal(int, str, str)  # (ticket, event type, mode)
     job_finished = pyqtSignal(int, str)     # (ticket, status)
     job_error    = pyqtSignal(int, str)     # (ticket, message)
     queue_changed = pyqtSignal(int, int)    # (active_ticket or -1, queued_count)
@@ -140,6 +156,8 @@ class ThreadBroker(QObject):
 
         # bubble up signals
         self._worker.token.connect(self.job_token, Qt.ConnectionType.QueuedConnection)
+        self._worker.thinking.connect(self.job_thinking, Qt.ConnectionType.QueuedConnection)
+        self._worker.notice.connect(self.job_notice, Qt.ConnectionType.QueuedConnection)
         self._worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self._worker.error.connect(self.job_error, Qt.ConnectionType.QueuedConnection)
 

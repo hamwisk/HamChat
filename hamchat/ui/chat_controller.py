@@ -55,6 +55,7 @@ class ChatController(QObject):
         db=None,
         session: Optional[SessionManager] = None,
         local_command_handler: Optional[Callable[[str], bool]] = None,
+        thinking_panel=None,
     ):
         super().__init__(parent)
         self.chat = chat_display
@@ -74,6 +75,9 @@ class ChatController(QObject):
         self._db = db
         self._session = session
         self._local_command_handler = local_command_handler
+        self._thinking_panel = thinking_panel
+        self._thinking_mode = "medium"
+        self._thinking_notice_shown = False
         self._conv_id: Optional[int] = None  # lazily created on first user msg
         memory_cfg = getattr(session, "settings", None).get("ham_mem", {}) if session is not None else {}
         embedding_model = (memory_cfg.get("embedding_model") or "nomic-embed-text").strip() if isinstance(memory_cfg, dict) else "nomic-embed-text"
@@ -88,14 +92,95 @@ class ChatController(QObject):
         # UI → controller
         self.chat.sig_send_text.connect(self._on_user_text, Qt.ConnectionType.QueuedConnection)
         self.chat.sig_stop_requested.connect(self._on_stop, Qt.ConnectionType.QueuedConnection)
+        if self._thinking_panel is not None:
+            self._thinking_panel.thinkingModeChanged.connect(
+                self._on_thinking_mode_changed, Qt.ConnectionType.QueuedConnection,
+            )
 
         # Broker → UI
         self.broker.job_token.connect(self._on_job_token, Qt.ConnectionType.QueuedConnection)
+        self.broker.job_thinking.connect(self._on_job_thinking, Qt.ConnectionType.QueuedConnection)
+        self.broker.job_notice.connect(self._on_job_notice, Qt.ConnectionType.QueuedConnection)
         self.broker.job_finished.connect(self._on_job_finished, Qt.ConnectionType.QueuedConnection)
         self.broker.job_error.connect(self._on_job_error, Qt.ConnectionType.QueuedConnection)
 
         self._active_row: Optional[int] = None
         self._active_ticket: int = -1
+        # This is invalidated immediately on cancel, before the worker has
+        # necessarily delivered all queued cross-thread signals.
+        self._thinking_ticket: int = -1
+        self._refresh_thinking_controls()
+
+    def _clear_thinking(self) -> None:
+        if self._thinking_panel is not None:
+            self._thinking_panel.clear_thinking()
+
+    def _begin_thinking_generation(self) -> None:
+        self._thinking_ticket = -1
+        self._clear_thinking()
+        log.debug("Transient thinking cleared for new generation")
+
+    def _activate_thinking_for_ticket(self, ticket: int) -> None:
+        self._thinking_ticket = ticket
+        self._refresh_thinking_controls()
+
+    def clear_transient_thinking(self) -> None:
+        """Forget non-persistent reasoning when the active session is unloaded."""
+        self._thinking_ticket = -1
+        self._clear_thinking()
+
+    def _thinking_model_info(self) -> tuple[bool, bool, bool]:
+        """Return (controls_enabled, requires_thinking, support_unverified)."""
+        if not hasattr(self._model_client, "prepare_runtime_context"):
+            return False, False, False
+        caps = self._session.get_model_capabilities(self._model_name) if self._session else {}
+        if isinstance(caps.get("thinking"), bool):
+            return caps["thinking"], False, False
+        metadata = self._session.get_model_metadata(self._model_name) if self._session and hasattr(self._session, "get_model_metadata") else {}
+        family = str((metadata or {}).get("family") or caps.get("family") or "").lower().replace("_", "-")
+        model = self._model_name.lower().replace("_", "-")
+        is_gpt_oss = family in {"gptoss", "gpt-oss"} or model.startswith("gpt-oss:")
+        supports = is_gpt_oss or family in {"qwen3", "qwen35", "qwen3.5", "deepseek-r1"}
+        if supports:
+            return True, is_gpt_oss, False
+        # No registry assertion is not an assertion of no support.  Let Ollama
+        # decide and surface an explicit rejection if the override is invalid.
+        return True, False, True
+
+    def _refresh_thinking_controls(self) -> None:
+        if self._thinking_panel is None:
+            return
+        supports, _, unverified = self._thinking_model_info()
+        self._thinking_panel.set_thinking_mode(self._thinking_mode, enabled=supports and self._active_ticket == -1)
+        self._thinking_panel.set_thinking_support_unverified(unverified)
+
+    def _set_thinking_mode(self, mode: str, *, show_forced_notice: bool = False) -> None:
+        self._thinking_mode = mode if mode in {"off", "low", "medium", "high"} else "medium"
+        if self._conv_id and self._save_enabled():
+            try:
+                dbo.set_conversation_thinking_mode(self._db, self._conv_id, self._thinking_mode)
+            except Exception:
+                log.exception("Could not save conversation thinking mode")
+        if self._thinking_panel is not None:
+            self._refresh_thinking_controls()
+            if show_forced_notice and not self._thinking_notice_shown:
+                self._thinking_panel.show_thinking_notice(
+                    "Thinking can’t be disabled for this model, so HamChat has set it to Low."
+                )
+                self._thinking_notice_shown = True
+
+    def _on_thinking_mode_changed(self, mode: str) -> None:
+        self._thinking_notice_shown = False
+        self._set_thinking_mode(mode)
+
+    def _request_thinking_modes(self) -> tuple[Optional[str], Optional[str]]:
+        requested_mode = self._thinking_mode
+        supports, requires_thinking, _ = self._thinking_model_info()
+        if not supports:
+            return None, None
+        if requires_thinking and self._thinking_mode == "off":
+            self._set_thinking_mode("low", show_forced_notice=True)
+        return requested_mode, self._thinking_mode
 
     def set_model_client(self, model_client) -> None:
         """
@@ -104,6 +189,7 @@ class ChatController(QObject):
         """
         self._model_client = model_client
         self._configure_stream()
+        self._refresh_thinking_controls()
 
     def get_active_runtime_context(self, options: Optional[Dict] = None):
         """Return known Ollama runtime context without doing network I/O on the GUI thread."""
@@ -145,7 +231,9 @@ class ChatController(QObject):
             safe_title = safe_title[:80] + "…"
         try:
             uid = int(self._session.current.user_id)  # type: ignore
-            self._conv_id = dbo.create_conversation(self._db, user_id=uid, title=safe_title)
+            self._conv_id = dbo.create_conversation(
+                self._db, user_id=uid, title=safe_title, thinking_mode=self._thinking_mode,
+            )
             # Notify listeners (e.g., MainWindow → SidePanel) that a new convo exists
             self.conversation_started.emit(int(self._conv_id))
         except Exception:
@@ -405,6 +493,7 @@ class ChatController(QObject):
         """Create a text-only stream using a prompt resolved on the GUI thread."""
         request_options = dict(DEFAULT_GENERATION_OPTIONS if options is None else options)
         self._apply_model_context_allocation(request_options)
+        requested_thinking_mode, thinking_mode = self._request_thinking_modes()
 
         def _build_messages(prompt: str) -> List[ChatMessage]:
             hist: List[ChatMessage] = []
@@ -450,6 +539,8 @@ class ChatController(QObject):
             model=self._model_name,
             build_messages=_build_messages,
             build_options=_build_options,
+            build_thinking=lambda: thinking_mode,
+            build_requested_thinking=lambda: requested_thinking_mode,
         )
 
     def _apply_model_context_allocation(self, options: Dict) -> None:
@@ -486,6 +577,7 @@ class ChatController(QObject):
             invalidate_runtime_context()
         self._model_name = model_name
         self._configure_stream()
+        self._refresh_thinking_controls()
 
     # ---------- Slots ----------
 
@@ -506,6 +598,7 @@ class ChatController(QObject):
 
         # Reset assistant buffer for this turn
         self._assistant_buf = []
+        self._begin_thinking_generation()
 
         # Optional metadata: include pending attachments if any
         attachments_meta: List[Dict] = []
@@ -559,6 +652,7 @@ class ChatController(QObject):
         injection, options = self._resolve_active_profile_request()
         stream_func = self._make_text_stream(injection, options, self._memory_snapshot())
         self._active_ticket = self.broker.submit(stream_func, text)
+        self._activate_thinking_for_ticket(self._active_ticket)
 
     def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
         """
@@ -586,6 +680,7 @@ class ChatController(QObject):
             )
         )
         self._assistant_buf = []
+        self._begin_thinking_generation()
 
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
@@ -595,6 +690,7 @@ class ChatController(QObject):
         memory_snapshot = self._memory_snapshot()
         media_request_options = {"temperature": 0.7}
         self._apply_model_context_allocation(media_request_options)
+        requested_thinking_mode, thinking_mode = self._request_thinking_modes()
 
         # submit a one-off stream function that wraps the standard messages/options
         def build_messages(prompt: str) -> List[ChatMessage]:
@@ -633,11 +729,17 @@ class ChatController(QObject):
             model=self._model_name,
             build_messages=build_messages,
             build_options=build_options,
+            build_thinking=lambda: thinking_mode,
+            build_requested_thinking=lambda: requested_thinking_mode,
         )
 
         self._active_ticket = self.broker.submit(stream_func, text)
+        self._activate_thinking_for_ticket(self._active_ticket)
 
     def _on_stop(self):
+        # Keep partial text visible, but reject any deltas already queued from
+        # the worker after the user has cancelled this generation.
+        self._thinking_ticket = -1
         self.broker.stop_active()
 
     def clear_memory_vectors(self) -> None:
@@ -649,6 +751,27 @@ class ChatController(QObject):
         if ticket == self._active_ticket and self._active_row is not None:
             self._assistant_buf.append(chunk)
             self.chat.stream_chunk(self._active_row, chunk)
+
+    def _on_job_thinking(self, ticket: int, chunk: str):
+        if ticket != self._active_ticket or ticket != self._thinking_ticket:
+            log.debug(
+                "Ignoring stale transient thinking chunk ticket=%s active_ticket=%s thinking_ticket=%s",
+                ticket, self._active_ticket, self._thinking_ticket,
+            )
+            return
+        if self._thinking_panel is None:
+            return
+        self._thinking_panel.append_thinking(chunk)
+
+    def _on_job_notice(self, ticket: int, event_type: str, mode: str) -> None:
+        if ticket != self._active_ticket:
+            return
+        if event_type == "thinking_forced_low":
+            self._set_thinking_mode("low", show_forced_notice=True)
+        elif event_type == "thinking_rejected" and self._thinking_panel is not None:
+            self._thinking_panel.show_thinking_notice(
+                f"Ollama rejected the {mode.title()} thinking effort. Choose another effort and retry."
+            )
 
     def _on_job_finished(self, ticket: int, status: str):
         if ticket == self._active_ticket and self._active_row is not None:
@@ -695,6 +818,8 @@ class ChatController(QObject):
         self.chat.set_streaming(False)
         self._active_row = None
         self._active_ticket = -1
+        self._thinking_ticket = -1
+        self._refresh_thinking_controls()
 
     def _on_job_error(self, ticket: int, message: str):
         if ticket == self._active_ticket and self._active_row is not None:
@@ -707,8 +832,13 @@ class ChatController(QObject):
         """Call when starting a brand-new conversation (e.g., 'New chat')."""
         self._history.clear()
         self._assistant_buf = []
+        self.clear_transient_thinking()
+        self._thinking_mode = "medium"
+        self._thinking_notice_shown = False
+        self._refresh_thinking_controls()
         # Drop the persisted-conversation handle; next user msg will create a new one
         self._conv_id = None
+        self._clear_thinking()
 
     def has_persisted_conversation(self) -> bool:
         """
@@ -743,6 +873,13 @@ class ChatController(QObject):
         self._history.clear()
         self._assistant_buf = []
         self._conv_id = int(conversation_id)
+        self.clear_transient_thinking()
+        try:
+            self._thinking_mode = dbo.get_conversation_thinking_mode(self._db, self._conv_id) if self._db else "medium"
+        except Exception:
+            self._thinking_mode = "medium"
+        self._thinking_notice_shown = False
+        self._refresh_thinking_controls()
 
         insert_offset = 0  # tracks extra rows added for thumbs so indices stay aligned
         ui_row = -1
@@ -980,7 +1117,9 @@ class ChatController(QObject):
         uid = int(self._session.current.user_id)  # type: ignore
         new_title = self._make_fork_title()
         try:
-            new_conv_id = dbo.create_conversation(self._db, user_id=uid, title=new_title)
+            new_conv_id = dbo.create_conversation(
+                self._db, user_id=uid, title=new_title, thinking_mode=self._thinking_mode,
+            )
         except Exception:
             return
 
@@ -1234,9 +1373,11 @@ class ChatController(QObject):
         inj = self.system_injection_if_any()
         stream_func = self._make_text_stream(inj, {"temperature": 0.7}, self._memory_snapshot())
         self._assistant_buf = []
+        self._begin_thinking_generation()
         self._active_row = self.chat.begin_assistant_stream()
         self.chat.set_streaming(True)
         self._active_ticket = self.broker.submit(stream_func, text)
+        self._activate_thinking_for_ticket(self._active_ticket)
 
     def _regenerate_with_attachments(self, text: str, attachments: list[str]) -> None:
         if not getattr(getattr(self._session, "current", None), "vision", False):
@@ -1288,6 +1429,7 @@ class ChatController(QObject):
             self._assistant_buf = []
             self._active_row = None
             self._active_ticket = -1
+            self.clear_transient_thinking()
 
             # Tell the UI we're no longer streaming (just in case)
             try:

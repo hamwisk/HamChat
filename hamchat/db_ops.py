@@ -355,11 +355,12 @@ def delete_user_safe(conn, user_id: int) -> None:
 
 # ---------- conversations & messages ----------
 
-def create_conversation(conn, user_id: int, title: str) -> int:
+def create_conversation(conn, user_id: int, title: str, *, thinking_mode: str = "medium") -> int:
+    thinking_mode = thinking_mode if thinking_mode in {"off", "low", "medium", "high"} else "medium"
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO saved_conversations(user_id, title, created) VALUES(?,?,?)",
-        (user_id, title, _now()),
+        "INSERT INTO saved_conversations(user_id, title, created, thinking_mode) VALUES(?,?,?,?)",
+        (user_id, title, _now(), thinking_mode),
     )
     conv_id = cur.lastrowid
     conn.commit()
@@ -449,6 +450,23 @@ def rename_conversation(conn, conversation_id: int, title: str) -> None:
     cur.execute(
         "UPDATE saved_conversations SET title = ? WHERE id = ?",
         (title, int(conversation_id)),
+    )
+    conn.commit()
+
+
+def get_conversation_thinking_mode(conn, conversation_id: int) -> str:
+    row = conn.execute(
+        "SELECT thinking_mode FROM saved_conversations WHERE id=?", (int(conversation_id),)
+    ).fetchone()
+    mode = row[0] if row else None
+    return mode if mode in {"off", "low", "medium", "high"} else "medium"
+
+
+def set_conversation_thinking_mode(conn, conversation_id: int, mode: str) -> None:
+    if mode not in {"off", "low", "medium", "high"}:
+        raise ValueError(f"Unknown thinking mode: {mode}")
+    conn.execute(
+        "UPDATE saved_conversations SET thinking_mode=? WHERE id=?", (mode, int(conversation_id))
     )
     conn.commit()
 

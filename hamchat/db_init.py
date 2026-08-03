@@ -480,7 +480,9 @@ CREATE TABLE IF NOT EXISTS saved_conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES user_profiles(id) ON DELETE CASCADE,
   title TEXT,
-  created INTEGER
+  created INTEGER,
+  thinking_mode TEXT NOT NULL DEFAULT 'medium'
+    CHECK(thinking_mode IN ('off', 'low', 'medium', 'high'))
 );
 
 -- Messages: single schema supports plain or AEAD fields
@@ -759,7 +761,19 @@ def _migrate_existing_schema(conn, mode: str) -> None:
         return
     if current_key == target_key:
         return
-    migrations = (("2026-07-28.0", _migrate_memory_table), ("2026-07-28.1", lambda cur, mode: _create_embedding_objects(cur)))
+    def _add_conversation_thinking_mode(cur, _mode: str) -> None:
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(saved_conversations)")}
+        if "thinking_mode" not in columns:
+            cur.execute(
+                "ALTER TABLE saved_conversations ADD COLUMN thinking_mode TEXT NOT NULL "
+                "DEFAULT 'medium' CHECK(thinking_mode IN ('off', 'low', 'medium', 'high'))"
+            )
+
+    migrations = (
+        ("2026-07-28.0", _migrate_memory_table),
+        ("2026-07-28.1", lambda cur, mode: _create_embedding_objects(cur)),
+        ("2026-08-03.1", _add_conversation_thinking_mode),
+    )
     for version, migration in migrations:
         if current_key >= _version_key(version):
             continue

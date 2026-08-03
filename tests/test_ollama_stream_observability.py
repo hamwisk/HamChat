@@ -344,6 +344,7 @@ def test_thinking_and_visible_content_are_counted_separately(monkeypatch, caplog
 
     events = stream(OllamaClient())
 
+    assert [event.text for event in events if event.type == "thinking"] == ["consider"]
     assert [event.text for event in events if event.type == "delta"] == ["answer"]
     assert "thinking_chunk_count=1 thinking_char_count=8" in caplog.text
     assert "visible_chunk_count=1 visible_char_count=6" in caplog.text

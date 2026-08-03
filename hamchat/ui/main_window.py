@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
             db=self._db,
             session=self.session,
             local_command_handler=self._handle_local_command,
+            thinking_panel=self.chat_panel,
         )
 
         try:    # When the controller lazily creates a new saved conversation, refresh the side panel list
@@ -566,6 +567,7 @@ class MainWindow(QMainWindow):
     def _do_logout(self):
         try:
             self.chat_controller.clear_memory_vectors()
+            self.chat_controller.clear_transient_thinking()
         except Exception:
             pass
         self.session.logout()

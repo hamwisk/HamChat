@@ -6,8 +6,9 @@ from PyQt6.QtCore import Qt, QDateTime, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, QToolButton, QFrame, QFormLayout,
     QFileDialog, QMessageBox, QHBoxLayout, QSizePolicy, QListWidget, QListWidgetItem,
-    QAbstractItemView, QMenu
+    QAbstractItemView, QMenu, QPlainTextEdit, QComboBox
 )
+from PyQt6.QtGui import QTextCursor
 
 log = logging.getLogger("ui.chat_panel")
 
@@ -50,6 +51,7 @@ class ChatPanel(QWidget):
     attachmentOpenRequested = pyqtSignal(int)
     attachmentAttachRequested = pyqtSignal(int)
     attachmentScrollRequested = pyqtSignal(int)
+    thinkingModeChanged = pyqtSignal(str)
 
     def __init__(self, parent=None, *, chat_display=None, attachments_loader=None):
         super().__init__(parent)
@@ -91,6 +93,45 @@ class ChatPanel(QWidget):
         att_lay.addWidget(self._att_list)
         att.set_content(att_body)
         root.addWidget(att)
+
+        # Transient only: this is never part of ChatDisplay or exported data.
+        thinking = Expander("Thinking", expanded=False)
+        thinking_body = QWidget(thinking)
+        thinking_layout = QVBoxLayout(thinking_body)
+        thinking_layout.setContentsMargins(0, 0, 0, 0)
+        thinking_layout.setSpacing(6)
+        thinking_controls = QHBoxLayout()
+        thinking_controls.setContentsMargins(0, 0, 0, 0)
+        thinking_controls.addWidget(QLabel("Effort:", thinking_body))
+        self._thinking_mode = QComboBox(thinking_body)
+        for label, mode in (("Off", "off"), ("Low", "low"), ("Medium (Default)", "medium"), ("High", "high")):
+            self._thinking_mode.addItem(label, mode)
+        self._thinking_mode.setCurrentIndex(self._thinking_mode.findData("medium"))
+        self._thinking_mode.setToolTip(
+            "Medium uses the model's default thinking behaviour. Higher thinking effort may take longer "
+            "and leave fewer generated tokens for the visible answer."
+        )
+        self._thinking_mode.currentIndexChanged.connect(self._on_thinking_mode_changed)
+        thinking_controls.addWidget(self._thinking_mode, 1)
+        thinking_layout.addLayout(thinking_controls)
+        self._thinking_support_note = QLabel("", thinking_body)
+        self._thinking_support_note.setWordWrap(True)
+        self._thinking_support_note.setStyleSheet("color:#8b8f97; font-size:12px;")
+        self._thinking_support_note.setVisible(False)
+        thinking_layout.addWidget(self._thinking_support_note)
+        self._thinking_notice = QLabel("", thinking_body)
+        self._thinking_notice.setWordWrap(True)
+        self._thinking_notice.setStyleSheet("color:#8b8f97; font-size:12px;")
+        self._thinking_notice.setVisible(False)
+        thinking_layout.addWidget(self._thinking_notice)
+        self._thinking_view = QPlainTextEdit(thinking_body)
+        self._thinking_view.setReadOnly(True)
+        self._thinking_view.setPlainText("")
+        self._thinking_view.setMaximumHeight(220)
+        self._thinking_view.setPlaceholderText("")
+        thinking_layout.addWidget(self._thinking_view)
+        thinking.set_content(thinking_body)
+        root.addWidget(thinking)
 
         # Metadata expander
         meta = Expander("Conversation details", expanded=True)
@@ -178,6 +219,56 @@ class ChatPanel(QWidget):
         else:
             self._att_placeholder.setVisible(False)
             self._att_list.setVisible(True)
+
+    def clear_thinking(self) -> None:
+        self._thinking_view.clear()
+        self._thinking_view.verticalScrollBar().setValue(0)
+
+    def thinking_mode(self) -> str:
+        mode = self._thinking_mode.currentData()
+        return mode if mode in {"off", "low", "medium", "high"} else "medium"
+
+    def set_thinking_mode(self, mode: str, *, enabled: bool | None = None) -> None:
+        mode = mode if mode in {"off", "low", "medium", "high"} else "medium"
+        index = self._thinking_mode.findData(mode)
+        self._thinking_mode.blockSignals(True)
+        self._thinking_mode.setCurrentIndex(max(0, index))
+        if enabled is not None:
+            self._thinking_mode.setEnabled(enabled)
+        self._thinking_mode.blockSignals(False)
+
+    def set_thinking_mode_enabled(self, enabled: bool) -> None:
+        self._thinking_mode.setEnabled(enabled)
+
+    def set_thinking_support_unverified(self, unverified: bool) -> None:
+        self._thinking_support_note.setText(
+            "Thinking controls for this model are unverified. Changes may have no effect." if unverified else ""
+        )
+        self._thinking_support_note.setVisible(unverified)
+
+    def show_thinking_notice(self, text: str) -> None:
+        self._thinking_notice.setText(text)
+        self._thinking_notice.setVisible(bool(text))
+
+    def _on_thinking_mode_changed(self, _index: int) -> None:
+        self._thinking_notice.setVisible(False)
+        self.thinkingModeChanged.emit(self.thinking_mode())
+
+    def append_thinking(self, text: str) -> None:
+        if not text:
+            return
+        scrollbar = self._thinking_view.verticalScrollBar()
+        follow = scrollbar.maximum() - scrollbar.value() <= 2
+        cursor = self._thinking_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self._thinking_view.setTextCursor(cursor)
+        if follow:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def thinking_text(self) -> str:
+        """Small test/diagnostic accessor; not used for persistence or export."""
+        return self._thinking_view.toPlainText()
 
     # -------- internals ----------
     def _connect_model_signals(self):

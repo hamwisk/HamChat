@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from hamchat import db_init, db_ops
+from hamchat.constants import SCHEMA_VERSION
 
 
 def make_db(mode="open"):
@@ -23,7 +24,7 @@ def test_memory_migration_when_table_is_absent():
     conn = make_db(); conn.execute("DROP TABLE persistent_memory")
     conn.execute("UPDATE meta SET value='2025-12-06.1' WHERE key='schema_version'"); conn.commit()
     db_init._migrate_existing_schema(conn, "open")
-    assert db_ops.read_schema_version(conn) == "2026-07-28.1"
+    assert db_ops.read_schema_version(conn) == SCHEMA_VERSION
     assert "owner_user_id" in {r[1] for r in conn.execute("PRAGMA table_info(persistent_memory)")}
 
 

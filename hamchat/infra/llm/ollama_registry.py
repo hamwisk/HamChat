@@ -193,9 +193,15 @@ def refresh_registry(base_url: str = DEFAULT_OLLAMA, registry_path: Path = REGIS
             entry = cached or {
                 "name": name, "first_seen": now
             }
+            capabilities = dict(entry.get("capabilities") or {})
+            capabilities["vision"] = bool(vision)
+            # Learned thinking support belongs to one model build, so it must
+            # be rediscovered after a tag starts pointing at a new digest.
+            if cached is not None:
+                capabilities.pop("thinking", None)
             entry.update({
                 "digest": digest,
-                "capabilities": {"vision": bool(vision)},
+                "capabilities": capabilities,
                 "context": context,
                 "family": family,
                 "last_seen": now,
@@ -223,6 +229,7 @@ def refresh_registry(base_url: str = DEFAULT_OLLAMA, registry_path: Path = REGIS
             _apply_context_overrides(entry)
 
     # write back in stable order
+    reg["schema"] = 2
     reg["source"] = f"ollama@{base_url}"
     reg["last_refresh"] = _iso_now()
     reg["models"] = sorted(cache.values(), key=lambda m: (not m["available"], m["name"].lower()))
@@ -232,17 +239,53 @@ def refresh_registry(base_url: str = DEFAULT_OLLAMA, registry_path: Path = REGIS
 def _load_registry(path: Path) -> Dict[str, Any]:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"schema": 1, "source": "", "last_refresh": _iso_now(), "models": []}
+        data = {"schema": 2, "source": "", "last_refresh": _iso_now(), "models": []}
         _save_registry(path, data)
         return data
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Model registry must be a JSON object")
+    # Schema 1 needs no eager rewrite: a missing thinking key is unknown.
+    data.setdefault("schema", 1)
+    data.setdefault("models", [])
+    return data
 
 def _save_registry(path: Path, data: Dict[str, Any]) -> None:
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=False)
     tmp.replace(path)
+
+
+def update_model_capability(
+    model_name: str,
+    capability: str,
+    value: bool,
+    *,
+    registry_path: Path = REGISTRY_PATH,
+) -> bool:
+    """Atomically persist one learned capability, returning whether it changed."""
+    if not isinstance(value, bool):
+        raise ValueError("Model capability values must be boolean")
+    registry = _load_registry(registry_path)
+    models = registry.get("models")
+    if not isinstance(models, list):
+        return False
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("name") != model_name:
+            continue
+        capabilities = entry.get("capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+            entry["capabilities"] = capabilities
+        if capabilities.get(capability) is value and registry.get("schema") == 2:
+            return False
+        capabilities[capability] = value
+        registry["schema"] = 2
+        _save_registry(registry_path, registry)
+        return True
+    return False
 
 def measure_context(base_url: str, name: str, seed: int = 8192, upper: int = 131072, timeout=4) -> Optional[int]:
     """

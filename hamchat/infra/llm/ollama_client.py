@@ -46,6 +46,7 @@ class OllamaClient(ModelClient):
         thinking_mode: Optional[str] = None,
         requested_thinking_mode: Optional[str] = None,
         _thinking_retry_attempt: int = 0,
+        _final_messages_callback_called: bool = False,
         final_messages_callback=None,
     ) -> Iterator[StreamEvent]:
         request_id = request_id or uuid.uuid4().hex[:8]
@@ -69,7 +70,7 @@ class OllamaClient(ModelClient):
 
         effective_options = plan.options
         messages = plan.messages
-        if final_messages_callback is not None:
+        if final_messages_callback is not None and not _final_messages_callback_called:
             final_messages_callback(messages)
         log.info(
             "Ollama request plan request_id=%s model=%s context_length=%d context_source=%s "
@@ -150,6 +151,57 @@ class OllamaClient(ModelClient):
         retry_with_low = False
         try:
             with requests.post(url, json=payload, stream=True, timeout=self.timeout) as r:
+                status_code = getattr(r, "status_code", None)
+                if isinstance(status_code, int) and not 200 <= status_code < 300:
+                    error_text = self._response_error_text(r)
+                    log.warning(
+                        "Ollama HTTP error request_id=%s model=%s status=%s error=%s",
+                        request_id, model, status_code, error_text,
+                    )
+                    if (
+                        think_value is False
+                        and not _thinking_retry_attempt
+                        and self._is_think_false_rejection(error_text)
+                    ):
+                        log.warning(
+                            "Ollama thinking disable rejected request_id=%s model=%s; retrying once with low",
+                            request_id, model,
+                        )
+                        yield StreamEvent(type="thinking_forced_low", text="low")
+                        yield from self.stream_chat(
+                            model=model, messages=messages, options=effective_options,
+                            prepared_context=resolved_context, request_id=request_id,
+                            thinking_mode="low", requested_thinking_mode=requested_thinking_mode or thinking_mode,
+                            _thinking_retry_attempt=1,
+                            _final_messages_callback_called=True,
+                            final_messages_callback=final_messages_callback,
+                        )
+                        return
+                    if (
+                        think_value is not None
+                        and not _thinking_retry_attempt
+                        and self._is_thinking_unsupported(error_text)
+                    ):
+                        log.warning(
+                            "Ollama thinking unsupported request_id=%s model=%s; retrying once without think",
+                            request_id, model,
+                        )
+                        yield StreamEvent(type="thinking_unsupported", text=thinking_mode or "")
+                        yield from self.stream_chat(
+                            model=model, messages=messages, options=effective_options,
+                            prepared_context=resolved_context, request_id=request_id,
+                            thinking_mode=None,
+                            requested_thinking_mode=requested_thinking_mode or thinking_mode,
+                            _thinking_retry_attempt=1,
+                            _final_messages_callback_called=True,
+                            final_messages_callback=final_messages_callback,
+                        )
+                        return
+                    self.invalidate_runtime_context()
+                    if thinking_mode is not None and self._is_thinking_rejection(error_text):
+                        yield StreamEvent(type="thinking_rejected", text=thinking_mode)
+                    yield StreamEvent(type="error", error=f"Ollama request failed [{request_id}]: {error_text}")
+                    return
                 r.raise_for_status()
                 log.debug("Ollama stream opened request_id=%s", request_id)
                 yield StreamEvent(type="start")
@@ -193,6 +245,27 @@ class OllamaClient(ModelClient):
                             )
                             retry_with_low = True
                             break
+                        if (
+                            think_value is not None
+                            and not output_started
+                            and not _thinking_retry_attempt
+                            and self._is_thinking_unsupported(error)
+                        ):
+                            log.warning(
+                                "Ollama thinking unsupported request_id=%s model=%s; retrying once without think",
+                                request_id, model,
+                            )
+                            yield StreamEvent(type="thinking_unsupported", text=thinking_mode or "")
+                            yield from self.stream_chat(
+                                model=model, messages=messages, options=effective_options,
+                                prepared_context=resolved_context, request_id=request_id,
+                                thinking_mode=None,
+                                requested_thinking_mode=requested_thinking_mode or thinking_mode,
+                                _thinking_retry_attempt=1,
+                                _final_messages_callback_called=True,
+                                final_messages_callback=final_messages_callback,
+                            )
+                            return
                         if thinking_mode is not None and not output_started and self._is_thinking_rejection(error):
                             yield StreamEvent(type="thinking_rejected", text=thinking_mode)
                         yield StreamEvent(type="error", error=f"Ollama error [{request_id}]: {error}")
@@ -254,18 +327,18 @@ class OllamaClient(ModelClient):
                     prepared_context=resolved_context, request_id=request_id,
                     thinking_mode="low", requested_thinking_mode=requested_thinking_mode or thinking_mode,
                     _thinking_retry_attempt=1,
+                    _final_messages_callback_called=True,
+                    final_messages_callback=final_messages_callback,
                 )
                 return
         except Exception as e:
             response = getattr(e, "response", None)
-            response_error = None
-            try:
-                response_payload = response.json() if response is not None else None
-                if isinstance(response_payload, dict):
-                    response_error = response_payload.get("error")
-            except Exception:
-                pass
-            error_text = str(response_error or e)
+            error_text = self._response_error_text(response) if response is not None else str(e)
+            if response is not None:
+                log.warning(
+                    "Ollama HTTP exception request_id=%s model=%s status=%s error=%s",
+                    request_id, model, getattr(response, "status_code", None), error_text,
+                )
             output_started = bool(thinking_chunk_count or visible_chunk_count)
             if (
                 think_value is False
@@ -283,6 +356,29 @@ class OllamaClient(ModelClient):
                     prepared_context=resolved_context, request_id=request_id,
                     thinking_mode="low", requested_thinking_mode=requested_thinking_mode or thinking_mode,
                     _thinking_retry_attempt=1,
+                    _final_messages_callback_called=True,
+                    final_messages_callback=final_messages_callback,
+                )
+                return
+            if (
+                think_value is not None
+                and not output_started
+                and not _thinking_retry_attempt
+                and self._is_thinking_unsupported(error_text)
+            ):
+                log.warning(
+                    "Ollama thinking unsupported HTTP rejection request_id=%s model=%s; retrying once without think",
+                    request_id, model,
+                )
+                yield StreamEvent(type="thinking_unsupported", text=thinking_mode or "")
+                yield from self.stream_chat(
+                    model=model, messages=messages, options=effective_options,
+                    prepared_context=resolved_context, request_id=request_id,
+                    thinking_mode=None,
+                    requested_thinking_mode=requested_thinking_mode or thinking_mode,
+                    _thinking_retry_attempt=1,
+                    _final_messages_callback_called=True,
+                    final_messages_callback=final_messages_callback,
                 )
                 return
             self.invalidate_runtime_context()
@@ -306,6 +402,32 @@ class OllamaClient(ModelClient):
     @staticmethod
     def _is_thinking_rejection(error: str) -> bool:
         return "think" in (error or "").lower()
+
+    @staticmethod
+    def _is_thinking_unsupported(error: str) -> bool:
+        """Match Ollama's explicit capability diagnostic, not generic errors."""
+        return "does not support thinking" in (error or "").lower()
+
+    @staticmethod
+    def _response_error_text(response) -> str:
+        """Prefer Ollama's structured error, even when its response is falsey."""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("error") is not None:
+                return str(payload["error"])
+        except Exception:
+            pass
+        try:
+            text = response.text
+            if text:
+                return str(text)
+        except Exception:
+            pass
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            return str(exc)
+        return "HTTP request failed without an error body"
 
     def prepare_runtime_context(
         self,

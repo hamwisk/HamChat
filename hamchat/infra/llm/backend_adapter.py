@@ -84,7 +84,7 @@ def make_stream_func_from_client(
                 thinking_parts.append(ev.text)
                 if time.monotonic() - last_thinking_flush >= 0.05:
                     yield from flush_thinking()
-            elif ev.type in {"thinking_forced_low", "thinking_rejected"}:
+            elif ev.type in {"thinking_forced_low", "thinking_rejected", "thinking_unsupported"}:
                 yield StreamChunk(type=ev.type, text=ev.text)
             elif ev.type == "delta" and ev.text:
                 # Thinking and visible text have independent destinations.

@@ -78,6 +78,9 @@ class ChatController(QObject):
         self._thinking_panel = thinking_panel
         self._thinking_mode = "medium"
         self._thinking_notice_shown = False
+        # Only clear notices that this controller created for a capability
+        # state; forced-low and rejection notices have separate lifecycles.
+        self._thinking_capability_notice_model: Optional[str] = None
         self._use_ham_mem = True
         self._conv_id: Optional[int] = None  # lazily created on first user msg
         memory_cfg = getattr(session, "settings", None).get("ham_mem", {}) if session is not None else {}
@@ -112,6 +115,7 @@ class ChatController(QObject):
         # This is invalidated immediately on cancel, before the worker has
         # necessarily delivered all queued cross-thread signals.
         self._thinking_ticket: int = -1
+        self._thinking_generation_state: dict[int, dict] = {}
         self._refresh_thinking_controls()
         self._refresh_ham_mem_control()
 
@@ -182,6 +186,18 @@ class ChatController(QObject):
         supports, _, unverified = self._thinking_model_info()
         self._thinking_panel.set_thinking_mode(self._thinking_mode, enabled=supports and self._active_ticket == -1)
         self._thinking_panel.set_thinking_support_unverified(unverified)
+        caps = self._session.get_model_capabilities(self._model_name) if self._session else {}
+        is_ollama = hasattr(self._model_client, "prepare_runtime_context")
+        if is_ollama and caps.get("thinking") is False:
+            self._thinking_panel.show_thinking_notice(
+                f"{self._model_name} does not support Ollama thinking controls. "
+                "HamChat will omit the thinking setting for this model."
+            )
+            self._thinking_capability_notice_model = self._model_name
+        elif getattr(self, "_thinking_capability_notice_model", None) is not None:
+            # Do not erase notices produced by the forced-low/rejection paths.
+            self._thinking_panel.show_thinking_notice("")
+            self._thinking_capability_notice_model = None
 
     def _set_thinking_mode(self, mode: str, *, show_forced_notice: bool = False) -> None:
         self._thinking_mode = mode if mode in {"off", "low", "medium", "high"} else "medium"
@@ -210,6 +226,27 @@ class ChatController(QObject):
         if requires_thinking and self._thinking_mode == "off":
             self._set_thinking_mode("low", show_forced_notice=True)
         return requested_mode, self._thinking_mode
+
+    def _register_thinking_generation(
+        self, ticket: int, requested_mode: Optional[str], effective_mode: Optional[str],
+    ) -> None:
+        """Remember the submission-time facts needed for capability learning."""
+        caps = self._session.get_model_capabilities(self._model_name) if self._session else {}
+        self._thinking_generation_state[ticket] = {
+            "model": self._model_name,
+            "unknown_at_submission": not isinstance(caps.get("thinking"), bool),
+            "explicit_think_sent": effective_mode in {"off", "low", "high"},
+            "unsupported": False,
+            "requested_mode": requested_mode,
+        }
+
+    def _set_learned_thinking_capability(self, model: str, value: bool) -> None:
+        if self._session is None or not hasattr(self._session, "set_model_capability"):
+            return
+        try:
+            self._session.set_model_capability(model, "thinking", value)
+        except Exception:
+            log.exception("Could not persist thinking capability for model %s", model)
 
     def set_model_client(self, model_client) -> None:
         """
@@ -582,7 +619,7 @@ class ChatController(QObject):
         def _build_options() -> dict:
             return dict(request_options)
 
-        return make_stream_func_from_client(
+        stream = make_stream_func_from_client(
             self._model_client,
             model=self._model_name,
             build_messages=_build_messages,
@@ -591,6 +628,8 @@ class ChatController(QObject):
             build_requested_thinking=lambda: requested_thinking_mode,
             on_final_messages=self._final_memory_snapshot,
         )
+        setattr(stream, "_thinking_generation", (requested_thinking_mode, thinking_mode))
+        return stream
 
     def _apply_model_context_allocation(self, options: Dict) -> None:
         """Apply the saved Ollama tier before background preparation begins."""
@@ -701,6 +740,8 @@ class ChatController(QObject):
         injection, options = self._resolve_active_profile_request()
         stream_func = self._make_text_stream(injection, options, self._memory_snapshot(self._use_ham_mem))
         self._active_ticket = self.broker.submit(stream_func, text)
+        requested_mode, effective_mode = getattr(stream_func, "_thinking_generation", (None, None))
+        self._register_thinking_generation(self._active_ticket, requested_mode, effective_mode)
         self._activate_thinking_for_ticket(self._active_ticket)
 
     def send_user_with_media(self, text: str, llm_parts: List[Dict], attachments_meta: Optional[List[Dict]] = None):
@@ -776,6 +817,7 @@ class ChatController(QObject):
         )
 
         self._active_ticket = self.broker.submit(stream_func, text)
+        self._register_thinking_generation(self._active_ticket, requested_thinking_mode, thinking_mode)
         self._activate_thinking_for_ticket(self._active_ticket)
 
     def _on_stop(self):
@@ -810,6 +852,12 @@ class ChatController(QObject):
             return
         if event_type == "thinking_forced_low":
             self._set_thinking_mode("low", show_forced_notice=True)
+        elif event_type == "thinking_unsupported":
+            generation = getattr(self, "_thinking_generation_state", {}).get(ticket)
+            if generation is not None:
+                generation["unsupported"] = True
+                self._set_learned_thinking_capability(generation["model"], False)
+            self._refresh_thinking_controls()
         elif event_type == "thinking_rejected" and self._thinking_panel is not None:
             self._thinking_panel.show_thinking_notice(
                 f"Ollama rejected the {mode.title()} thinking effort. Choose another effort and retry."
@@ -832,6 +880,15 @@ class ChatController(QObject):
         self._thinking_panel.set_memory_snapshot(snapshot)
 
     def _on_job_finished(self, ticket: int, status: str):
+        generation = getattr(self, "_thinking_generation_state", {}).pop(ticket, None)
+        if (
+            status == "ok"
+            and generation is not None
+            and generation["unknown_at_submission"]
+            and generation["explicit_think_sent"]
+            and not generation["unsupported"]
+        ):
+            self._set_learned_thinking_capability(generation["model"], True)
         if ticket == self._active_ticket and self._active_row is not None:
             self.chat.end_assistant_stream(self._active_row)
 

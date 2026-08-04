@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from types import SimpleNamespace
 import logging
+import requests
 
 from hamchat import db_ops
 from hamchat.db_init import _create_schema, _migrate_existing_schema
@@ -180,6 +181,81 @@ def test_unsupported_effort_emits_notice_event_without_retry(monkeypatch):
     assert [event.type for event in events] == ["start", "thinking_rejected", "error"]
 
 
+def test_explicit_unsupported_thinking_retries_once_without_think(monkeypatch):
+    payloads = []
+
+    def post(_url, **kwargs):
+        payloads.append(kwargs["json"])
+        if len(payloads) == 1:
+            return Response(['{"error":"gemma3:latest does not support thinking"}'])
+        return Response(['{"message":{"content":"answer"},"done":true}'])
+
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post", post)
+
+    events = _chat(OllamaClient(), "high")
+
+    assert len(payloads) == 2
+    assert payloads[0]["think"] == "high"
+    assert "think" not in payloads[1]
+    assert [event.type for event in events] == ["start", "thinking_unsupported", "start", "delta", "end"]
+
+
+def test_generic_http_error_does_not_probe_without_thinking(monkeypatch):
+    payloads = []
+
+    class HttpErrorResponse:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def raise_for_status(self):
+            error = requests.HTTPError("400 Client Error")
+            error.response = SimpleNamespace(json=lambda: {"error": "invalid request"})
+            raise error
+
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.post",
+        lambda _url, **kwargs: (payloads.append(kwargs["json"]) or HttpErrorResponse()),
+    )
+
+    events = _chat(OllamaClient(), "high")
+
+    assert len(payloads) == 1
+    assert [event.type for event in events] == ["error"]
+
+
+def test_timeout_does_not_retry_or_emit_capability_event(monkeypatch):
+    payloads = []
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.post",
+        lambda _url, **kwargs: (payloads.append(kwargs["json"]) or (_ for _ in ()).throw(requests.Timeout("late"))),
+    )
+
+    events = _chat(OllamaClient(), "high")
+
+    assert len(payloads) == 1
+    assert [event.type for event in events] == ["error"]
+
+
+def test_unsupported_retry_keeps_final_messages_callback_once(monkeypatch):
+    payloads, snapshots = [], []
+
+    def post(_url, **kwargs):
+        payloads.append(kwargs["json"])
+        return Response(
+            ['{"error":"model does not support thinking"}']
+            if len(payloads) == 1 else ['{"done":true}']
+        )
+
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post", post)
+    list(OllamaClient().stream_chat(
+        model="thinker", messages=[ChatMessage(role="user", content="hello")], options={},
+        prepared_context=RuntimeContext(4096, "runtime"), thinking_mode="high",
+        final_messages_callback=lambda messages: snapshots.append(messages),
+    ))
+
+    assert len(snapshots) == 1
+    assert len(payloads) == 2
+
+
 def test_non_ollama_adapter_does_not_receive_thinking_argument():
     class OtherClient(ModelClient):
         def stream_chat(self, *, model, messages, options):
@@ -267,4 +343,47 @@ def test_explicit_non_thinking_capability_disables_controls_and_omits_mode():
 
     assert panel.mode == ("high", False)
     assert panel.unverified is False
+    assert panel.notices == [
+        "non-thinking does not support Ollama thinking controls. "
+        "HamChat will omit the thinking setting for this model."
+    ]
     assert ChatController._request_thinking_modes(state) == (None, None)
+
+
+def test_controller_learns_true_only_for_clean_explicit_unknown_generation():
+    learned = []
+    state = SimpleNamespace(
+        _active_ticket=5, _active_row=None, _assistant_buf=[], chat=SimpleNamespace(set_streaming=lambda _value: None),
+        _thinking_ticket=-1, _thinking_generation_state={
+            5: {"model": "gemma4:12b", "unknown_at_submission": True,
+                "explicit_think_sent": True, "unsupported": False},
+        },
+        _set_learned_thinking_capability=lambda model, value: learned.append((model, value)),
+        _refresh_thinking_controls=lambda: None, _refresh_ham_mem_control=lambda: None,
+    )
+
+    ChatController._on_job_finished(state, 5, "ok")
+
+    assert learned == [("gemma4:12b", True)]
+
+
+def test_controller_unsupported_notice_keeps_false_after_success():
+    panel = Panel()
+    learned = []
+    state = SimpleNamespace(
+        _active_ticket=7, _active_row=None, _assistant_buf=[], chat=SimpleNamespace(set_streaming=lambda _value: None),
+        _thinking_ticket=-1, _thinking_panel=panel, _model_name="gemma3:latest",
+        _thinking_generation_state={
+            7: {"model": "gemma3:latest", "unknown_at_submission": True,
+                "explicit_think_sent": True, "unsupported": False},
+        },
+        _set_learned_thinking_capability=lambda model, value: learned.append((model, value)),
+        _refresh_thinking_controls=lambda: None, _refresh_ham_mem_control=lambda: None,
+    )
+
+    ChatController._on_job_notice(state, 7, "thinking_unsupported", "high")
+    ChatController._on_job_finished(state, 7, "ok")
+
+    assert learned == [("gemma3:latest", False)]
+    # The real refresh path owns the persistent capability notice.
+    assert panel.notices == []

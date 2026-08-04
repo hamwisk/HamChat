@@ -7,6 +7,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from pathlib import Path
 from hamchat.paths import settings_dir
 from hamchat.core.settings import Settings
+from hamchat.infra.llm.ollama_registry import update_model_capability
 
 @dataclass
 class Preferences:
@@ -44,6 +45,9 @@ class SessionManager(QObject):
     def __init__(self, settings: Settings, runtime_mode: str, server_url: Optional[str]):
         super().__init__()
         self.settings = settings
+        # Registry reads are file-backed, but learned capabilities must take
+        # effect immediately for this live session as well.
+        self._model_capability_overrides: dict[str, dict[str, tuple[bool, Optional[str]]]] = {}
         self.current = SessionData(runtime_mode=runtime_mode, server_url=server_url)
         # hydrate guest prefs from app settings
         self.current.prefs.theme_variant      = settings.get("theme_variant", "dark")
@@ -296,10 +300,43 @@ class SessionManager(QObject):
         try:
             for m in self._load_all_models():
                 if m.get("name") == model_id:
-                    return dict(m.get("capabilities") or {})
+                    capabilities = dict(m.get("capabilities") or {})
+                    overrides = self._model_capability_overrides.get(model_id, {})
+                    digest = m.get("digest")
+                    for capability, (value, learned_digest) in list(overrides.items()):
+                        if learned_digest == digest:
+                            capabilities[capability] = value
+                        else:
+                            # A registry refresh found a new build under the
+                            # same tag, so do not retain stale learned state.
+                            del overrides[capability]
+                    return capabilities
         except Exception:
             pass
-        return {}
+        return {
+            capability: value
+            for capability, (value, _digest) in self._model_capability_overrides.get(model_id, {}).items()
+        }
+
+    def set_model_capability(self, model_id: str, capability: str, value: bool) -> bool:
+        """Persist a learned Ollama capability and apply it to this session."""
+        if not isinstance(value, bool):
+            raise ValueError("Model capability values must be boolean")
+        if not self.is_ollama_model(model_id):
+            return False
+        current = self.get_model_capabilities(model_id)
+        digest = self.get_model_metadata(model_id).get("digest")
+        if current.get(capability) is value:
+            self._model_capability_overrides.setdefault(model_id, {})[capability] = (value, digest)
+            return False
+        changed = update_model_capability(
+            model_id, capability, value,
+            registry_path=settings_dir() / "models.json",
+        )
+        self._model_capability_overrides.setdefault(model_id, {})[capability] = (value, digest)
+        if model_id == self.get_model_id():
+            self._refresh_current_capabilities()
+        return changed
 
     def get_model_metadata(self, model_id: str) -> dict:
         """Return registry metadata, including Ollama's reported family when known."""

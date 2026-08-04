@@ -73,7 +73,7 @@ class _Worker(QObject):
                     if isinstance(chunk, StreamChunk) and chunk.type == "thinking":
                         self.thinking.emit(ticket, chunk.text)
                     elif isinstance(chunk, StreamChunk) and chunk.type in {
-                        "thinking_forced_low", "thinking_rejected", "output_limit",
+                        "thinking_forced_low", "thinking_rejected", "thinking_unsupported", "output_limit",
                     }:
                         self.notice.emit(ticket, chunk.type, chunk.text)
                     elif isinstance(chunk, StreamChunk) and chunk.type == "memory_snapshot":

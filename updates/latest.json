@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "version": "2.7.0",
+  "git_ref": "v2.7.0",
+  "release_notes": "updates/2.7.0.md",
+  "minimum_updater_version": "2.7.0"
+}

@@ -4,7 +4,7 @@ No function in this module mutates Git, the installation, backups, or state.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import os
 from pathlib import Path
@@ -69,6 +69,25 @@ class RepositoryKind(str, Enum):
     UNUSUAL_WORKTREE = "unusual_worktree"
 
 
+class LegacyMigrationAssessment(str, Enum):
+    NOT_REQUIRED = "not_required"
+    POTENTIALLY_MIGRATABLE = "potentially_migratable"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class LegacyMigrationFinding:
+    """Read-only legacy-registry planning state retained with an assessment.
+
+    This deliberately never alters ``reasons``: a potentially migratable
+    tracked edit still blocks a future mutating updater until a later
+    backup-and-execution transaction exists.
+    """
+
+    registry_path: str
+    status: LegacyMigrationAssessment
+
+
 @dataclass(frozen=True)
 class CommandResult:
     returncode: int
@@ -119,6 +138,7 @@ class InstallationAssessment:
     data_dir_external: bool
     findings: tuple[PathFinding, ...]
     reasons: tuple[AssessmentReason, ...]
+    legacy_migrations: tuple[LegacyMigrationFinding, ...] = ()
 
     @property
     def safe_for_future_backup(self) -> bool:
@@ -130,6 +150,37 @@ class PreservationPlan:
     findings: tuple[PathFinding, ...]
     future_phases: tuple[str, ...]
     blocked: bool
+
+
+def summarize_legacy_migration(plan: object) -> LegacyMigrationAssessment:
+    """Expose a pure planner result without clearing any assessment blocker."""
+    status = getattr(plan, "status", None)
+    value = getattr(status, "value", status)
+    if value == "ready":
+        return LegacyMigrationAssessment.POTENTIALLY_MIGRATABLE
+    if value == "not_required":
+        return LegacyMigrationAssessment.NOT_REQUIRED
+    return LegacyMigrationAssessment.BLOCKED
+
+
+def with_legacy_migration(
+    assessment: InstallationAssessment, registry_path: str, plan: object,
+) -> InstallationAssessment:
+    """Return an assessment annotated with a non-authorizing planner result.
+
+    Only the two known tracked registry paths are accepted.  The returned
+    assessment preserves every dirty-worktree blocker from the original.
+    """
+    if registry_path not in LEGACY_REGISTRIES:
+        raise ValueError("unknown legacy registry path")
+    finding = LegacyMigrationFinding(
+        registry_path, summarize_legacy_migration(plan),
+    )
+    retained = tuple(
+        item for item in assessment.legacy_migrations
+        if item.registry_path != registry_path
+    )
+    return replace(assessment, legacy_migrations=retained + (finding,))
 
 
 def normalize_hamchat_remote(value: object) -> str | None:

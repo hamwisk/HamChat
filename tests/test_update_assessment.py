@@ -6,9 +6,28 @@ import pytest
 
 from hamchat.update_assessment import (
     AssessmentReason, CommandResult, PreservationClass, RepositoryKind,
-    assess_installation, build_preservation_plan, normalize_hamchat_remote,
+    LegacyMigrationAssessment, assess_installation, build_preservation_plan, normalize_hamchat_remote,
     resolve_data_dir,
+    with_legacy_migration,
 )
+
+
+@pytest.mark.parametrize(("status", "expected"), [
+    ("not_required", LegacyMigrationAssessment.NOT_REQUIRED),
+    ("ready", LegacyMigrationAssessment.POTENTIALLY_MIGRATABLE),
+    ("blocked", LegacyMigrationAssessment.BLOCKED),
+])
+def test_legacy_migration_assessment_is_non_authorizing(tmp_path, status, expected):
+    root = tmp_path / "root"; root.mkdir()
+    assessment = assess_installation(
+        root, target_ref="v2.7.0",
+        runner=RecordingRunner(clean_replies(root, status=" M settings/context_overrides.json\0")),
+    )
+    plan = type("Plan", (), {"status": status})()
+    annotated = with_legacy_migration(assessment, "settings/context_overrides.json", plan)
+    assert annotated.legacy_migrations[0].status is expected
+    assert annotated.reasons == assessment.reasons
+    assert not annotated.safe_for_future_backup
 
 
 class RecordingRunner:

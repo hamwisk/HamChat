@@ -4,14 +4,14 @@ HamChat is a local-first desktop chat client for large language models. It’s b
 
 > Status: pre-alpha, expect dragons and breaking changes.
 
-## Features (current & planned)
+## Features (current)
 
 - Local-first, privacy-friendly chat with LLMs
 - Desktop UI built with PyQt6 + QML
 - Multiple user accounts with admin mode
-- Conversation history and long-term memory (WIP)
-- AI profiles / personas (planned)
-- Image attachments and thumbnails in the chat UI (WIP)
+- Conversation history and long-term memory
+- AI profiles / personas
+- Image attachments and thumbnails in the chat UI
 - Pluggable backends (currently focused on local Ollama; API support planned)
 
 ## Getting started

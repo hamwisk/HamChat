@@ -177,6 +177,8 @@ def _classify_path(path: str, status: str, target_paths: frozenset[str]) -> Path
         return PathFinding(Path(path), PreservationClass.USER_OWNED)
     if normalized in {"settings/app.json", "settings/models.json"}:
         return PathFinding(Path(path), PreservationClass.USER_OWNED)
+    if normalized in {"settings/context_overrides.user.json", "settings/modality_triggers.user.json"}:
+        return PathFinding(Path(path), PreservationClass.USER_OWNED)
     if normalized.startswith("settings/themes/") and normalized != "settings/themes/default_theme.json":
         return PathFinding(Path(path), PreservationClass.USER_EXTENSION)
     if status != "??":
@@ -310,6 +312,10 @@ def build_preservation_plan(assessment: InstallationAssessment) -> PreservationP
             PreservationClass.RELEASE_OWNED,
         )
     )
+    for name in ("context_overrides.json", "modality_triggers.json"):
+        findings.append(PathFinding(assessment.installation_root / "settings" / name, PreservationClass.RELEASE_OWNED))
+    for name in ("context_overrides.user.json", "modality_triggers.user.json"):
+        findings.append(PathFinding(assessment.installation_root / "settings" / name, PreservationClass.USER_OWNED))
     return PreservationPlan(
         tuple(sorted(findings, key=lambda item: item.path.as_posix())),
         ("backup", "quiesce_database", "verify_target", "apply", "migrate", "restart") if not assessment.reasons else (),

@@ -128,6 +128,7 @@ def test_data_resolution_precedence_and_pure_plan(tmp_path):
     assert not plan.blocked
     assert any(item.preservation is PreservationClass.EXTERNAL_AUTHORITATIVE_STATE for item in plan.findings)
     assert any(item.path.name == "default_theme.json" and item.preservation is PreservationClass.RELEASE_OWNED for item in plan.findings)
+    assert {item.path.name for item in plan.findings if item.preservation is PreservationClass.USER_OWNED} >= {"context_overrides.user.json", "modality_triggers.user.json"}
 
 
 def test_unsafe_or_existing_backup_destination_blocks(tmp_path):

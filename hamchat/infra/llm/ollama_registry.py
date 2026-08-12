@@ -4,6 +4,7 @@ import json, re, time, logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
+from .registry_layers import load_effective_registries, normalize_model_key
 
 log = logging.getLogger("models")
 
@@ -89,42 +90,39 @@ def _probe_model(base_url: str, name: str) -> Dict[str, Any]:
     out["vision"] = _infer_vision(name, out["family"], details, triggers)
     return out
 
-def _load_ctx_overrides() -> dict:
-    try:
-        with OVERRIDES_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        data["_rx"] = [(re.compile(p, re.IGNORECASE), v) for p, v in (data.get("by_regex") or {}).items()]
-        return data
-    except Exception:
-        return {"by_name": {}, "_rx": [], "default_by_family": {}}
+def _load_layers():
+    result = load_effective_registries(Path("settings"))
+    for diagnostic in result.diagnostics:
+        log.warning("Registry layer rejected source=%s code=%s field=%s", diagnostic.source, diagnostic.code.value, diagnostic.field)
+    return result
 
 def _apply_context_overrides(entry: dict) -> None:
     if entry.get("context"):
         return
-    name = entry.get("name","")
+    name = entry.get("name", "")
     family = (entry.get("family") or "").lower()
-    o = _load_ctx_overrides()
+    o = _load_layers().context
+    name_key = normalize_model_key(name)
     # exact by_name
-    if name in o.get("by_name", {}):
-        entry["context"] = int(o["by_name"][name]); return
+    if name_key in o.by_name:
+        entry["context"] = o.by_name[name_key]; return
     # regex patterns
-    for rx, val in o.get("_rx", []):
-        if rx.search(name):
-            entry["context"] = int(val); return
+    for pattern, val in o.by_regex.items():
+        if re.search(pattern, name, re.IGNORECASE):
+            entry["context"] = val; return
     # conservative family default
-    if family and family in o.get("default_by_family", {}):
-        entry["context"] = int(o["default_by_family"][family]); return
+    if family and family in o.default_by_family:
+        entry["context"] = o.default_by_family[family]; return
 
 def _load_triggers() -> dict:
-    try:
-        with TRIGGERS_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        # precompile regexes for speed
-        data["_rx_mm"] = [re.compile(p, re.IGNORECASE) for p in data.get("regex_multimodal", [])]
-        return data
-    except Exception as e:
-        log.warning("No modality triggers found (%s); defaulting to text-only.", e)
-        return {"defaults_to": "text", "_rx_mm": []}
+    registry = _load_layers().modality
+    return {
+        "defaults_to": registry.defaults_to,
+        "families_multimodal": registry.trigger_lists["families_multimodal"],
+        "name_contains_multimodal": registry.trigger_lists["name_contains_multimodal"],
+        "_rx_mm": [re.compile(pattern, re.IGNORECASE) for pattern in registry.trigger_lists["regex_multimodal"]],
+        "model_overrides": registry.model_overrides,
+    }
 
 def _infer_vision(name: str, family: Optional[str], details: Dict[str, Any], triggers: dict) -> bool:
     """
@@ -135,7 +133,7 @@ def _infer_vision(name: str, family: Optional[str], details: Dict[str, Any], tri
     family_l = (family or "").lower()
 
     # 1) exact override
-    override = (triggers.get("model_overrides") or {}).get(name)
+    override = (triggers.get("model_overrides") or {}).get(normalize_model_key(name))
     if override and override.lower() == "multimodal":
         return True
 

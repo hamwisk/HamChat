@@ -216,3 +216,5 @@ data/
 # Generated settings files
 settings/app.json
 settings/models.json
+settings/context_overrides.user.json
+settings/modality_triggers.user.json

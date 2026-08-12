@@ -16,6 +16,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auth": {
         "has_admin": None,
         "signup_submit": False
+    },
+    "updates": {
+        "mode": "prompt",
+        "ignore_patch_updates": False,
+        "skipped_version": None
     }
 }
 

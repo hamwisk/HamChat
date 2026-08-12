@@ -29,3 +29,16 @@ declared originals to the plan before capture, and record plan/output digests;
 this module neither writes a user registry layer nor restores a shipped file.
 `BACKUP_VERIFIED` is evidence for a later coordinator, never permission to
 modify sources, Git state, the database, or an installed release.
+
+## Data snapshots
+
+`HamChatDataSnapshotProvider` is injected into the preservation transaction.
+For open SQLite it holds an in-process snapshot barrier, uses SQLite's online
+backup API (therefore includes committed WAL state), validates the snapshot,
+then copies exactly the CAS objects referenced by the snapshot's `files`
+table. Unreferenced CAS objects and `cas_tmp` are deliberately excluded.
+The provider never raw-copies a database, WAL, or journal and never checkpoints
+the source. Secure/strict SQLCipher modes currently return a controlled blocker
+until encrypted online-backup semantics are proven; strict CAS is never
+downgraded to plaintext. The barrier does not claim protection from external
+writers, so a future coordinator must refuse such an uncoordinated situation.

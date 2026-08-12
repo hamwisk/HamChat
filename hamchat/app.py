@@ -78,12 +78,12 @@ def needs_local_init(mode: RunMode) -> bool:
     return mode in (RunMode.SOLO, RunMode.HAM)
 
 # --- Runtime implementations here ---
-def run_solo(db_conn, db_mode_str):
+def run_solo(db_conn, db_mode_str, data_dir: Path):
     logging.getLogger("boot").info("Starting SOLO (🥓 whole hog) — launching MainWindow")
     app = QApplication(sys.argv)
     app.setWindowIcon(get_app_icon())
 
-    w = MainWindow(runtime_mode=RunMode.SOLO.value, db_conn=db_conn, db_mode=db_mode_str)
+    w = MainWindow(runtime_mode=RunMode.SOLO.value, db_conn=db_conn, db_mode=db_mode_str, data_dir=data_dir)
     w.show()
     app.exec()
 
@@ -179,7 +179,7 @@ def main() -> int:
     elif mode is RunMode.HAM:
         run_server()
     else:
-        run_solo(conn, db_mode)
+        run_solo(conn, db_mode, data_dir)
 
     return 0
 

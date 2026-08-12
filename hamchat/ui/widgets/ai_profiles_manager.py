@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint
@@ -44,10 +45,11 @@ class AIProfilesManager(QWidget):
     sig_profile_activated = pyqtSignal(int)
     sig_profiles_changed = pyqtSignal()
 
-    def __init__(self, conn, session_mgr, active_profile_id: Optional[int] = None, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, conn, session_mgr, *, data_dir: Path, active_profile_id: Optional[int] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._db = conn
         self._session = session_mgr
+        self._data_dir = Path(data_dir)
         self._active_profile_id = active_profile_id
 
         self._current_profile_id: Optional[int] = None
@@ -414,7 +416,7 @@ class AIProfilesManager(QWidget):
             # If the avatar actually changed, clean up the previous CAS entry.
             new_avatar = data.get("avatar") or ""
             if old_avatar and old_avatar != new_avatar:
-                media_helper.cleanup_profile_avatar(self._db, old_avatar)
+                media_helper.cleanup_profile_avatar(self._db, old_avatar, data_dir=self._data_dir)
 
 
         except Exception:
@@ -564,7 +566,7 @@ class AIProfilesManager(QWidget):
         if resp != QMessageBox.StandardButton.Yes:
             return
         try:
-            dbo.delete_ai_profile(self._db, int(profile_id))
+            dbo.delete_ai_profile(self._db, int(profile_id), data_dir=self._data_dir)
             if self._active_profile_id == profile_id:
                 self._active_profile_id = None
             self._current_profile_id = None
@@ -661,7 +663,7 @@ class AIProfilesManager(QWidget):
         if self._db is not None:
             try:
                 # Use a smaller avatar size than the 96px chat thumbnails.
-                stored_path = media_helper.store_profile_avatar(path, db=self._db, size=64)
+                stored_path = media_helper.store_profile_avatar(path, db=self._db, data_dir=self._data_dir, size=64)
             except Exception:
                 # Fail soft – keep original path rather than crashing the form.
                 stored_path = path

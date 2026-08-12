@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
+from pathlib import Path
 import hashlib, base64, os, tempfile, shutil, io, math, warnings
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -102,7 +103,7 @@ def _to_base64(p: str) -> str:
     with open(p, "rb") as f:
         return base64.b64encode(f.read()).decode("ascii")
 
-def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
+def process_images(paths: List[str], *, ephemeral: bool, db=None, data_dir=None, session=None):
     """
     Returns dict: {stored:[...], thumbs:[...], llm_parts:[...]}
     - guest/admin → copy into temp dir
@@ -112,6 +113,8 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
     if not ephemeral and db is None:
         # fail safe: without DB we fallback to temp-only handling
         ephemeral = True
+    if not ephemeral and data_dir is None:
+        raise ValueError("data_dir is required for persistent media")
     work_dir = tempfile.mkdtemp(prefix="hamchat_")
 
     for idx, p in enumerate(paths):
@@ -130,7 +133,7 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
         else:
             # CAS store via db_ops (implements de-dupe by sha256)
             from hamchat import db_ops as dbo
-            file_id = dbo.cas_put(db, sha256=sha, mime=mime, src_path=src)
+            file_id = dbo.cas_put(db, data_dir=Path(data_dir), sha256=sha, mime=mime, src_path=src)
             stored_path = None
 
         # thumbnail
@@ -140,7 +143,7 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
         thumb_mime = "image/png"
 
         if not ephemeral and db is not None:
-            thumb_file_id = dbo.cas_put(db, sha256=thumb_sha, mime=thumb_mime, src_path=thumb_path)
+            thumb_file_id = dbo.cas_put(db, data_dir=Path(data_dir), sha256=thumb_sha, mime=thumb_mime, src_path=thumb_path)
         else:
             thumb_file_id = None
 
@@ -151,7 +154,7 @@ def process_images(paths: List[str], *, ephemeral: bool, db=None, session=None):
         results["llm_parts"].append({"type": "image", "media_type": "image/png", "data_base64": b64, "width": normalized.width, "height": normalized.height})
     return results
 
-def store_profile_avatar(src: str, *, db, size: int = AVATAR_SIZE) -> str:
+def store_profile_avatar(src: str, *, db, data_dir, size: int = AVATAR_SIZE) -> str:
     """
     Normalise a user-selected avatar image into a square thumbnail, store it in CAS,
     and return a filesystem path that the UI can load.
@@ -181,10 +184,10 @@ def store_profile_avatar(src: str, *, db, size: int = AVATAR_SIZE) -> str:
 
         sha = _sha256_file(tmp_avatar)
         mime = _mime_guess(tmp_avatar)
-        file_id = dbo.cas_put(db, sha256=sha, mime=mime, src_path=tmp_avatar)
+        file_id = dbo.cas_put(db, data_dir=Path(data_dir), sha256=sha, mime=mime, src_path=tmp_avatar)
 
         # 3) Resolve a readable path for the UI (handles strict vs lite).
-        cas_path = dbo.cas_path_for_file(db, file_id)
+        cas_path = dbo.cas_path_for_file(db, file_id, data_dir=Path(data_dir))
         if cas_path is None:
             # Fallback to original path if something went sideways.
             return src_path
@@ -195,7 +198,7 @@ def store_profile_avatar(src: str, *, db, size: int = AVATAR_SIZE) -> str:
         except Exception:
             pass
 
-def cleanup_profile_avatar(db, old_avatar_path: str) -> None:
+def cleanup_profile_avatar(db, old_avatar_path: str, *, data_dir: Path) -> None:
     """
     Best-effort cleanup for a *previous* avatar image that was stored in CAS.
 
@@ -227,7 +230,7 @@ def cleanup_profile_avatar(db, old_avatar_path: str) -> None:
             row = cur.fetchone()
             if not row:
                 # No DB row; at most try to delete the on-disk file and bail.
-                base_dir = os.path.dirname(os.path.dirname(old_avatar_path))
+                base_dir = str(Path(data_dir))
                 cas_dirs = [
                     os.path.join(base_dir, "cas"),
                     os.path.join(base_dir, "cas_tmp"),
@@ -257,7 +260,7 @@ def cleanup_profile_avatar(db, old_avatar_path: str) -> None:
                 return
 
             # At this point, no messages and no profiles reference this SHA.
-            base_dir = os.path.dirname(os.path.dirname(old_avatar_path))
+            base_dir = str(Path(data_dir))
             cas_dirs = [
                 os.path.join(base_dir, "cas"),
                 os.path.join(base_dir, "cas_tmp"),

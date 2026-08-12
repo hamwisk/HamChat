@@ -65,7 +65,7 @@ def test_process_images_keeps_original_bytes_and_sends_png(tmp_path, monkeypatch
     captured = []
     monkeypatch.setattr("hamchat.db_ops.cas_put", lambda _db, **kwargs: (captured.append(open(kwargs["src_path"], "rb").read()) or 1))
 
-    batch = process_images([str(source)], ephemeral=False, db=object())
+    batch = process_images([str(source)], ephemeral=False, db=object(), data_dir=tmp_path / "data")
 
     assert captured[0] == original
     part = batch["llm_parts"][0]

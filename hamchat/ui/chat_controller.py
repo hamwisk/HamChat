@@ -53,6 +53,7 @@ class ChatController(QObject):
         model_name: str,
         parent: Optional[QObject] = None,
         db=None,
+        data_dir=None,
         session: Optional[SessionManager] = None,
         local_command_handler: Optional[Callable[[str], bool]] = None,
         thinking_panel=None,
@@ -64,6 +65,7 @@ class ChatController(QObject):
         # Keep a handle to the client + current model so we can reconfigure later
         self._model_client = model_client
         self._model_name = model_name
+        self._data_dir = data_dir
 
         # ---- In-memory session history ----
         self._history: List[HistoryEntry] = []
@@ -1045,12 +1047,12 @@ class ChatController(QObject):
                         path = None
                         if thumb_id is not None and self._db is not None:
                             try:
-                                path = dbo.cas_path_for_file(self._db, int(thumb_id))
+                                path = dbo.cas_path_for_file(self._db, int(thumb_id), data_dir=self._data_dir)
                             except Exception:
                                 path = None
                         if path is None and file_id is not None and self._db is not None:
                             try:
-                                path = dbo.cas_path_for_file(self._db, int(file_id))
+                                path = dbo.cas_path_for_file(self._db, int(file_id), data_dir=self._data_dir)
                             except Exception:
                                 path = None
                         if path:
@@ -1424,7 +1426,7 @@ class ChatController(QObject):
                 if fid is None or self._db is None:
                     continue
                 try:
-                    path = dbo.cas_path_for_file(self._db, int(fid))
+                    path = dbo.cas_path_for_file(self._db, int(fid), data_dir=self._data_dir)
                 except Exception:
                     path = None
                 if path:
@@ -1456,6 +1458,7 @@ class ChatController(QObject):
                 attachments,
                 ephemeral=(getattr(getattr(self._session, "current", None), "role", "guest") != "user"),
                 db=self._db,
+                data_dir=self._data_dir,
                 session=self._session,
             )
             parts = batch["llm_parts"]
@@ -1511,6 +1514,7 @@ class ChatController(QObject):
                 attachments,
                 ephemeral=(getattr(getattr(self._session, "current", None), "role", "guest") != "user"),
                 db=self._db,
+                data_dir=self._data_dir,
                 session=self._session,
             )
             parts = batch["llm_parts"]

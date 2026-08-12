@@ -2,9 +2,12 @@
 from __future__ import annotations
 from pathlib import Path
 import json
+import logging
 from typing import Dict
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import QApplication
+
+log = logging.getLogger("ui.theme")
 
 DEFAULT_THEME: Dict = {
     "name": "HamChat Default",
@@ -157,35 +160,21 @@ def merge_theme_with_defaults(theme: Dict) -> Dict:
     """
     return _merge_defaults(theme, DEFAULT_THEME)
 
-# --- default theme file management ---
-def ensure_theme(themes_dir: Path) -> Dict:
+# --- shipped default theme loading ---
+def load_shipped_theme(themes_dir: Path) -> Dict:
+    """Load the release-owned default theme without ever modifying disk.
+
+    A missing or malformed shipped asset is a packaging error.  The embedded
+    DEFAULT_THEME is an in-memory emergency fallback so startup stays usable.
     """
-    Ensure the default theme file exists.
-    If it exists, read, merge with defaults (for forward-compat),
-    persist any fixes, and return the hydrated dict.
-    """
-    themes_dir.mkdir(parents=True, exist_ok=True)
     f = themes_dir / "default_theme.json"
-
-    if not f.exists():
-        f.write_text(json.dumps(DEFAULT_THEME, indent=2), encoding="utf-8")
-        return DEFAULT_THEME
-
     try:
         data = json.load(f.open("r", encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("Theme JSON root must be a dict")
-
-        merged = merge_theme_with_defaults(data)
-
-        # Persist if we filled in anything missing or corrected types
-        if merged != data:
-            f.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-
-        return merged
-    except Exception:
-        # If corrupt, reset to defaults
-        f.write_text(json.dumps(DEFAULT_THEME, indent=2), encoding="utf-8")
+        return merge_theme_with_defaults(data)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("Shipped default theme unavailable; using in-memory fallback (%s)", type(exc).__name__)
         return DEFAULT_THEME
 
 # --- custom theme loading ---
@@ -194,10 +183,14 @@ def load_theme(path: Path) -> Dict:
     Load a custom theme JSON from 'path' and merge with DEFAULT_THEME
     so missing keys are auto-filled. Does not modify the file on disk.
     """
-    data = json.load(path.open("r", encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("Theme JSON root must be a dict")
-    return merge_theme_with_defaults(data)
+    try:
+        data = json.load(path.open("r", encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Theme JSON root must be a dict")
+        return merge_theme_with_defaults(data)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("Custom theme unavailable; using in-memory fallback (%s)", type(exc).__name__)
+        return DEFAULT_THEME
 
 def select_variant(theme: Dict, variant: str) -> Dict:
     v = variant.lower()
@@ -334,4 +327,3 @@ def export_qml_tokens(colors: Dict) -> Dict:
         "selection_bg","selection_text",
     ]
     return {k: colors[k] for k in keys if k in colors}
-

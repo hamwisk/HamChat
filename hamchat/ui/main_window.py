@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 from hamchat.paths import settings_dir
 from hamchat.infra.llm.ollama_client import OllamaClient
 from hamchat.infra.llm.openai_client import OpenAIClient
-from hamchat.ui.theme import ensure_theme, select_variant, apply_theme, export_qml_tokens
+from hamchat.ui.theme import load_shipped_theme, select_variant, apply_theme, export_qml_tokens
 from hamchat.ui.menus import Menus
 from hamchat.core.settings import Settings
 from hamchat.core.session import SessionManager
@@ -77,13 +77,17 @@ class MainWindow(QMainWindow):
             server_url: Optional[str] = None,
             parent: Optional[QWidget] = None,
             db_conn: Optional[str] = None,
-            db_mode: Optional[str] = None
+            db_mode: Optional[str] = None,
+            data_dir: Optional[Path] = None,
     ):
         super().__init__(parent)
         self.runtime_mode = runtime_mode
         self.server_url = server_url
         self._db_mode = db_mode
         self._db = db_conn  # ← hold sqlite/sqlcipher connection
+        if db_conn is not None and data_dir is None:
+            raise ValueError("data_dir is required when a database connection is supplied")
+        self._data_dir = Path(data_dir) if data_dir is not None else None
         self._models_available = None
         self._active_profile_id: Optional[int] = None
         self._active_profile_name: Optional[str] = None
@@ -142,6 +146,7 @@ class MainWindow(QMainWindow):
             model_name=model_id,
             parent=self,
             db=self._db,
+            data_dir=self._data_dir,
             session=self.session,
             local_command_handler=self._handle_local_command,
             thinking_panel=self.chat_panel,
@@ -331,9 +336,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _init_theme(self):
-        # Load + merge defaults (writes back if needed) then apply chosen variant
+        # Shipped theme files are read-only at runtime.
         themes_dir = Path("settings/themes")
-        theme = ensure_theme(themes_dir)
+        theme = load_shipped_theme(themes_dir)
         self._theme = theme
         self._apply_theme_variant()  # uses self._variant
 
@@ -603,7 +608,7 @@ class MainWindow(QMainWindow):
         """
         from .widgets.ai_profiles_manager import AIProfilesManager
 
-        form = AIProfilesManager(self._db, self.session, active_profile_id=self._active_profile_id)
+        form = AIProfilesManager(self._db, self.session, data_dir=self._data_dir, active_profile_id=self._active_profile_id)
         form.sig_close.connect(self.top_panel.close_panel)
         if hasattr(form, "sig_profile_activated"):
             form.sig_profile_activated.connect(self._on_profile_activated)
@@ -839,7 +844,7 @@ class MainWindow(QMainWindow):
         if not self._db:
             return
         try:
-            path = dbo.cas_path_for_file(self._db, int(file_id))
+            path = dbo.cas_path_for_file(self._db, int(file_id), data_dir=self._data_dir)
         except Exception as e:
             log.exception("cas_path_for_file failed: %s", e)
             path = None
@@ -857,7 +862,7 @@ class MainWindow(QMainWindow):
         if not self._db or not hasattr(self, "chat_display"):
             return
         try:
-            path = dbo.cas_path_for_file(self._db, int(file_id))
+            path = dbo.cas_path_for_file(self._db, int(file_id), data_dir=self._data_dir)
         except Exception as e:
             log.exception("cas_path_for_file failed: %s", e)
             path = None
@@ -1262,7 +1267,7 @@ class MainWindow(QMainWindow):
         # Vision path: process + send with media
         try:
             from hamchat.media_helper import process_images
-            batch = process_images(attachments, ephemeral=(self.session.current.role != "user"), db=self._db,
+            batch = process_images(attachments, ephemeral=(self.session.current.role != "user"), db=self._db, data_dir=self._data_dir,
                                    session=self.session)
             parts = batch["llm_parts"]
             thumb_paths = [t["path"] for t in batch.get("thumbs", [])]

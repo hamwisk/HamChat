@@ -35,25 +35,17 @@ def _verify_password(plain: str, salt: bytes, expect_hash: bytes) -> bool:
 
 # ---------- connection handling ----------
 
-def _data_dir() -> Path:
-    # matches your project layout; data dir contains ham_mem.db (see tree listing)
-    root = Path.cwd()
-    d = root / "data"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def _apply_runtime_pragmas(conn) -> None:
     cur = conn.cursor()
     cur.execute("PRAGMA foreign_keys=ON;")
 
 
-def init_and_open() -> Tuple[sqlite3.Connection, str]:
+def init_and_open(data_dir: Path) -> Tuple[sqlite3.Connection, str]:
     """
     Ensure DB exists/validates, then return (conn, mode).
     mode ∈ {'open','secure_or_strict'} — we’ll read meta for the exact mode string next.
     """
-    data_dir = _data_dir()
+    data_dir = Path(data_dir)
     # create/verify once
     rc = ensure_database_ready(data_dir)  # returns 0 on success
     if rc != 0:
@@ -118,7 +110,7 @@ def open_by_detection(data_dir: Path):
     Open the database by detection (SQLite vs SQLCipher) and return (conn, db_mode).
     Source of truth is the file itself + meta.db_mode.
     """
-    conn, meta_mode = init_and_open()  # this already tries sqlite → sqlcipher
+    conn, meta_mode = init_and_open(Path(data_dir))
     return conn, meta_mode
 
 
@@ -325,7 +317,7 @@ def count_admins(conn) -> int:
     return int(cur.fetchone()[0])
 
 
-def delete_user_safe(conn, user_id: int) -> None:
+def delete_user_safe(conn, user_id: int, *, data_dir: Path) -> None:
     """
     Safely delete a user:
       - refuse to delete the last admin
@@ -343,7 +335,7 @@ def delete_user_safe(conn, user_id: int) -> None:
     rows = cur.fetchall()
     for (pid,) in rows:
         try:
-            delete_ai_profile(conn, int(pid))
+            delete_ai_profile(conn, int(pid), data_dir=Path(data_dir))
         except Exception:
             log.exception("Failed to delete AI profile %s while deleting user %s", pid, user_id)
 
@@ -767,12 +759,12 @@ def delete_memory(conn, *, owner_user_id: int, memory_id: int) -> None:
 
 # ---------- boot glue you’ll call from app startup ----------
 
-def boot_database_and_admin(maybe_admin_user: Optional[Tuple[str, str]] = None) -> Tuple[sqlite3.Connection, str]:
+def boot_database_and_admin(data_dir: Path, maybe_admin_user: Optional[Tuple[str, str]] = None) -> Tuple[sqlite3.Connection, str]:
     """
     Ensure the DB is ready, open it, and (optionally) seed a first admin.
     maybe_admin_user: (username, password) to create if no admin exists yet.
     """
-    conn, mode = init_and_open()
+    conn, mode = init_and_open(Path(data_dir))
     if maybe_admin_user:
         username, password = maybe_admin_user
         ensure_bootstrap_admin(conn, username=username, password=password)
@@ -871,7 +863,7 @@ def list_ai_profiles(conn, *, owner_user_id: Optional[int], include_builtin: boo
     return [_profile_row_to_dict(r) for r in rows]
 
 
-def delete_ai_profile(conn, profile_id: int) -> None:
+def delete_ai_profile(conn, profile_id: int, *, data_dir: Path) -> None:
     """
     Delete a non-default AI profile and, if it had a CAS-backed avatar that is no longer
     referenced anywhere, clean up that avatar file as well.
@@ -889,7 +881,7 @@ def delete_ai_profile(conn, profile_id: int) -> None:
     # Best-effort CAS cleanup for the old avatar.
     if avatar:
         try:
-            media_helper.cleanup_profile_avatar(conn, avatar)
+            media_helper.cleanup_profile_avatar(conn, avatar, data_dir=Path(data_dir))
         except Exception:
             log.exception("Failed to clean up avatar for deleted profile %s", profile_id)
 
@@ -944,11 +936,11 @@ def import_ai_profile(conn, *, owner_user_id: Optional[int], data: Dict[str, Any
 
 # ---------- Storage for attachments ----------
 
-def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
+def cas_put(db, *, data_dir: Path, sha256: str, mime: str, src_path: str) -> int:
     """
     Ensure the file is present in on-disk CAS (data/cas/<sha256>), de-dupe by sha256, and return the id from the files table.
     """
-    cas_root = _data_dir() / "cas"
+    cas_root = Path(data_dir) / "cas"
     cas_root.mkdir(parents=True, exist_ok=True)
     cas_path = cas_root / sha256
     mode = read_db_mode(db)
@@ -994,7 +986,7 @@ def cas_put(db, *, sha256: str, mime: str, src_path: str) -> int:
     return int(row[0])
 
 
-def cas_path_for_file(db, file_id: int) -> Optional[Path]:
+def cas_path_for_file(db, file_id: int, *, data_dir: Path) -> Optional[Path]:
     """
     Given a files.id, return the filesystem path to the CAS file (data/cas/<sha256>),
     or None if not found or the file does not exist.
@@ -1008,7 +1000,7 @@ def cas_path_for_file(db, file_id: int) -> Optional[Path]:
     if isinstance(sha_blob, memoryview):
         sha_blob = sha_blob.tobytes()
     sha_hex = sha_blob.hex()
-    cas_root = _data_dir() / "cas"
+    cas_root = Path(data_dir) / "cas"
     path = cas_root / sha_hex
     if not path.exists():
         return None
@@ -1027,7 +1019,7 @@ def cas_path_for_file(db, file_id: int) -> Optional[Path]:
         except Exception:
             raw_bytes = b""
 
-    tmp_root = _data_dir() / "cas_tmp"
+    tmp_root = Path(data_dir) / "cas_tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_root / sha_hex
     tmp_path.write_bytes(raw_bytes)

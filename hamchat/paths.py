@@ -19,7 +19,7 @@ def log_paths(data_dir: Path) -> Tuple[Path, Path]:
     return logs_dir, logs_dir / "app.log"
 
 def settings_dir(project_root: Path | None = None) -> Path:
-    # Non-sensitive JSON settings live here.
+    # Non-sensitive settings live here; some JSON files are shipped assets.
     base = Path(project_root) if project_root else Path(".")
     s = base.resolve() / "settings"
     s.mkdir(parents=True, exist_ok=True)

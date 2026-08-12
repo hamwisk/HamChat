@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
+import logging
 import re
+from http.client import HTTPException
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .settings import save_settings
 
@@ -17,9 +23,20 @@ _SEMVER = re.compile(
     r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 _FIELDS = frozenset(
-    ("schema_version", "version", "git_ref", "release_notes", "minimum_updater_version")
+    ("schema_version", "version", "git_ref", "release_notes")
 )
 _SCHEMA_VERSION = 1
+DEFAULT_MANIFEST_URL = (
+    "https://raw.githubusercontent.com/hamwisk/HamChat/main/"
+    "updates/latest.json"
+)
+DEFAULT_RELEASE_NOTES_BASE_URL = (
+    "https://raw.githubusercontent.com/hamwisk/HamChat/"
+)
+MANIFEST_MAX_BYTES = 64 * 1024
+RELEASE_NOTES_MAX_BYTES = 256 * 1024
+UPDATE_REQUEST_TIMEOUT_SECONDS = 5.0
+log = logging.getLogger("updates")
 
 
 class UpdateMode(str, Enum):
@@ -38,14 +55,13 @@ class DecisionReason(str, Enum):
     INVALID_MANIFEST = "invalid_manifest"
     UNSUPPORTED_MANIFEST_SCHEMA = "unsupported_manifest_schema"
     INVALID_UPDATE_PREFERENCES = "invalid_update_preferences"
-    UPDATER_INCOMPATIBLE = "updater_incompatible"
 
 
 class UpdateValidationError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SemanticVersion:
     major: int
     minor: int
@@ -77,6 +93,12 @@ class SemanticVersion:
         if self.build:
             value += "+" + ".".join(self.build)
         return value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, SemanticVersion) and self.compare(other) == 0
+
+    def __hash__(self) -> int:
+        return hash((self.major, self.minor, self.patch, self.prerelease))
 
     def compare(self, other: "SemanticVersion") -> int:
         own_core = (self.major, self.minor, self.patch)
@@ -119,17 +141,15 @@ class UpdatePreferences:
 
     @classmethod
     def from_mapping(cls, value: object) -> "UpdatePreferences":
-        expected = {"mode", "ignore_patch_updates", "skipped_version"}
-        if not isinstance(value, Mapping) or set(value) != expected:
-            raise UpdateValidationError(
-                "updates settings must contain exactly mode, "
-                "ignore_patch_updates, skipped_version"
-            )
+        if not isinstance(value, Mapping):
+            raise UpdateValidationError("updates settings must be an object")
+        defaults = cls().as_mapping()
+        merged = {key: value.get(key, default) for key, default in defaults.items()}
         try:
-            mode = UpdateMode(value["mode"])
+            mode = UpdateMode(merged["mode"])
         except (TypeError, ValueError) as exc:
             raise UpdateValidationError("invalid update mode") from exc
-        return cls(mode, value["ignore_patch_updates"], value["skipped_version"])
+        return cls(mode, merged["ignore_patch_updates"], merged["skipped_version"])
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -145,7 +165,10 @@ def preferences_from_settings(settings: Mapping[str, Any]) -> UpdatePreferences:
 
 def save_update_preferences(path: Path, settings: Mapping[str, Any], preferences: UpdatePreferences) -> dict[str, Any]:
     updated = dict(settings)
-    updated["updates"] = preferences.as_mapping()
+    existing = settings.get("updates", {})
+    update_settings = dict(existing) if isinstance(existing, Mapping) else {}
+    update_settings.update(preferences.as_mapping())
+    updated["updates"] = update_settings
     save_settings(path, updated)
     return updated
 
@@ -156,7 +179,6 @@ class ReleaseManifest:
     version: SemanticVersion
     git_ref: str
     release_notes: str
-    minimum_updater_version: SemanticVersion
 
 
 @dataclass(frozen=True)
@@ -167,7 +189,10 @@ class ManifestValidationResult:
 
 
 def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip() or any(char.isspace() for char in value):
+    if (
+        not isinstance(value, str) or not value or value != value.strip()
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
         raise UpdateValidationError(f"{field} must be a non-empty whitespace-free string")
     return value
 
@@ -175,10 +200,23 @@ def _text(value: object, field: str) -> str:
 def _release_notes_path(value: object) -> str:
     text = _text(value, "release_notes")
     path = PurePosixPath(text)
-    if ("\\" in text or path.as_posix() != text or path.is_absolute()
+    if ("\\" in text or "?" in text or "#" in text or ":" in text
+            or path.as_posix() != text or path.is_absolute()
             or not path.parts or path.parts[0] != "updates"
             or any(part in {".", ".."} for part in path.parts)):
         raise UpdateValidationError("release_notes must be a safe repository-relative path under updates/")
+    return text
+
+
+def _git_ref(value: object) -> str:
+    text = _text(value, "git_ref")
+    if (
+        text == "@" or text.startswith("/") or text.endswith(("/", "."))
+        or ".." in text or "//" in text or "@{" in text
+        or any(part in {".", ".."} or part.startswith(".") or part.endswith(".lock") for part in text.split("/"))
+        or any(char in text for char in "~^:?*[\\")
+    ):
+        raise UpdateValidationError("git_ref is not a safe Git ref")
     return text
 
 
@@ -198,16 +236,14 @@ def parse_release_manifest(value: object) -> ManifestValidationResult:
         if schema != _SCHEMA_VERSION:
             return ManifestValidationResult(None, DecisionReason.UNSUPPORTED_MANIFEST_SCHEMA, f"unsupported schema_version: {schema}")
         release = SemanticVersion.parse(value["version"])
-        minimum = SemanticVersion.parse(value["minimum_updater_version"])
         if not release.is_stable:
             raise UpdateValidationError("manifest version must be a stable release")
         return ManifestValidationResult(
             ReleaseManifest(
                 schema,
                 release,
-                _text(value["git_ref"], "git_ref"),
+                _git_ref(value["git_ref"]),
                 _release_notes_path(value["release_notes"]),
-                minimum,
             )
         )
     except UpdateValidationError as exc:
@@ -231,7 +267,6 @@ def decide_update(
     preferences: UpdatePreferences | Mapping[str, Any] | object,
     *,
     manual_check: bool = False,
-    updater_version: object = None,
 ) -> UpdateDecision:
     """Decide eligibility without I/O; a manual check only bypasses a skip."""
     try:
@@ -259,18 +294,198 @@ def decide_update(
     remote = parsed.manifest.version
     if remote.compare(installed) <= 0:
         return UpdateDecision(DecisionReason.REMOTE_NOT_NEWER, parsed.manifest)
-    try:
-        updater = SemanticVersion.parse(updater_version)
-    except UpdateValidationError as exc:
-        return UpdateDecision(
-            DecisionReason.UPDATER_INCOMPATIBLE,
-            parsed.manifest,
-            f"updater version unavailable or invalid: {exc}",
-        )
-    if updater.compare(parsed.manifest.minimum_updater_version) < 0:
-        return UpdateDecision(DecisionReason.UPDATER_INCOMPATIBLE, parsed.manifest, "updater version is below manifest minimum")
     if prefs.ignore_patch_updates and remote.major == installed.major and remote.minor == installed.minor:
         return UpdateDecision(DecisionReason.PATCH_UPDATE_IGNORED, parsed.manifest)
     if prefs.skipped_version == str(remote) and not manual_check:
         return UpdateDecision(DecisionReason.VERSION_SKIPPED, parsed.manifest)
     return UpdateDecision(DecisionReason.UPDATE_AVAILABLE, parsed.manifest)
+
+
+class RemoteCheckStatus(str, Enum):
+    CHECKING_DISABLED = "checking_disabled"
+    UPDATE_AVAILABLE_WITH_NOTES = "update_available_with_notes"
+    NO_ELIGIBLE_UPDATE = "no_eligible_update"
+    MANIFEST_URL_REJECTED = "manifest_url_rejected"
+    MANIFEST_TIMEOUT = "manifest_timeout"
+    MANIFEST_NETWORK_ERROR = "manifest_network_error"
+    MANIFEST_HTTP_ERROR = "manifest_http_error"
+    MANIFEST_TOO_LARGE = "manifest_too_large"
+    MANIFEST_DECODING_ERROR = "manifest_decoding_error"
+    MANIFEST_JSON_ERROR = "manifest_json_error"
+    MANIFEST_INVALID = "manifest_invalid"
+    RELEASE_NOTES_URL_REJECTED = "release_notes_url_rejected"
+    RELEASE_NOTES_TIMEOUT = "release_notes_timeout"
+    RELEASE_NOTES_NETWORK_ERROR = "release_notes_network_error"
+    RELEASE_NOTES_HTTP_ERROR = "release_notes_http_error"
+    RELEASE_NOTES_TOO_LARGE = "release_notes_too_large"
+    RELEASE_NOTES_DECODING_ERROR = "release_notes_decoding_error"
+
+
+@dataclass(frozen=True)
+class RemoteUpdateResult:
+    status: RemoteCheckStatus
+    decision: UpdateDecision
+    manifest: ReleaseManifest | None = None
+    release_notes: str | None = None
+    diagnostic: str | None = None
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Convert every redirect into a controlled HTTP failure."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class UrllibTransport:
+    """Small injectable HTTPS transport with redirects disabled."""
+
+    def __init__(self) -> None:
+        self._opener = build_opener(_NoRedirectHandler())
+
+    def open(self, url: str, timeout: float):
+        request = Request(url, headers={"Accept": "application/json, text/markdown;q=0.9"})
+        return self._opener.open(request, timeout=timeout)
+
+
+def _valid_https_url(value: object) -> str | None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https" or not parsed.netloc or parsed.username is not None
+        or parsed.password is not None or parsed.query or parsed.fragment
+    ):
+        return None
+    return value
+
+
+def _release_notes_url(base_url: str, manifest: ReleaseManifest) -> str | None:
+    base = _valid_https_url(base_url)
+    if base is None:
+        return None
+    # git_ref and release_notes have already been syntactically restricted.
+    return f"{base.rstrip('/')}/{manifest.git_ref}/{manifest.release_notes}"
+
+
+def _read_limited(response: Any, limit: int) -> bytes:
+    content_length = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
+    expected_length: int | None = None
+    if content_length is not None:
+        try:
+            expected_length = int(content_length)
+            if expected_length > limit:
+                raise OverflowError("declared payload exceeds limit")
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = response.read(min(8192, limit + 1 - total))
+        if not chunk:
+            if expected_length is not None and total != expected_length:
+                raise OSError("truncated response body")
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise OverflowError("payload exceeds limit")
+        chunks.append(chunk)
+
+
+def _fetch_bytes(transport: Any, url: str, limit: int, timeout: float) -> tuple[bytes | None, RemoteCheckStatus | None, str | None]:
+    try:
+        with transport.open(url, timeout) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            if not 200 <= status < 300:
+                return None, RemoteCheckStatus.MANIFEST_HTTP_ERROR, f"http_status={status}"
+            return _read_limited(response, limit), None, None
+    except TimeoutError:
+        return None, RemoteCheckStatus.MANIFEST_TIMEOUT, "timeout"
+    except HTTPError as exc:
+        return None, RemoteCheckStatus.MANIFEST_HTTP_ERROR, f"http_status={exc.code}"
+    except OverflowError:
+        return None, RemoteCheckStatus.MANIFEST_TOO_LARGE, "payload_too_large"
+    except (HTTPException, OSError, URLError):
+        return None, RemoteCheckStatus.MANIFEST_NETWORK_ERROR, "network_error"
+
+
+def _notes_status(status: RemoteCheckStatus) -> RemoteCheckStatus:
+    return {
+        RemoteCheckStatus.MANIFEST_TIMEOUT: RemoteCheckStatus.RELEASE_NOTES_TIMEOUT,
+        RemoteCheckStatus.MANIFEST_NETWORK_ERROR: RemoteCheckStatus.RELEASE_NOTES_NETWORK_ERROR,
+        RemoteCheckStatus.MANIFEST_HTTP_ERROR: RemoteCheckStatus.RELEASE_NOTES_HTTP_ERROR,
+        RemoteCheckStatus.MANIFEST_TOO_LARGE: RemoteCheckStatus.RELEASE_NOTES_TOO_LARGE,
+    }[status]
+
+
+def check_for_updates(
+    installed_version: object,
+    preferences: UpdatePreferences | Mapping[str, Any] | object,
+    *,
+    manual_check: bool = False,
+    manifest_url: str = DEFAULT_MANIFEST_URL,
+    release_notes_base_url: str = DEFAULT_RELEASE_NOTES_BASE_URL,
+    transport: Any = None,
+    timeout: float = UPDATE_REQUEST_TIMEOUT_SECONDS,
+) -> RemoteUpdateResult:
+    """Fetch, validate, and decide updates; all failures are non-fatal results."""
+    try:
+        prefs = preferences if isinstance(preferences, UpdatePreferences) else UpdatePreferences.from_mapping(preferences)
+    except UpdateValidationError as exc:
+        return RemoteUpdateResult(
+            RemoteCheckStatus.NO_ELIGIBLE_UPDATE,
+            UpdateDecision(DecisionReason.INVALID_UPDATE_PREFERENCES, detail=str(exc)),
+            diagnostic="invalid_preferences",
+        )
+    if prefs.mode is UpdateMode.OFF and not manual_check:
+        return RemoteUpdateResult(
+            RemoteCheckStatus.CHECKING_DISABLED,
+            UpdateDecision(DecisionReason.UPDATE_MODE_OFF),
+        )
+    url = _valid_https_url(manifest_url)
+    if url is None:
+        return RemoteUpdateResult(
+            RemoteCheckStatus.MANIFEST_URL_REJECTED,
+            UpdateDecision(DecisionReason.INVALID_MANIFEST, detail="manifest URL must use HTTPS"),
+            diagnostic="manifest_url_rejected",
+        )
+    transport = transport or UrllibTransport()
+    payload, fetch_status, diagnostic = _fetch_bytes(transport, url, MANIFEST_MAX_BYTES, timeout)
+    if fetch_status is not None:
+        return RemoteUpdateResult(fetch_status, UpdateDecision(DecisionReason.INVALID_MANIFEST), diagnostic=diagnostic)
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return RemoteUpdateResult(RemoteCheckStatus.MANIFEST_DECODING_ERROR, UpdateDecision(DecisionReason.INVALID_MANIFEST), diagnostic="invalid_utf8")
+    try:
+        raw_manifest = json.loads(decoded)
+    except json.JSONDecodeError:
+        return RemoteUpdateResult(RemoteCheckStatus.MANIFEST_JSON_ERROR, UpdateDecision(DecisionReason.INVALID_MANIFEST), diagnostic="invalid_json")
+    parsed = parse_release_manifest(raw_manifest)
+    decision = decide_update(installed_version, parsed, prefs, manual_check=manual_check)
+    if parsed.manifest is None:
+        safe_decision = UpdateDecision(
+            parsed.reason or DecisionReason.INVALID_MANIFEST,
+            detail="manifest_validation_failed",
+        )
+        return RemoteUpdateResult(
+            RemoteCheckStatus.MANIFEST_INVALID,
+            safe_decision,
+            diagnostic="manifest_validation_failed",
+        )
+    if not decision.update_available:
+        return RemoteUpdateResult(RemoteCheckStatus.NO_ELIGIBLE_UPDATE, decision, parsed.manifest)
+    notes_url = _release_notes_url(release_notes_base_url, parsed.manifest)
+    if notes_url is None:
+        return RemoteUpdateResult(RemoteCheckStatus.RELEASE_NOTES_URL_REJECTED, decision, parsed.manifest, diagnostic="release_notes_url_rejected")
+    payload, fetch_status, diagnostic = _fetch_bytes(transport, notes_url, RELEASE_NOTES_MAX_BYTES, timeout)
+    if fetch_status is not None:
+        return RemoteUpdateResult(_notes_status(fetch_status), decision, parsed.manifest, diagnostic=diagnostic)
+    try:
+        notes = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return RemoteUpdateResult(RemoteCheckStatus.RELEASE_NOTES_DECODING_ERROR, decision, parsed.manifest, diagnostic="invalid_utf8")
+    log.info("Update release notes retrieved version=%s byte_count=%d", parsed.manifest.version, len(payload))
+    return RemoteUpdateResult(RemoteCheckStatus.UPDATE_AVAILABLE_WITH_NOTES, decision, parsed.manifest, notes)

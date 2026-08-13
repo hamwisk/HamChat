@@ -1,67 +1,160 @@
 # HamChat
 
-HamChat is a local-first desktop chat client for large language models. It’s built for running local LLMs (via Ollama or other backends), with multi-user sessions, admin tools and a comfy PyQt/QML UI.
+HamChat is a local-first Linux desktop application for talking to large language models. It combines private, Ollama-focused chat with multiple user accounts, AI Profiles, persistent memory, image-capable conversations, model-aware context planning, and safe application updates in a comfortable PyQt6 interface.
 
-> Status: pre-alpha, expect dragons and breaking changes.
+**Current release: HamChat 2.7.0**
 
-## Features (current)
+HamChat is a complete working application under active development. Linux is its primary and currently tested platform.
 
-- Local-first, privacy-friendly chat with LLMs
-- Desktop UI built with PyQt6 + QML
-- Multiple user accounts with admin mode
-- Conversation history and long-term memory
-- AI profiles / personas
-- Image attachments and thumbnails in the chat UI
-- Pluggable backends (currently focused on local Ollama; API support planned)
+## Highlights
 
-## Getting started
+### Local-first conversations
 
-### Requirements
+- Run conversations against local models through Ollama.
+- Keep account data, conversations, memories, attachments, and configuration on your own machine.
+- Maintain separate user accounts with administrative roles and permissions.
+- Preserve conversation history, fork chats, and export or import chat JSON.
+- Stream responses with cancellation and useful request diagnostics.
 
-- Python 3.10+
-- A modern Linux desktop  
-  (developed on Linux Mint; other platforms not tested yet)
-- A local LLM backend (e.g. [Ollama]) if you want actual responses
+### HamMem persistent memory
 
-### Setup
+HamMem lets HamChat recall useful information beyond the immediate context window.
 
-Clone the repo and install dependencies:
+- Create, inspect, edit, and delete memories in the Memory Manager.
+- Scope memories to a user, chat, AI Profile, administrator, or the whole installation.
+- Enable or disable memory independently for each conversation.
+- Preserve a chat's HamMem preference when forking it.
+- Build and rebuild embeddings used for relevant memory retrieval.
+- Control memory availability through account roles and permissions.
+
+### AI Profiles
+
+- Create reusable AI personalities and behavioural profiles.
+- Associate persistent memories with individual AI Profiles.
+- Manage profile avatars and media inside HamChat's selected data directory.
+- Switch profiles without losing the identity and context attached to them.
+
+### Model-aware context planning
+
+HamChat inspects the active Ollama model instead of assuming every model behaves alike.
+
+- Discover the model's effective runtime context window.
+- Choose **Auto**, **Low/4K**, **Mid/8K**, or **High/16K** context allocation.
+- Account for the complete prompt while reserving room for the response.
+- Stop requests that cannot fit and provide useful guidance instead of failing mysteriously.
+- Record diagnostics for interrupted streams, malformed responses, and model preparation.
+
+### Thinking support
+
+Compatible models can display transient reasoning output in a dedicated, collapsible Thinking panel.
+
+- Select an available thinking-effort level.
+- Keep thinking separate from the final answer.
+- Automatically disable or constrain controls according to the model's capabilities.
+- Avoid storing transient thinking as ordinary conversation content.
+
+### Images and attachments
+
+- Attach images to conversations with compatible multimodal models.
+- Accept WebP and other common raster formats supported by Pillow.
+- Normalize model input to a bounded PNG while preserving the original attachment bytes.
+- Store attachments in HamChat's content-addressed storage and display thumbnails in the chat interface.
+
+### Safe automatic updates
+
+HamChat 2.7.0 introduces a verified system-file updater with four menu actions:
+
+- **Off**
+- **Ask Before Installing**
+- **Install Automatically**
+- **Check for Updates**
+
+Updates are checked after the splash screen appears and before normal database and model initialization. HamChat validates release metadata, archive size, cryptographic digest, archive structure, and the complete managed-file inventory before installation.
+
+Installation is journaled and supports rollback and interrupted-update recovery. The updater manages declared HamChat system files only: it does not install into `data/` or `settings/`, and it blocks updates that require an incompatible database schema, data layout, or data migration.
+
+Installations older than 2.7.0 require one final manual update before they can use this system.
+
+## Requirements
+
+- Python 3.10 or newer
+- A modern Linux desktop
+- [Ollama](https://ollama.com/) and at least one installed model for local AI responses
+- Hardware appropriate for the models you choose
+
+HamChat is developed and tested on Linux Mint. Other Linux distributions may work, but other operating systems are not currently tested.
+
+## Installation
+
+Clone the repository and create a virtual environment:
 
 ```bash
-git clone git@github.com:hamwisk/HamChat.git
+git clone https://github.com/hamwisk/HamChat.git
 cd HamChat
 
 python3.10 -m venv .venv
 source .venv/bin/activate
 
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
-There are also helper scripts:
-./setup_venv.sh      # optional convenience script for the steps above
-./run_hamchat.sh     # run the app with logging
+The supplied helper can perform the virtual-environment setup instead:
 
-Or run directly:
+```bash
+./setup_venv.sh
+```
+
+## Running HamChat
+
+The recommended launcher enables HamChat's normal logging setup:
+
+```bash
+./run_hamchat.sh
+```
+
+You can also run HamChat directly from the activated environment:
+
+```bash
+python main.py
+```
+
+For detailed terminal and file logging:
+
+```bash
 python main.py --log-level DEBUG
+```
 
-Configuration
+Runtime logs are written to `data/logs/app.log`.
 
-Basic settings (models, runtime mode, etc.) live under the settings/ directory.
-HamChat is currently wired to talk to local LLMs (e.g. via Ollama); model IDs and related options can be adjusted there.
+## Configuration and user data
 
-Roadmap (short version)
+Application configuration and shipped model-knowledge files live under `settings/`. Optional user registry layers allow local context and modality overrides to remain separate from HamChat's shipped defaults.
 
-  - Finish multi-user + admin flows
+HamChat keeps its user-owned state beneath its selected `data/` directory, including databases, logs, profile media, and content-addressed attachment storage. This separation lets application files be updated without replacing personal data.
 
-  - Stabilise chat controller / streaming & cancel logic
+You should still keep an independent backup of important user data. Automatic update safety is not a substitute for an ordinary backup policy.
 
-  - Flesh out AI profiles and memory system
+## Release notes
 
-  - Add cleaner configuration for different backends
+See [`updates/2.7.0.md`](updates/2.7.0.md) for the complete HamChat 2.7.0 release notes.
 
-  - Polish the UI and theming
+## Future possibilities
 
-License
+HamChat's major planned capabilities are now present. Future work may include:
 
-HamChat is licensed under the GNU GPL v3.0.
-See the LICENSE file for details.
+- Speech-to-text input
+- Text-to-speech responses and voice options
+- Broader remote/API backend support
+- Additional platform testing and compatibility
+- Continued interface, accessibility, and packaging polish
+
+Speech features remain dependent on finding implementations that fit the available hardware without compromising the local-first experience.
+
+## Project status
+
+HamChat is an independently developed personal project. It is usable today, but active development means behaviour and configuration may continue to evolve. Bug reports and careful testing are welcome.
+
+## License
+
+HamChat is licensed under the GNU General Public License v3.0. See [`LICENSE`](LICENSE) for details.

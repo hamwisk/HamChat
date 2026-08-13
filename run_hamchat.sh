@@ -13,5 +13,5 @@ else
   exit 1
 fi
 
-# Run HamChat via main.py with logging
-exec python3.10 main.py --log-level DEBUG "$@"
+# Run HamChat via main.py
+exec python3.10 main.py "$@"

@@ -42,7 +42,10 @@ log = logging.getLogger("updates")
 
 class UpdateMode(str, Enum):
     AUTOMATIC = "automatic"
-    PROMPT = "prompt"
+    # ``ask`` is the persisted public value.  PROMPT remains the source
+    # compatible enum name used by the pre-UI updater code.
+    PROMPT = "ask"
+    ASK = "ask"
     OFF = "off"
 
 
@@ -148,7 +151,10 @@ class UpdatePreferences:
         defaults = cls().as_mapping()
         merged = {key: value.get(key, default) for key, default in defaults.items()}
         try:
-            mode = UpdateMode(merged["mode"])
+            # Older development settings used ``prompt``.  Treat it as the
+            # public Ask value rather than making an existing profile fail.
+            raw_mode = "ask" if merged["mode"] == "prompt" else merged["mode"]
+            mode = UpdateMode(raw_mode)
         except (TypeError, ValueError) as exc:
             raise UpdateValidationError("invalid update mode") from exc
         return cls(mode, merged["ignore_patch_updates"], merged["skipped_version"])

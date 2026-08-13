@@ -18,7 +18,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "signup_submit": False
     },
     "updates": {
-        "mode": "prompt",
+        "mode": "ask",
         "ignore_patch_updates": False,
         "skipped_version": None
     }

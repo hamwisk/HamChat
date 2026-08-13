@@ -28,6 +28,9 @@ class Menus:
         get_models: Callable[[], Iterable[tuple[str, str]]],
         set_current_model: Callable[[str], None],
         open_model_manager: Callable[[], None],
+        get_update_mode: Callable[[], str] = lambda: "ask",
+        set_update_mode: Callable[[str], None] = lambda _value: None,
+        check_updates: Callable[[], None] = lambda: None,
     ) -> None:
         self.mb = menubar
         self._get_spell_enabled = get_spell_enabled
@@ -47,6 +50,9 @@ class Menus:
         self._get_models = get_models
         self._set_current_model = set_current_model
         self._open_model_manager = open_model_manager
+        self._get_update_mode = get_update_mode
+        self._set_update_mode = set_update_mode
+        self._check_updates = check_updates
 
     def build(self) -> None:
         self.mb.clear()
@@ -54,6 +60,19 @@ class Menus:
         self._edit_menu()
         self._model_menu()
         self._view_menu()
+        self._updates_menu()
+
+    def _updates_menu(self) -> None:
+        menu = self.mb.addMenu("&Updates")
+        modes = menu.addMenu("Update Mode")
+        group = QActionGroup(modes); group.setExclusive(True)
+        current = self._get_update_mode()
+        for value, label in (("off", "Off"), ("ask", "Ask Before Installing"), ("automatic", "Install Automatically")):
+            action = modes.addAction(label); action.setCheckable(True); action.setChecked(value == current)
+            action.triggered.connect(lambda _=False, mode=value: self._set_update_mode(mode))
+            group.addAction(action)
+        menu.addSeparator()
+        menu.addAction("Check for Updates…", self._check_updates)
 
     def _file_menu(self) -> None:
         m = self.mb.addMenu("&File")

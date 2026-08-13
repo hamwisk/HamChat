@@ -16,14 +16,25 @@ def splash_process(conn: Connection, logo_path: str | None = None):
     app = QApplication(sys.argv)
     splash = FunSplash(logo_path=logo_path, closable=False, min_ms=1200)
     splash.show()
+    def report_ready():
+        # Let Qt process the show event before the parent is permitted to run
+        # recovery or updater work.
+        app.processEvents()
+        conn.send({"type": "ready"})
+    QTimer.singleShot(0, report_ready)
 
     def poll_parent():
         if conn.poll():
             msg = conn.recv()
-            if msg == "close":
+            kind = msg.get("type") if isinstance(msg, dict) else msg
+            if kind == "close":
                 splash.request_close()
                 # allow the fade-out to complete before exit
                 QTimer.singleShot(600, app.quit)
+            elif kind == "status" and isinstance(msg.get("text"), str) and len(msg["text"]) <= 120:
+                splash.set_text(msg["text"])
+            elif kind == "clear_status":
+                splash.clear_text()
 
     t = QTimer()
     t.timeout.connect(poll_parent)

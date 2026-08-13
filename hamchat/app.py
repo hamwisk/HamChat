@@ -1,20 +1,17 @@
 # hamchat/app.py
 from __future__ import annotations
 import logging, sys
-import argparse, logging, os, platform
-from PyQt6.QtWidgets import QApplication
+import argparse, os, platform
+from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QIcon
 from pathlib import Path
 from enum import Enum
 from multiprocessing import Process, Pipe
 from .splash_worker import splash_process
-from .db_init import ensure_database_ready
 from .paths import default_data_dir, log_paths, settings_dir
-from .settings import load_settings, set_admin_presence
 from .logging_config import init_logging
 from .constants import APP_NAME, __version__
-from hamchat.ui.main_window import MainWindow
-from hamchat.db_ops import read_db_mode, open_by_detection, probe_admin_exists
 
 
 class RunMode(str, Enum):
@@ -78,12 +75,16 @@ def needs_local_init(mode: RunMode) -> bool:
     return mode in (RunMode.SOLO, RunMode.HAM)
 
 # --- Runtime implementations here ---
-def run_solo(db_conn, db_mode_str, data_dir: Path):
+def run_solo(app: QApplication, db_conn, db_mode_str, data_dir: Path, update_controller=None):
     logging.getLogger("boot").info("Starting SOLO (🥓 whole hog) — launching MainWindow")
-    app = QApplication(sys.argv)
     app.setWindowIcon(get_app_icon())
-
-    w = MainWindow(runtime_mode=RunMode.SOLO.value, db_conn=db_conn, db_mode=db_mode_str, data_dir=data_dir)
+    from hamchat.ui.main_window import MainWindow
+    w = MainWindow(
+        runtime_mode=RunMode.SOLO.value, db_conn=db_conn, db_mode=db_mode_str,
+        data_dir=data_dir, update_controller=update_controller,
+    )
+    if update_controller is not None:
+        update_controller.attach_window(w)
     w.show()
     app.exec()
 
@@ -91,12 +92,38 @@ def run_server():
     logging.getLogger("boot").info("Starting HAM server (🐖)")
     # TODO: import and start FastAPI (or your server) and block
 
-def run_agent(server_url: str):
+def run_agent(app: QApplication, server_url: str):
     logging.getLogger("boot").info("Starting SNOUT agent (🐽) — launching MainWindow bound to %s", server_url)
-    app = QApplication(sys.argv)
+    from hamchat.ui.main_window import MainWindow
     w = MainWindow(runtime_mode=RunMode.SNOUT.value, server_url=server_url)
     w.show()
     app.exec()
+
+
+class _SplashBridge:
+    """Bounded parent-side protocol for the separate startup splash."""
+    def __init__(self, conn, process, log: logging.Logger):
+        self._conn, self._process, self._log, self._closed = conn, process, log, False
+
+    def status(self, text: str) -> None:
+        if not self._closed and isinstance(text, str) and len(text) <= 120:
+            self._conn.send({"type": "status", "text": text})
+
+    def clear_status(self) -> None:
+        if not self._closed:
+            self._conn.send({"type": "clear_status"})
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._conn.send({"type": "close"})
+            self._process.join(timeout=5)
+            if self._process.is_alive():
+                self._log.warning("Splash closure timed out")
+        except (BrokenPipeError, EOFError, OSError):
+            self._log.warning("Splash close request failed")
 
 def main() -> int:
     args = parse_args()
@@ -109,15 +136,15 @@ def main() -> int:
 
     data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else default_data_dir()
     logs_dir, log_path = log_paths(data_dir)
-    settings_path = settings_dir().joinpath("app.json")
-    cfg = load_settings(settings_path)
-
-    level = (args.log_level or cfg["logging"]["level"]).upper()
+    settings_path = Path.cwd().resolve() / "settings" / "app.json"
+    # Logging is allowed in the minimal bootstrap; ordinary settings are not
+    # loaded until recovery has made startup safe.
+    level = (args.log_level or "INFO").upper()
     init_logging(
         logs_dir,
         level=level,
-        max_bytes=int(cfg["logging"]["max_bytes"]),
-        backup_count=int(cfg["logging"]["backup_count"]),
+        max_bytes=10 * 1024 * 1024,
+        backup_count=5,
         also_console=(not args.no_console_log),
     )
     log = logging.getLogger("boot")
@@ -133,14 +160,57 @@ def main() -> int:
     splash_proc.daemon = True
     splash_proc.start()
     log.info("Splash process started (pid %s)", splash_proc.pid)
+    if not parent_conn.poll(3) or parent_conn.recv() != {"type": "ready"}:
+        log.warning("Splash readiness was not confirmed")
+    else:
+        log.info("updates splash visibly ready")
+    splash = _SplashBridge(parent_conn, splash_proc, log)
+
+    # Recovery is intentionally before database/config/model imports.  It uses
+    # only the durable system-file journal and rollback artifacts.
+    from hamchat.system_update_executor import SystemUpdateStatus, recover_pending_system_installs
+    from hamchat.update_controller import UpdateController, transaction_parent_for_installation
+    splash.status("Checking previous update…")
+    log.info("updates recovery check started")
+    recovery = recover_pending_system_installs(
+        transaction_parent=transaction_parent_for_installation(Path.cwd()),
+        installation_root=Path.cwd(),
+    )
+    if recovery is not None:
+        log.info("updates recovery outcome status=%s code=%s", recovery.status.value, recovery.code.value if recovery.code else "none")
+    if recovery is not None and recovery.status is SystemUpdateStatus.BLOCKED:
+        splash.close()
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(None, "HamChat update recovery", "HamChat needs manual update recovery before it can start.")
+        return 1
+
+    # SOLO's policy is resolved while the splash is still visible, before any
+    # user-data or model initialization.  The controller worker keeps fetches
+    # and acquisition off the Qt GUI thread.
+    app = QApplication.instance() or QApplication(sys.argv)
+    controller = None
+    if mode is RunMode.SOLO:
+        controller = UpdateController(settings_path=settings_path, installation_root=Path.cwd(), data_root=data_dir, splash=splash)
+        loop = QEventLoop()
+        outcome = {"stop": False}
+        def _startup_done(stop: bool) -> None:
+            outcome["stop"] = stop; loop.quit()
+        controller.startup_finished.connect(_startup_done)
+        QTimer.singleShot(0, controller.start_startup_check)
+        loop.exec()
+        if outcome["stop"]:
+            controller.shutdown()
+            return 0
 
     try:
         # --- heavy init (skip for SNOUT/agent) ---
         if needs_local_init(mode):
+            from .db_init import ensure_database_ready
+            from .settings import load_settings, set_admin_presence
+            from .db_ops import open_by_detection, probe_admin_exists
             log.info("Initializing secure database...")
             if ensure_database_ready(data_dir, update_settings=True) != 0:
-                parent_conn.send("close")
-                splash_proc.join(timeout=3)
+                splash.close()
                 log.error("Database initialization failed. Aborting.")
                 return 1
 
@@ -165,21 +235,20 @@ def main() -> int:
         log.info("Initialization complete.")
     except Exception:
         log.exception("Fatal error during startup")
-        parent_conn.send("close")
-        splash_proc.join(timeout=3)
+        splash.close()
         raise
 
     # tell splash to close, wait briefly
-    parent_conn.send("close")
-    splash_proc.join(timeout=5)
+    splash.clear_status()
+    splash.close()
 
     # continue into the chosen runtime
     if mode is RunMode.SNOUT:
-        run_agent(args.server_url)
+        run_agent(app, args.server_url)
     elif mode is RunMode.HAM:
         run_server()
     else:
-        run_solo(conn, db_mode, data_dir)
+        run_solo(app, conn, db_mode, data_dir, controller)
 
     return 0
 

@@ -222,6 +222,7 @@ class FunSplash(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._spin)
         self._timer.start(cycle_ms)
+        self._operational = False
 
         # center on the current screen
         geo = QApplication.primaryScreen().availableGeometry()
@@ -229,11 +230,17 @@ class FunSplash(QWidget):
         self.move(geo.center() - self.rect().center())
 
     def _spin(self):
+        if self._operational:
+            return
         self.status.setText(random.choice(FUN_LINES))
 
     # allow loader to push a line explicitly if desired
     def set_text(self, s: str):
+        self._operational = True
         self.status.setText(s)
+
+    def clear_text(self):
+        self._operational = False
 
     def request_close(self):
         """Close now if we've shown long enough; else, schedule it."""

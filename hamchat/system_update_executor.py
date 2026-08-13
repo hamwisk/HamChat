@@ -203,3 +203,67 @@ def recover_system_install(*, candidate: VerifiedStagedCandidate, transaction_ro
     except (OSError, ValueError, KeyError):
         journal["state"] = _MANUAL; _save(transaction_root, journal)
         return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
+
+
+def recover_pending_system_installs(*, transaction_parent: Path, installation_root: Path) -> SystemUpdateResult | None:
+    """Recover the one pending system transaction without needing a candidate.
+
+    Startup deliberately runs before manifest discovery.  Recovery therefore
+    uses only the durable, write-ahead journal and rollback artifacts; it does
+    not fetch, parse, or trust a new candidate.
+    """
+    parent = Path(transaction_parent)
+    if not parent.exists():
+        return None
+    journals = sorted(parent.glob("*/system-install.json"))
+    if len(journals) != 1:
+        return None if not journals else SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+    root = journals[0].parent
+    try:
+        import json
+        journal = json.loads(journals[0].read_text("utf-8"))
+        state = journal["state"]
+        files = journal["files"]
+        if state == _COMPLETED:
+            return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
+        if state == _AUTHORIZED:
+            return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
+        if state in {_ROLLBACK_VERIFIED}:
+            return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
+        if state == _MANUAL:
+            return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
+        if state not in {_STARTED, _VERIFIED, _ROLLBACK_REQUIRED, _ROLLBACK_STARTED}:
+            return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+        journal["state"] = _ROLLBACK_STARTED; _save(root, journal)
+        for item in reversed(files):
+            path = item.get("path")
+            if not isinstance(path, str) or not _safe_path(path):
+                raise ValueError
+            target = Path(installation_root) / path
+            state_now = _state(target)
+            old, new = item.get("old"), item.get("new")
+            if state_now == old:
+                continue
+            if state_now != new:
+                raise ValueError
+            if old is None:
+                target.unlink()
+            else:
+                rollback = item.get("rollback")
+                if not isinstance(rollback, str) or not _safe_path(rollback):
+                    raise ValueError
+                backup = root / rollback
+                if _state(backup) != old:
+                    raise ValueError
+                shutil.copyfile(backup, target)
+            if _state(target) != old:
+                raise ValueError
+            item["checkpoint"] = "rollback_verified"; _save(root, journal)
+        journal["state"] = _ROLLBACK_VERIFIED; _save(root, journal)
+        return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
+    except (OSError, ValueError, KeyError, TypeError):
+        try:
+            journal["state"] = _MANUAL; _save(root, journal)
+        except (OSError, UnboundLocalError):
+            pass
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)

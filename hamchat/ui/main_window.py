@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
             db_conn: Optional[str] = None,
             db_mode: Optional[str] = None,
             data_dir: Optional[Path] = None,
+            update_controller=None,
     ):
         super().__init__(parent)
         self.runtime_mode = runtime_mode
@@ -88,6 +89,7 @@ class MainWindow(QMainWindow):
         if db_conn is not None and data_dir is None:
             raise ValueError("data_dir is required when a database connection is supplied")
         self._data_dir = Path(data_dir) if data_dir is not None else None
+        self._update_controller = update_controller
         self._models_available = None
         self._active_profile_id: Optional[int] = None
         self._active_profile_name: Optional[str] = None
@@ -134,6 +136,9 @@ class MainWindow(QMainWindow):
             get_models=self.session.get_model_choices,
             set_current_model=self._on_model_changed_from_menu,
             open_model_manager=self._open_model_manager,
+            get_update_mode=(update_controller.mode_value if update_controller else (lambda: "ask")),
+            set_update_mode=(update_controller.set_mode if update_controller else (lambda _value: None)),
+            check_updates=(update_controller.check_manually if update_controller else (lambda: None)),
         )
         self.menus.build()
 

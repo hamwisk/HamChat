@@ -37,6 +37,15 @@ class JournalState(str, Enum):
     BACKUP_PUBLISHED = "backup_published"
     BACKUP_VERIFIED = "backup_verified"
     ABORTED = "aborted"
+    DATA_PRESERVATION_NOT_REQUIRED = "data_preservation_not_required"
+    SYSTEM_INSTALL_AUTHORIZED = "system_install_authorized"
+    SYSTEM_INSTALL_STARTED = "system_install_started"
+    SYSTEM_INSTALL_VERIFIED = "system_install_verified"
+    COMPLETED = "completed"
+    SYSTEM_ROLLBACK_REQUIRED = "system_rollback_required"
+    SYSTEM_ROLLBACK_STARTED = "system_rollback_started"
+    SYSTEM_ROLLBACK_VERIFIED = "system_rollback_verified"
+    MANUAL_RECOVERY_REQUIRED = "manual_recovery_required"
 
 
 class PreservationSourceKind(str, Enum):

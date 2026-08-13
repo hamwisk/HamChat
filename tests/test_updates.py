@@ -27,6 +27,7 @@ def manifest(version="2.7.0", **changes):
         "version": version,
         "git_ref": f"v{version}",
         "release_notes": "updates/2.7.0.md",
+        "data_compatibility": {"database_schema_version": "2026-08-03.2", "data_layout_version": 1, "data_mutation_required": False},
     }
     value.update(changes)
     return value

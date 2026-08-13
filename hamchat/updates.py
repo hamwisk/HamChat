@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .settings import save_settings
+from .constants import DATA_LAYOUT_VERSION, SCHEMA_VERSION
 
 
 _SEMVER = re.compile(
@@ -23,7 +24,7 @@ _SEMVER = re.compile(
     r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 _FIELDS = frozenset(
-    ("schema_version", "version", "git_ref", "release_notes")
+    ("schema_version", "version", "git_ref", "release_notes", "data_compatibility")
 )
 _SCHEMA_VERSION = 1
 DEFAULT_MANIFEST_URL = (
@@ -55,6 +56,7 @@ class DecisionReason(str, Enum):
     INVALID_MANIFEST = "invalid_manifest"
     UNSUPPORTED_MANIFEST_SCHEMA = "unsupported_manifest_schema"
     INVALID_UPDATE_PREFERENCES = "invalid_update_preferences"
+    DATA_COMPATIBILITY_BLOCKED = "data_compatibility_blocked"
 
 
 class UpdateValidationError(ValueError):
@@ -179,6 +181,20 @@ class ReleaseManifest:
     version: SemanticVersion
     git_ref: str
     release_notes: str
+    data_compatibility: "DataCompatibility"
+
+
+@dataclass(frozen=True)
+class DataCompatibility:
+    database_schema_version: str
+    data_layout_version: int
+    data_mutation_required: bool
+
+    @property
+    def data_neutral(self) -> bool:
+        return (self.database_schema_version == SCHEMA_VERSION
+                and self.data_layout_version == DATA_LAYOUT_VERSION
+                and not self.data_mutation_required)
 
 
 @dataclass(frozen=True)
@@ -238,12 +254,19 @@ def parse_release_manifest(value: object) -> ManifestValidationResult:
         release = SemanticVersion.parse(value["version"])
         if not release.is_stable:
             raise UpdateValidationError("manifest version must be a stable release")
+        compatibility = value["data_compatibility"]
+        if not isinstance(compatibility, Mapping) or set(compatibility) != {"database_schema_version", "data_layout_version", "data_mutation_required"}:
+            raise UpdateValidationError("invalid data compatibility metadata")
+        db_schema, layout, mutation = compatibility.values()
+        if not isinstance(db_schema, str) or not db_schema or isinstance(layout, bool) or not isinstance(layout, int) or not isinstance(mutation, bool):
+            raise UpdateValidationError("invalid data compatibility metadata")
         return ManifestValidationResult(
             ReleaseManifest(
                 schema,
                 release,
                 _git_ref(value["git_ref"]),
                 _release_notes_path(value["release_notes"]),
+                DataCompatibility(db_schema, layout, mutation),
             )
         )
     except UpdateValidationError as exc:
@@ -292,6 +315,8 @@ def decide_update(
     except UpdateValidationError as exc:
         return UpdateDecision(DecisionReason.INVALID_INSTALLED_VERSION, parsed.manifest, str(exc))
     remote = parsed.manifest.version
+    if not parsed.manifest.data_compatibility.data_neutral:
+        return UpdateDecision(DecisionReason.DATA_COMPATIBILITY_BLOCKED, parsed.manifest)
     if remote.compare(installed) <= 0:
         return UpdateDecision(DecisionReason.REMOTE_NOT_NEWER, parsed.manifest)
     if prefs.ignore_patch_updates and remote.major == installed.major and remote.minor == installed.minor:

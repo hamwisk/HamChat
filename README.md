@@ -2,7 +2,7 @@
 
 HamChat is a local-first Linux desktop application for talking to large language models. It combines private, Ollama-focused chat with multiple user accounts, AI Profiles, persistent memory, image-capable conversations, model-aware context planning, and safe application updates in a comfortable PyQt6 interface.
 
-**Current release: HamChat 2.7.0**
+**Current release: HamChat 2.7.1**
 
 HamChat is a complete working application under active development. Linux is its primary and currently tested platform.
 
@@ -62,7 +62,7 @@ Compatible models can display transient reasoning output in a dedicated, collaps
 
 ### Safe automatic updates
 
-HamChat 2.7.0 introduces a verified system-file updater with four menu actions:
+HamChat 2.7.1 introduces a verified system-file updater with four menu actions:
 
 - **Off**
 - **Ask Before Installing**
@@ -73,7 +73,7 @@ Updates are checked after the splash screen appears and before normal database a
 
 Installation is journaled and supports rollback and interrupted-update recovery. The updater manages declared HamChat system files only: it does not install into `data/` or `settings/`, and it blocks updates that require an incompatible database schema, data layout, or data migration.
 
-Installations older than 2.7.0 require one final manual update before they can use this system.
+Installations older than 2.7.1 require one final manual update before they can use this system.
 
 ## Requirements
 
@@ -137,7 +137,7 @@ You should still keep an independent backup of important user data. Automatic up
 
 ## Release notes
 
-See [`updates/2.7.0.md`](updates/2.7.0.md) for the complete HamChat 2.7.0 release notes.
+See [`updates/2.7.1.md`](updates/2.7.1.md) for the complete HamChat 2.7.1 release notes.
 
 ## Future possibilities
 

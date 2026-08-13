@@ -24,9 +24,9 @@ _SEMVER = re.compile(
     r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 _FIELDS = frozenset(
-    ("schema_version", "version", "git_ref", "release_notes", "data_compatibility")
+    ("schema_version", "version", "git_ref", "release_notes", "data_compatibility", "release_payload")
 )
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 DEFAULT_MANIFEST_URL = (
     "https://raw.githubusercontent.com/hamwisk/HamChat/main/"
     "updates/latest.json"
@@ -182,6 +182,7 @@ class ReleaseManifest:
     git_ref: str
     release_notes: str
     data_compatibility: "DataCompatibility"
+    release_payload: "ReleasePayload"
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,28 @@ class DataCompatibility:
         return (self.database_schema_version == SCHEMA_VERSION
                 and self.data_layout_version == DATA_LAYOUT_VERSION
                 and not self.data_mutation_required)
+
+
+@dataclass(frozen=True)
+class ManagedReleaseFile:
+    """One system-owned regular file in an immutable release payload."""
+
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ReleasePayload:
+    """Pinned archive and the exhaustive system-file inventory it may stage."""
+
+    url: str
+    archive_format: str
+    size: int
+    sha256: str
+    root_prefix: str
+    files: tuple[ManagedReleaseFile, ...]
+    removals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -236,6 +259,93 @@ def _git_ref(value: object) -> str:
     return text
 
 
+def _sha256(value: object, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise UpdateValidationError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _managed_path(value: object, field: str) -> str:
+    text = _text(value, field)
+    path = PurePosixPath(text)
+    if ("\\" in text or ":" in text or path.as_posix() != text or path.is_absolute() or not path.parts
+            or any(part in {".", ".."} for part in path.parts)
+            or path.parts[0] in {"data", "settings", ".git", ".staging", "journals", "bundles"}):
+        raise UpdateValidationError(f"{field} is not a managed system path")
+    return text
+
+
+def _release_payload(value: object, version: SemanticVersion, git_ref: str) -> ReleasePayload:
+    if not isinstance(value, Mapping):
+        raise UpdateValidationError("release_payload must be an object")
+    required = {"url", "format", "size", "sha256", "root_prefix", "files", "removals"}
+    if set(value) != required:
+        raise UpdateValidationError("release_payload fields invalid")
+    url = _valid_https_url(value["url"])
+    if url is None:
+        raise UpdateValidationError("release_payload URL must be clean HTTPS")
+    parsed = urlsplit(url)
+    # The manifest's immutable ref must be visible in the archive URL.  This
+    # rejects mutable branch archives without hard-coding a single mirror.
+    if not any(part == git_ref or part.startswith(f"{git_ref}.") for part in parsed.path.split("/")):
+        raise UpdateValidationError("release_payload URL is not bound to git_ref")
+    archive_format = value["format"]
+    if archive_format != "zip":
+        raise UpdateValidationError("unsupported release archive format")
+    size = value["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= 1024 * 1024 * 1024:
+        raise UpdateValidationError("release_payload size is invalid")
+    root_prefix = _text(value["root_prefix"], "release_payload root_prefix")
+    if "/" in root_prefix or "\\" in root_prefix or ":" in root_prefix or root_prefix in {".", ".."}:
+        raise UpdateValidationError("release_payload root_prefix is invalid")
+    files = value["files"]
+    if not isinstance(files, list) or not files:
+        raise UpdateValidationError("release_payload files must be a non-empty list")
+    parsed_files: list[ManagedReleaseFile] = []
+    seen: set[str] = set()
+    seen_folded: set[str] = set()
+    for item in files:
+        if not isinstance(item, Mapping) or set(item) != {"path", "size", "sha256"}:
+            raise UpdateValidationError("invalid release managed file")
+        path = _managed_path(item["path"], "release_payload file path")
+        file_size = item["size"]
+        if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 0:
+            raise UpdateValidationError("release_payload file size is invalid")
+        if path in seen or path.casefold() in seen_folded:
+            raise UpdateValidationError("release_payload file paths collide")
+        seen.add(path); seen_folded.add(path.casefold())
+        parsed_files.append(ManagedReleaseFile(path, file_size, _sha256(item["sha256"], "release_payload file digest")))
+    removals = value["removals"]
+    if not isinstance(removals, list) or any(not isinstance(item, str) for item in removals):
+        raise UpdateValidationError("release_payload removals must be a list")
+    parsed_removals = tuple(_managed_path(item, "release_payload removal") for item in removals)
+    if len(set(parsed_removals)) != len(parsed_removals) or set(parsed_removals) & seen:
+        raise UpdateValidationError("release_payload removals collide")
+    # The current executor has no removal operation.  Rejecting this in the
+    # trusted manifest prevents absence from becoming implicit deletion.
+    if parsed_removals:
+        raise UpdateValidationError("release_payload removals are not supported")
+    return ReleasePayload(url, archive_format, size, _sha256(value["sha256"], "release_payload digest"), root_prefix, tuple(parsed_files), parsed_removals)
+
+
+def release_manifest_digest(manifest: ReleaseManifest) -> str:
+    """Stable identity for binding a staged release to its trusted manifest."""
+    payload = {
+        "schema_version": manifest.schema_version, "version": str(manifest.version),
+        "git_ref": manifest.git_ref, "release_notes": manifest.release_notes,
+        "data_compatibility": manifest.data_compatibility.__dict__,
+        "release_payload": {
+            "url": manifest.release_payload.url, "format": manifest.release_payload.archive_format,
+            "size": manifest.release_payload.size, "sha256": manifest.release_payload.sha256,
+            "root_prefix": manifest.release_payload.root_prefix,
+            "files": [file.__dict__ for file in manifest.release_payload.files],
+            "removals": list(manifest.release_payload.removals),
+        },
+    }
+    import hashlib
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def parse_release_manifest(value: object) -> ManifestValidationResult:
     try:
         if not isinstance(value, Mapping):
@@ -267,6 +377,7 @@ def parse_release_manifest(value: object) -> ManifestValidationResult:
                 _git_ref(value["git_ref"]),
                 _release_notes_path(value["release_notes"]),
                 DataCompatibility(db_schema, layout, mutation),
+                _release_payload(value["release_payload"], release, _git_ref(value["git_ref"])),
             )
         )
     except UpdateValidationError as exc:

@@ -4,7 +4,8 @@ from hamchat.updates import parse_release_manifest
 
 
 def release():
-    return parse_release_manifest({"schema_version": 1, "version": "2.7.0", "git_ref": "v2.7.0", "release_notes": "updates/2.7.0.md", "data_compatibility": {"database_schema_version": "2026-08-03.2", "data_layout_version": 1, "data_mutation_required": False}}).manifest
+    payload = b"release"; managed = b"managed"
+    return parse_release_manifest({"schema_version": 2, "version": "2.7.0", "git_ref": "v2.7.0", "release_notes": "updates/2.7.0.md", "data_compatibility": {"database_schema_version": "2026-08-03.2", "data_layout_version": 1, "data_mutation_required": False}, "release_payload": {"url": "https://example.test/archive/v2.7.0.zip", "format": "zip", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "root_prefix": "HamChat-v2.7.0", "files": [{"path": "hamchat/a.py", "size": len(managed), "sha256": hashlib.sha256(managed).hexdigest()}], "removals": []}}).manifest
 
 
 def test_system_only_executor_preserves_data_and_updates_managed_file(tmp_path):

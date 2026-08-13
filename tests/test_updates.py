@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from urllib.error import HTTPError
 
 import pytest
@@ -22,12 +23,23 @@ from hamchat.updates import (
 
 
 def manifest(version="2.7.0", **changes):
+    payload = b"placeholder release payload"
+    managed = b"placeholder managed file"
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "version": version,
         "git_ref": f"v{version}",
         "release_notes": "updates/2.7.0.md",
         "data_compatibility": {"database_schema_version": "2026-08-03.2", "data_layout_version": 1, "data_mutation_required": False},
+        "release_payload": {
+            "url": f"https://example.test/archive/v{version}.zip",
+            "format": "zip",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "root_prefix": f"HamChat-v{version}",
+            "files": [{"path": "hamchat/example.py", "size": len(managed), "sha256": hashlib.sha256(managed).hexdigest()}],
+            "removals": [],
+        },
     }
     value.update(changes)
     return value
@@ -181,7 +193,24 @@ def test_manifest_structure_and_future_schema_are_controlled():
     del incomplete["git_ref"]
     assert parse_release_manifest(incomplete).reason is DecisionReason.INVALID_MANIFEST
     assert parse_release_manifest(manifest(extra="no")).reason is DecisionReason.INVALID_MANIFEST
-    assert parse_release_manifest(manifest(schema_version=2)).reason is DecisionReason.UNSUPPORTED_MANIFEST_SCHEMA
+    assert parse_release_manifest(manifest(schema_version=3)).reason is DecisionReason.UNSUPPORTED_MANIFEST_SCHEMA
+
+
+@pytest.mark.parametrize(
+    "payload_change",
+    [
+        {"url": "http://example.test/archive/v2.7.0.zip"},
+        {"url": "https://example.test/archive/main.zip"},
+        {"format": "tar"},
+        {"files": []},
+        {"files": [{"path": "data/x", "size": 1, "sha256": "0" * 64}]},
+        {"removals": ["hamchat/old.py"]},
+    ],
+)
+def test_release_payload_descriptor_is_strict(payload_change):
+    value = manifest()
+    value["release_payload"].update(payload_change)
+    assert parse_release_manifest(value).reason is DecisionReason.INVALID_MANIFEST
 
 
 def test_preferences_accept_missing_and_unknown_keys_without_mutating_input():

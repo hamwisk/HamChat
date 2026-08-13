@@ -7,7 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 
-from .updates import ReleaseManifest
+from .updates import ReleaseManifest, release_manifest_digest
 from .update_preservation import _atomic_json, _digest_bytes, _canonical
 
 
@@ -62,7 +62,9 @@ def _journal_path(root: Path) -> Path:
 
 def prepare_system_install(candidate: VerifiedStagedCandidate, transaction_root: Path) -> None:
     """Durably bind candidate inventory before any installation mutation."""
-    if not candidate.data_preservation_not_required:
+    # This is derived from trusted candidate metadata, never from the
+    # descriptive boolean retained on VerifiedStagedCandidate for results.
+    if not candidate.manifest.data_compatibility.data_neutral:
         raise ValueError("not data neutral")
     records = []
     for path, digest in candidate.artifacts:
@@ -70,7 +72,7 @@ def prepare_system_install(candidate: VerifiedStagedCandidate, transaction_root:
         if not _safe_path(path) or not source.is_file() or source.is_symlink() or _digest_bytes(source.read_bytes()) != digest:
             raise ValueError("unsafe staged artifact")
         records.append({"ordinal": len(records), "path": path, "new": digest, "old": None, "checkpoint": "planned"})
-    _atomic_json(_journal_path(transaction_root), {"transaction": candidate.transaction_id, "staging": str(candidate.staging_root.resolve()), "state": _AUTHORIZED, "files": records})
+    _atomic_json(_journal_path(transaction_root), {"transaction": candidate.transaction_id, "staging": str(candidate.staging_root.resolve()), "manifest_digest": release_manifest_digest(candidate.manifest), "state": _AUTHORIZED, "files": records})
 
 
 def _state(path):
@@ -98,7 +100,8 @@ def _load(root: Path, candidate: VerifiedStagedCandidate) -> dict | None:
     try:
         import json
         value = json.loads(_journal_path(root).read_text())
-        if value["transaction"] != candidate.transaction_id or value["staging"] != str(candidate.staging_root.resolve()): return None
+        if (value["transaction"] != candidate.transaction_id or value["staging"] != str(candidate.staging_root.resolve())
+                or value["manifest_digest"] != release_manifest_digest(candidate.manifest)): return None
         if value["state"] not in {_AUTHORIZED, _STARTED, _VERIFIED, _COMPLETED, _ROLLBACK_REQUIRED, _ROLLBACK_STARTED, _ROLLBACK_VERIFIED, _MANUAL}: return None
         return value
     except (OSError, ValueError, KeyError, TypeError): return None

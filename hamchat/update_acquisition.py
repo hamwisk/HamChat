@@ -141,8 +141,12 @@ def _safe_member_name(name: str, prefix: str) -> str | None:
     if len(path.parts) == 1:
         return ""
     relative = "/".join(path.parts[1:])
-    if (any(":" in part for part in path.parts)
-            or relative.split("/", 1)[0] in {"data", "settings", ".git", ".staging", "journals", "bundles"}):
+    # This validates archive structure only.  Authorization remains at the
+    # manifest boundary: ``_managed_path`` forbids protected roots such as
+    # ``settings`` and ``data`` from the trusted installation inventory.  A
+    # normal tagged source ZIP may legitimately contain undeclared regular
+    # files below those roots; they are inspected but never staged.
+    if any(":" in part for part in path.parts):
         return None
     return relative
 

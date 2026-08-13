@@ -9,11 +9,14 @@ exhaustive list of managed regular files (`path`, `size`, and SHA-256).
 The descriptor is an allowlist, not a request to copy an archive wholesale.
 The acquirer streams the archive into a private transaction root, validates its
 outer digest, rejects unsafe ZIP metadata, and stages only the declared files.
+Safe undeclared regular files and directories may be present in a tagged source
+archive; they are structurally inspected but are never extracted or installed.
 It independently verifies staged bytes, then creates the existing system
 installation journal binding the transaction, staging root, and inventory.
 
 `data/`, `settings/`, registries, `.git`, and transaction metadata are never
-managed payload paths.  Empty inventory entries do not delete prior files;
+managed payload paths, even when safe undeclared copies exist in an archive.
+Empty inventory entries do not delete prior files;
 the current system-file executor deliberately rejects manifest removals until
 it has an explicitly verified removal operation.
 

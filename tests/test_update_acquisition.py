@@ -41,12 +41,26 @@ class Transport:
         return self.response
 
 
-def archive(entries: dict[str, bytes], *, special: str | None = None) -> bytes:
+class FixtureTransport:
+    """Test-only transport that exposes exactly one captured public URL."""
+    def __init__(self, url: str, archive_path: Path):
+        self.url, self.archive_path, self.calls = url, archive_path, []
+
+    def open(self, url: str, timeout: float):
+        self.calls.append((url, timeout))
+        if url != self.url:
+            raise AssertionError("unexpected URL")
+        response = Response(self.archive_path.read_bytes())
+        response.geturl = lambda: url
+        return response
+
+
+def archive(entries: dict[str, bytes] | list[tuple[str, bytes]], *, special: str | None = None, special_name: str | None = None) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zipped:
-        for name, content in entries.items():
+        for name, content in entries.items() if isinstance(entries, dict) else entries:
             info = zipfile.ZipInfo(name)
-            if special:
+            if special and (special_name is None or special_name == name):
                 info.external_attr = (special == "symlink") and ((stat.S_IFLNK | 0o777) << 16) or ((stat.S_IFIFO | 0o600) << 16)
             zipped.writestr(info, content)
     return output.getvalue()
@@ -102,9 +116,10 @@ def test_acquires_stages_binds_and_hands_off_to_executor(tmp_path):
     ("entries", "code"),
     [
         ({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/../escape": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
+        ({"HamChat-v2.7.0/hamchat/a.py": b"x", "/absolute/escape": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
         ({"HamChat-v2.7.0/hamchat/a.py": b"x", "other/a.py": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
         ({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/C:/escape": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
-        ({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/data/escape": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
+        ({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/hamchat\\escape.py": b"x"}, AcquisitionCode.UNSAFE_ARCHIVE_MEMBER),
         ({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/hamchat/A.py": b"x"}, AcquisitionCode.PATH_COLLISION),
     ],
 )
@@ -148,6 +163,90 @@ def test_digest_mismatch_and_user_owned_inventory_are_refused(tmp_path):
     assert acquire_verified_candidate(request(tmp_path, bad), transport=Transport(Response(payload))).failure.code is AcquisitionCode.PAYLOAD_DIGEST_MISMATCH
     value["release_payload"]["files"][0]["path"] = "data/evil"
     assert parse_release_manifest(value).manifest is None
+    value["release_payload"]["files"][0]["path"] = "settings/app.json"
+    assert parse_release_manifest(value).manifest is None
+
+
+def test_safe_undeclared_protected_source_files_are_never_staged(tmp_path):
+    files = {"hamchat/a.py": b"managed"}
+    payload = archive({
+        "HamChat-v2.7.0/hamchat/a.py": b"managed",
+        "HamChat-v2.7.0/settings/": b"",
+        "HamChat-v2.7.0/settings/app.json": b"user settings",
+        "HamChat-v2.7.0/data/": b"",
+        "HamChat-v2.7.0/data/ignored.db": b"never touched",
+        "HamChat-v2.7.0/tests/test_example.py": b"test-only",
+        "HamChat-v2.7.0/docs/guide.md": b"documentation",
+    })
+    manifest = manifest_for(payload, files)
+    req = request(tmp_path, manifest)
+    result = acquire_verified_candidate(req, transport=Transport(Response(payload)))
+    assert result.succeeded and result.candidate is not None
+    stage = result.candidate.staging_root
+    assert (stage / "hamchat/a.py").read_bytes() == b"managed"
+    for path in ("settings", "data", "tests", "docs"):
+        assert not (stage / path).exists()
+        assert not (req.transaction_root / "rollback" / path).exists()
+    assert not (req.data_root / "ignored.db").exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_unsafe_protected_members_are_rejected_even_when_undeclared(tmp_path, kind):
+    payload = archive(
+        {"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/settings/app.json": b"x"},
+        special=kind,
+        special_name="HamChat-v2.7.0/settings/app.json",
+    )
+    manifest = manifest_for(payload, {"hamchat/a.py": b"x"})
+    result = acquire_verified_candidate(request(tmp_path, manifest), transport=Transport(Response(payload)))
+    assert result.failure and result.failure.code is AcquisitionCode.UNSAFE_ARCHIVE_MEMBER
+
+
+def test_undeclared_duplicate_and_size_limit_are_still_rejected(tmp_path):
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        duplicated = archive([
+            ("HamChat-v2.7.0/hamchat/a.py", b"x"),
+            ("HamChat-v2.7.0/settings/app.json", b"one"),
+            ("HamChat-v2.7.0/settings/app.json", b"two"),
+        ])
+    manifest = manifest_for(duplicated, {"hamchat/a.py": b"x"})
+    result = acquire_verified_candidate(request(tmp_path, manifest), transport=Transport(Response(duplicated)))
+    assert result.failure and result.failure.code is AcquisitionCode.PATH_COLLISION
+    oversized = archive({"HamChat-v2.7.0/hamchat/a.py": b"x", "HamChat-v2.7.0/settings/large.json": b"123"})
+    manifest = manifest_for(oversized, {"hamchat/a.py": b"x"})
+    result = acquire_verified_candidate(
+        request(tmp_path, manifest, transaction="txn-undeclared-size-0001", max_member_bytes=2),
+        transport=Transport(Response(oversized)),
+    )
+    assert result.failure and result.failure.code is AcquisitionCode.UNSAFE_ARCHIVE_MEMBER
+
+
+def test_captured_public_tag_zip_stages_conservative_inventory(tmp_path):
+    archive_path = Path("/tmp/hamchat-release-verification.3yNhSQ/archive-1.zip")
+    if not archive_path.is_file():
+        pytest.skip("captured public v2.7.0 archive fixture is unavailable")
+    public_url = "https://codeload.github.com/hamwisk/HamChat/zip/refs/tags/v2.7.0"
+    with zipfile.ZipFile(archive_path) as zipped:
+        selected = {path: zipped.read(f"HamChat-2.7.0/{path}") for path in ("main.py", "hamchat/__init__.py", "hamchat/app.py", "hamchat/ui/logo.png")}
+    payload = archive_path.read_bytes()
+    raw = {
+        "schema_version": 2, "version": "2.7.0", "git_ref": "v2.7.0", "release_notes": "updates/2.7.0.md",
+        "data_compatibility": {"database_schema_version": "2026-08-03.2", "data_layout_version": 1, "data_mutation_required": False},
+        "release_payload": {
+            "url": public_url, "format": "zip", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "root_prefix": "HamChat-2.7.0",
+            "files": [{"path": path, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()} for path, content in sorted(selected.items())],
+            "removals": [],
+        },
+    }
+    manifest = parse_release_manifest(raw).manifest
+    assert manifest is not None
+    req = request(tmp_path, manifest, transaction="txn-public-0001")
+    result = acquire_verified_candidate(req, transport=FixtureTransport(public_url, archive_path))
+    assert result.succeeded and result.candidate is not None
+    assert {path for path, _ in result.candidate.artifacts} == set(selected)
+    assert not (result.candidate.staging_root / "settings").exists()
+    assert not (result.candidate.staging_root / "data").exists()
 
 
 def test_manifest_and_transaction_binding_refuse_forged_request(tmp_path):

@@ -205,13 +205,15 @@ def main() -> int:
     try:
         # --- heavy init (skip for SNOUT/agent) ---
         if needs_local_init(mode):
-            from .db_init import ensure_database_ready
             from .settings import load_settings, set_admin_presence
             from .db_ops import open_by_detection, probe_admin_exists
-            log.info("Initializing secure database...")
-            if ensure_database_ready(data_dir, update_settings=True) != 0:
+
+            log.info("Initializing database...")
+            try:
+                conn, db_mode = open_by_detection(data_dir)
+            except Exception:
                 splash.close()
-                log.error("Database initialization failed. Aborting.")
+                log.exception("Database initialization failed. Aborting.")
                 return 1
 
             log.info("Loading configuration and models...")
@@ -220,8 +222,6 @@ def main() -> int:
             registry = refresh_registry()
             log.info("Models available: %d", sum(1 for m in registry["models"] if m["available"]))
 
-            # Re-load settings to pick up db_mode that init may have written
-            conn, db_mode = open_by_detection(data_dir)
             has_admin: bool | None = None
             try:
                 has_admin = probe_admin_exists(conn)  # returns True/False

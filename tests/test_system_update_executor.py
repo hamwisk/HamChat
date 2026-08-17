@@ -2,7 +2,7 @@ import hashlib
 import json
 import stat
 
-from hamchat.system_update_executor import SystemUpdateStatus, VerifiedStagedCandidate, install_system_files, install_verified_candidate, prepare_system_install, recover_system_install
+from hamchat.system_update_executor import SystemUpdateCode, SystemUpdateStatus, VerifiedStagedCandidate, install_system_files, install_verified_candidate, prepare_system_install, recover_pending_system_installs, recover_system_install
 from hamchat.updates import parse_release_manifest
 
 
@@ -35,9 +35,9 @@ def test_verified_staging_binds_transaction_and_digest(tmp_path):
     candidate = VerifiedStagedCandidate("tx-0000001", staged, release(), (("hamchat/a.py", hashlib.sha256(payload).hexdigest()),), True)
     prepare_system_install(candidate, txn)
     assert install_verified_candidate(candidate=candidate, installation_root=install, data_root=data, transaction_root=txn).status is SystemUpdateStatus.INSTALLED
+    assert not txn.exists()
     (staged / "hamchat/a.py").write_bytes(b"changed")
     assert install_verified_candidate(candidate=candidate, installation_root=install, data_root=data, transaction_root=txn).status is SystemUpdateStatus.BLOCKED
-    assert recover_system_install(candidate=candidate, transaction_root=txn).status is SystemUpdateStatus.INSTALLED
 
 
 def test_verified_install_preserves_existing_executable_mode(tmp_path):
@@ -90,3 +90,65 @@ def test_rollback_restores_original_bytes_and_mode(tmp_path):
     assert recover_system_install(candidate=candidate, transaction_root=txn, installation_root=install).status is SystemUpdateStatus.ROLLED_BACK
     assert target.read_bytes() == b"old"
     assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert not txn.exists()
+
+
+def _journal(state, files=None):
+    return {"transaction": "tx", "staging": "/tmp/staging", "manifest_digest": "0" * 64, "state": state, "files": files or []}
+
+
+def _write_journal(parent, name, journal):
+    root = parent / name; root.mkdir()
+    (root / "system-install.json").write_text(json.dumps(journal))
+    return root
+
+
+def test_multiple_completed_journals_are_retired_without_blocking(tmp_path):
+    first = _write_journal(tmp_path, "tx-first", _journal("completed"))
+    second = _write_journal(tmp_path, "tx-second", _journal("system_rollback_verified"))
+    assert recover_pending_system_installs(transaction_parent=tmp_path, installation_root=tmp_path / "install") is None
+    assert not first.exists() and not second.exists()
+
+
+def test_one_unfinished_journal_recovers_after_completed_journals_retire(tmp_path):
+    install = tmp_path / "install"; (install / "hamchat").mkdir(parents=True)
+    target = install / "hamchat/a.py"; target.write_bytes(b"new")
+    old = hashlib.sha256(b"old").hexdigest(); new = hashlib.sha256(b"new").hexdigest()
+    active = _write_journal(tmp_path, "tx-active", _journal("system_install_started", [{"path": "hamchat/a.py", "new": new, "old": old, "rollback": "rollback/hamchat/a.py"}]))
+    backup = active / "rollback/hamchat/a.py"; backup.parent.mkdir(parents=True); backup.write_bytes(b"old")
+    completed = _write_journal(tmp_path, "tx-completed", _journal("completed"))
+    result = recover_pending_system_installs(transaction_parent=tmp_path, installation_root=install)
+    assert result.status is SystemUpdateStatus.ROLLED_BACK
+    assert target.read_bytes() == b"old"
+    assert not active.exists() and not completed.exists()
+
+
+def test_multiple_unfinished_journals_remain_blocked(tmp_path):
+    first = _write_journal(tmp_path, "tx-first", _journal("system_install_started", [{"path": "a", "new": "0" * 64, "old": None}]))
+    second = _write_journal(tmp_path, "tx-second", _journal("system_rollback_required", [{"path": "b", "new": "0" * 64, "old": None}]))
+    result = recover_pending_system_installs(transaction_parent=tmp_path, installation_root=tmp_path / "install")
+    assert result.status is SystemUpdateStatus.BLOCKED and result.code is SystemUpdateCode.JOURNAL_INVALID
+    assert first.exists() and second.exists()
+
+
+def test_malformed_or_unknown_journals_remain_blocked(tmp_path):
+    malformed = _write_journal(tmp_path, "tx-malformed", {"state": "completed"})
+    result = recover_pending_system_installs(transaction_parent=tmp_path, installation_root=tmp_path / "install")
+    assert result.status is SystemUpdateStatus.BLOCKED and result.code is SystemUpdateCode.JOURNAL_INVALID
+    assert malformed.exists()
+    unknown_parent = tmp_path / "unknown"; unknown_parent.mkdir()
+    unknown = _write_journal(unknown_parent, "tx-unknown", _journal("future_unknown_state"))
+    result = recover_pending_system_installs(transaction_parent=unknown_parent, installation_root=tmp_path / "install")
+    assert result.status is SystemUpdateStatus.BLOCKED and result.code is SystemUpdateCode.JOURNAL_INVALID
+    assert unknown.exists()
+
+
+def test_cleanup_refuses_symlinked_or_symlink_parent_transactions(tmp_path):
+    outside = tmp_path / "outside"; outside.mkdir()
+    _write_journal(outside, "tx-outside", _journal("completed"))
+    (tmp_path / "tx-link").symlink_to(outside / "tx-outside", target_is_directory=True)
+    result = recover_pending_system_installs(transaction_parent=tmp_path, installation_root=tmp_path / "install")
+    assert result.status is SystemUpdateStatus.BLOCKED and (outside / "tx-outside").exists()
+    linked_parent = tmp_path / "linked-parent"; linked_parent.symlink_to(outside, target_is_directory=True)
+    result = recover_pending_system_installs(transaction_parent=linked_parent, installation_root=tmp_path / "install")
+    assert result.status is SystemUpdateStatus.BLOCKED

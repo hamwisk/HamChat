@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
+import json
 
 from .updates import ReleaseManifest, release_manifest_digest
 from .update_preservation import _atomic_json, _digest_bytes, _canonical
@@ -55,10 +56,78 @@ _ROLLBACK_REQUIRED = "system_rollback_required"
 _ROLLBACK_STARTED = "system_rollback_started"
 _ROLLBACK_VERIFIED = "system_rollback_verified"
 _MANUAL = "manual_recovery_required"
+_TERMINAL_STATES = {_AUTHORIZED, _COMPLETED, _ROLLBACK_VERIFIED}
+_RECOVERABLE_STATES = {_STARTED, _VERIFIED, _ROLLBACK_REQUIRED, _ROLLBACK_STARTED}
 
 
 def _journal_path(root: Path) -> Path:
     return root / "system-install.json"
+
+
+def _is_regular(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _is_safe_transaction_root(root: Path, parent: Path) -> bool:
+    """Require a direct, non-symlink child of the transaction parent."""
+    try:
+        parent_stat = os.stat(parent, follow_symlinks=False)
+        root_stat = os.stat(root, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(parent_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        return False
+    try:
+        return root.parent == parent and root.resolve().parent == parent.resolve()
+    except OSError:
+        return False
+
+
+def _valid_journal(value: object) -> bool:
+    """Validate recovery data before it may be classified or discarded."""
+    if not isinstance(value, dict):
+        return False
+    def digest(item: object) -> bool:
+        return isinstance(item, str) and len(item) == 64 and all(char in "0123456789abcdef" for char in item)
+
+    if (not isinstance(value.get("transaction"), str) or not value["transaction"]
+            or not isinstance(value.get("staging"), str)
+            or not digest(value.get("manifest_digest"))
+            or value.get("state") not in _TERMINAL_STATES | _RECOVERABLE_STATES | {_MANUAL}
+            or not isinstance(value.get("files"), list)):
+        return False
+    for item in value["files"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                or not _safe_path(item["path"])
+                or not digest(item.get("new"))
+                or item.get("old") is not None and not digest(item["old"])):
+            return False
+        rollback = item.get("rollback")
+        if rollback is not None and (not isinstance(rollback, str) or not _safe_path(rollback)):
+            return False
+        mode = item.get("old_mode")
+        if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
+            return False
+    return True
+
+
+def _retire_transaction(root: Path, parent: Path) -> bool:
+    """Remove only a validated direct transaction directory, never a link."""
+    if not _is_safe_transaction_root(root, parent):
+        return False
+    try:
+        shutil.rmtree(root)
+    except OSError:
+        return False
+    return not os.path.lexists(root)
+
+
+def _retire_if_safe(root: Path) -> None:
+    """Best-effort retirement after a terminal state is durably recorded."""
+    _retire_transaction(root, root.parent)
 
 
 def prepare_system_install(candidate: VerifiedStagedCandidate, transaction_root: Path) -> None:
@@ -152,7 +221,6 @@ def _prepare_rollback(journal, installation_root, transaction_root):
 
 def _load(root: Path, candidate: VerifiedStagedCandidate) -> dict | None:
     try:
-        import json
         value = json.loads(_journal_path(root).read_text())
         if (value["transaction"] != candidate.transaction_id or value["staging"] != str(candidate.staging_root.resolve())
                 or value["manifest_digest"] != release_manifest_digest(candidate.manifest)): return None
@@ -235,6 +303,7 @@ def install_verified_candidate(*, candidate: VerifiedStagedCandidate, installati
             if _state(target) != item["new"] or _mode(target) != intended_mode: raise ValueError
             item["checkpoint"] = "target_verified"; _save(transaction_root, journal)
         journal["state"] = _VERIFIED; _save(transaction_root, journal); journal["state"] = _COMPLETED; _save(transaction_root, journal)
+        _retire_if_safe(transaction_root)
         return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
     except (OSError, ValueError):
         journal["state"] = _ROLLBACK_REQUIRED; _save(transaction_root, journal)
@@ -244,8 +313,14 @@ def install_verified_candidate(*, candidate: VerifiedStagedCandidate, installati
 def recover_system_install(*, candidate: VerifiedStagedCandidate, transaction_root: Path, installation_root: Path | None = None) -> SystemUpdateResult:
     journal = _load(transaction_root, candidate)
     if journal is None: return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
-    if journal["state"] == _COMPLETED: return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
-    if journal["state"] in {_ROLLBACK_VERIFIED, _MANUAL}: return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK if journal["state"] == _ROLLBACK_VERIFIED else SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY if journal["state"] == _MANUAL else None)
+    if journal["state"] == _COMPLETED:
+        _retire_if_safe(transaction_root)
+        return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
+    if journal["state"] in {_ROLLBACK_VERIFIED, _MANUAL}:
+        if journal["state"] == _ROLLBACK_VERIFIED:
+            _retire_if_safe(transaction_root)
+            return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
     if installation_root is None: return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
     try:
         journal["state"] = _ROLLBACK_STARTED; _save(transaction_root, journal)
@@ -263,40 +338,21 @@ def recover_system_install(*, candidate: VerifiedStagedCandidate, transaction_ro
             if _state(target) != item["old"] or (item["old"] is not None and _mode(target) != old_mode): raise ValueError
             item["checkpoint"] = "rollback_verified"; _save(transaction_root, journal)
         journal["state"] = _ROLLBACK_VERIFIED; _save(transaction_root, journal)
+        _retire_if_safe(transaction_root)
         return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
     except (OSError, ValueError, KeyError):
         journal["state"] = _MANUAL; _save(transaction_root, journal)
         return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
 
 
-def recover_pending_system_installs(*, transaction_parent: Path, installation_root: Path) -> SystemUpdateResult | None:
-    """Recover the one pending system transaction without needing a candidate.
-
-    Startup deliberately runs before manifest discovery.  Recovery therefore
-    uses only the durable, write-ahead journal and rollback artifacts; it does
-    not fetch, parse, or trust a new candidate.
-    """
-    parent = Path(transaction_parent)
-    if not parent.exists():
-        return None
-    journals = sorted(parent.glob("*/system-install.json"))
-    if len(journals) != 1:
-        return None if not journals else SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
-    root = journals[0].parent
+def _recover_pending_journal(root: Path, journal: dict, installation_root: Path) -> SystemUpdateResult:
+    """Roll back one already-validated incomplete journal."""
     try:
-        import json
-        journal = json.loads(journals[0].read_text("utf-8"))
         state = journal["state"]
         files = journal["files"]
-        if state == _COMPLETED:
-            return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
-        if state == _AUTHORIZED:
-            return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
-        if state in {_ROLLBACK_VERIFIED}:
-            return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
         if state == _MANUAL:
             return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
-        if state not in {_STARTED, _VERIFIED, _ROLLBACK_REQUIRED, _ROLLBACK_STARTED}:
+        if state not in _RECOVERABLE_STATES:
             return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
         journal["state"] = _ROLLBACK_STARTED; _save(root, journal)
         for item in reversed(files):
@@ -325,6 +381,7 @@ def recover_pending_system_installs(*, transaction_parent: Path, installation_ro
                 raise ValueError
             item["checkpoint"] = "rollback_verified"; _save(root, journal)
         journal["state"] = _ROLLBACK_VERIFIED; _save(root, journal)
+        _retire_if_safe(root)
         return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
     except (OSError, ValueError, KeyError, TypeError):
         try:
@@ -332,3 +389,54 @@ def recover_pending_system_installs(*, transaction_parent: Path, installation_ro
         except (OSError, UnboundLocalError):
             pass
         return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
+
+
+def recover_pending_system_installs(*, transaction_parent: Path, installation_root: Path) -> SystemUpdateResult | None:
+    """Validate every transaction, retire terminal ones, then recover one.
+
+    Startup deliberately runs before manifest discovery.  Recovery therefore
+    uses only durable journals and rollback artifacts, never fetched metadata.
+    """
+    parent = Path(transaction_parent)
+    try:
+        parent_stat = os.stat(parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+
+    validated: list[tuple[Path, dict]] = []
+    try:
+        entries = sorted(os.scandir(parent), key=lambda entry: entry.name)
+        for entry in entries:
+            root = parent / entry.name
+            root_stat = os.stat(root, follow_symlinks=False)
+            journal_path = _journal_path(root)
+            if stat.S_ISLNK(root_stat.st_mode):
+                if os.path.lexists(journal_path):
+                    return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+                continue
+            if not stat.S_ISDIR(root_stat.st_mode) or not os.path.lexists(journal_path):
+                continue
+            if not _is_safe_transaction_root(root, parent) or not _is_regular(journal_path):
+                return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+            journal = json.loads(journal_path.read_text("utf-8"))
+            if not _valid_journal(journal):
+                return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+            validated.append((root, journal))
+    except (OSError, ValueError, TypeError):
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+
+    terminal = [(root, journal) for root, journal in validated if journal["state"] in _TERMINAL_STATES]
+    unfinished = [(root, journal) for root, journal in validated if journal["state"] not in _TERMINAL_STATES]
+    if any(journal["state"] == _MANUAL for _, journal in unfinished):
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.MANUAL_RECOVERY)
+    if len(unfinished) > 1:
+        return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+    for root, _ in terminal:
+        if not _retire_transaction(root, parent):
+            return SystemUpdateResult(SystemUpdateStatus.BLOCKED, SystemUpdateCode.JOURNAL_INVALID)
+    if not unfinished:
+        return None
+    root, journal = unfinished[0]
+    return _recover_pending_journal(root, journal, Path(installation_root))

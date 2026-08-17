@@ -1,7 +1,7 @@
 # hamchat/constants.py
 
 APP_NAME = "HamChat"
-__version__ = "2.7.2"
+__version__ = "2.7.3"
 SCHEMA_VERSION = "2026-08-03.2"
 DATA_LAYOUT_VERSION = 1
 DEFAULT_LOG_FILENAME = "app.log"

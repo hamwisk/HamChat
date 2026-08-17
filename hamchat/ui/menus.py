@@ -31,6 +31,7 @@ class Menus:
         get_update_mode: Callable[[], str] = lambda: "ask",
         set_update_mode: Callable[[str], None] = lambda _value: None,
         check_updates: Callable[[], None] = lambda: None,
+        show_about: Callable[[], None] = lambda: None,
     ) -> None:
         self.mb = menubar
         self._get_spell_enabled = get_spell_enabled
@@ -53,6 +54,7 @@ class Menus:
         self._get_update_mode = get_update_mode
         self._set_update_mode = set_update_mode
         self._check_updates = check_updates
+        self._show_about = show_about
 
     def build(self) -> None:
         self.mb.clear()
@@ -61,6 +63,11 @@ class Menus:
         self._model_menu()
         self._view_menu()
         self._updates_menu()
+        self._help_menu()
+
+    def _help_menu(self) -> None:
+        menu = self.mb.addMenu("&Help")
+        menu.addAction("About HamChat", self._show_about)
 
     def _updates_menu(self) -> None:
         menu = self.mb.addMenu("&Updates")

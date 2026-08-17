@@ -162,7 +162,7 @@ class UpdateController(QObject):
         elif result.status is RemoteCheckStatus.NO_ELIGIBLE_UPDATE:
             log.info("No eligible update")
         if manual:
-            message = "HamChat is already up to date." if result.status is RemoteCheckStatus.NO_ELIGIBLE_UPDATE else "Update check could not use this release."
+            message = f"HamChat {__version__} is already up to date." if result.status is RemoteCheckStatus.NO_ELIGIBLE_UPDATE else "Update check could not use this release."
             self._message(QMessageBox.Icon.Information if result.status is RemoteCheckStatus.NO_ELIGIBLE_UPDATE else QMessageBox.Icon.Warning, "HamChat updates", message)
         self._finish_check(startup, manual)
 

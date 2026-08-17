@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from hamchat.paths import settings_dir
+from hamchat.constants import APP_NAME, SCHEMA_VERSION, __version__
 from hamchat.infra.llm.ollama_client import OllamaClient
 from hamchat.infra.llm.openai_client import OpenAIClient
 from hamchat.ui.theme import load_shipped_theme, select_variant, apply_theme, export_qml_tokens
@@ -145,6 +146,7 @@ class MainWindow(QMainWindow):
             get_update_mode=(update_controller.mode_value if update_controller else (lambda: "ask")),
             set_update_mode=(update_controller.set_mode if update_controller else (lambda _value: None)),
             check_updates=(update_controller.check_manually if update_controller else (lambda: None)),
+            show_about=self._show_about,
         )
         self.menus.build()
 
@@ -317,6 +319,18 @@ class MainWindow(QMainWindow):
         self._spell_locale = prefs.locale
         self.chat_display.input.set_spell_enabled(self._spell_enabled)
         self.chat_display.input.set_spell_locale(self._spell_locale)
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            (
+                f"<b>{APP_NAME}</b> {__version__}<br>"
+                f"Database schema: {SCHEMA_VERSION}<br><br>"
+                "A local-first desktop chat application.<br>"
+                '<a href="https://github.com/hamwisk/HamChat">github.com/hamwisk/HamChat</a>'
+            ),
+        )
 
     def _wire_signals(self):
         self.side_panel.sig_open_form.connect(self._open_test_form)

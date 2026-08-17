@@ -6,7 +6,7 @@ import time
 import uuid
 import requests
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from .base import ModelClient, ChatMessage, StreamEvent
 from .ollama_planner import RequestTooLargeError, plan_ollama_request
 
@@ -26,6 +26,18 @@ class RuntimeContext:
 
     context_length: int
     source: str  # "runtime" | "cache" | "fallback"
+
+
+@dataclass(frozen=True)
+class UnloadResult:
+    """Outcome of a best-effort unload of currently running Ollama models."""
+
+    loaded_count: int
+    unloaded: tuple[str, ...]
+    failed: tuple[str, ...]
+    skipped: tuple[str, ...]
+    remaining: Optional[tuple[str, ...]]
+    error: Optional[str] = None
 
 
 class OllamaClient(ModelClient):
@@ -520,6 +532,99 @@ class OllamaClient(ModelClient):
         for key in list(self._runtime_context_cache):
             if key[1] == model:
                 del self._runtime_context_cache[key]
+
+    def unload_all_models(
+        self,
+        *,
+        capabilities_for: Optional[Callable[[str], Optional[List[str]]]] = None,
+        timeout: tuple[float, float] = (1, 5),
+    ) -> UnloadResult:
+        """Unload known running models without guessing their Ollama endpoint."""
+        try:
+            running = self._running_models(timeout)
+        except Exception as exc:
+            return UnloadResult(0, (), (), (), None, str(exc))
+        if not running:
+            return UnloadResult(0, (), (), (), ())
+
+        unloaded: list[str] = []
+        failed: list[str] = []
+        skipped: list[str] = []
+        for name in running:
+            reported = capabilities_for(name) if capabilities_for else None
+            capabilities = self._normalize_capabilities(reported)
+            if capabilities is None:
+                capabilities = self._show_capabilities(name, timeout)
+
+            if capabilities is None:
+                skipped.append(name)
+                continue
+            if "completion" in capabilities:
+                endpoint, payload = "/api/generate", {
+                    "model": name, "prompt": "", "stream": False, "keep_alive": 0,
+                }
+            elif "embedding" in capabilities:
+                endpoint, payload = "/api/embed", {
+                    "model": name, "input": "", "keep_alive": 0,
+                }
+            else:
+                skipped.append(name)
+                continue
+            try:
+                response = requests.post(f"{self.base_url}{endpoint}", json=payload, timeout=timeout)
+                response.raise_for_status()
+                unloaded.append(name)
+                self.invalidate_runtime_context(model=name)
+            except Exception as exc:
+                log.warning("Ollama unload failed model=%s endpoint=%s error=%s", name, endpoint, exc)
+                failed.append(name)
+
+        try:
+            remaining = tuple(self._running_models(timeout))
+        except Exception as exc:
+            return UnloadResult(len(running), tuple(unloaded), tuple(failed), tuple(skipped), None, str(exc))
+        still_loaded = set(remaining)
+        verified_unloaded = [name for name in unloaded if name not in still_loaded]
+        for name in unloaded:
+            if name in still_loaded and name not in failed:
+                failed.append(name)
+        return UnloadResult(len(running), tuple(verified_unloaded), tuple(failed), tuple(skipped), remaining)
+
+    def _running_models(self, timeout: tuple[float, float]) -> list[str]:
+        response = requests.get(f"{self.base_url}/api/ps", timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        names: list[str] = []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("model")
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+        return names
+
+    def _show_capabilities(self, model: str, timeout: tuple[float, float]) -> Optional[set[str]]:
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/show", json={"name": model}, timeout=timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            log.warning("Ollama capability lookup failed model=%s error=%s", model, exc)
+            return None
+        return self._normalize_capabilities(payload.get("capabilities") if isinstance(payload, dict) else None)
+
+    @staticmethod
+    def _normalize_capabilities(value: object) -> Optional[set[str]]:
+        if not isinstance(value, list):
+            return None
+        return {
+            capability.strip().lower()
+            for capability in value
+            if isinstance(capability, str) and capability.strip()
+        }
 
     def _runtime_context_cache_key(
         self, model: str, options: Dict,

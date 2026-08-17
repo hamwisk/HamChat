@@ -691,7 +691,13 @@ class MainWindow(QMainWindow):
         from .widgets.model_manager import ModelManager
         models = self.session.get_model_choices()
         current = self.session.get_model_id()
-        panel = ModelManager(self.session, parent=self)
+        def is_generation_active() -> bool:
+            broker = getattr(self.chat_controller, "broker", None)
+            return bool(broker is not None and broker.active_ticket() != -1)
+
+        panel = ModelManager(
+            self.session, parent=self, is_generation_active=is_generation_active,
+        )
 
         def _on_model_activated(mid: str):
             # Switch session + controller to the chosen model

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import itertools
 from typing import Optional, List, Tuple, Dict, Any
 
 from PyQt6.QtCore import (
@@ -11,6 +12,8 @@ from PyQt6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QVariant,
+    QObject,
+    QThread,
     pyqtSignal,
 )
 from PyQt6.QtWidgets import (
@@ -27,6 +30,29 @@ from PyQt6.QtWidgets import (
 )
 
 logger = logging.getLogger(__name__)
+_UNLOAD_JOB_IDS = itertools.count(1)
+_ACTIVE_UNLOAD_JOBS = {}
+
+
+class _UnloadWorker(QObject):
+    done = pyqtSignal(int, object)
+
+    def __init__(self, job_id, client, capabilities_for):
+        super().__init__()
+        self.job_id = job_id
+        self.client = client
+        self.capabilities_for = capabilities_for
+
+    def run(self) -> None:
+        try:
+            result = self.client.unload_all_models(capabilities_for=self.capabilities_for)
+        except Exception as exc:
+            logger.exception("Unexpected Ollama unload worker failure")
+            result = None
+            error = str(exc)
+        else:
+            error = ""
+        self.done.emit(self.job_id, (result, error))
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +219,19 @@ class ModelManager(QWidget):
     sig_close = pyqtSignal()
     sig_model_activated = pyqtSignal(str)
 
-    def __init__(self, session_mgr, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        session_mgr,
+        parent: Optional[QWidget] = None,
+        *,
+        is_generation_active=None,
+        ollama_client=None,
+    ) -> None:
         super().__init__(parent)
         self._session = session_mgr
+        self._is_generation_active = is_generation_active or (lambda: False)
+        self._ollama_client = ollama_client
+        self._unload_busy = False
 
         self._table_model = ModelsTableModel()
         self._proxy = ModelsFilterProxy(self)
@@ -276,6 +312,8 @@ class ModelManager(QWidget):
         self.detail_backend = QLabel("Backend: —", self)
         self.detail_context = QLabel("Context: —", self)
         self.detail_caps = QLabel("Capabilities: —", self)
+        self.unload_status = QLabel("", self)
+        self.unload_status.setWordWrap(True)
         self.context_allocation = QComboBox(self)
         self.context_allocation.addItem("Auto — Ollama default", "auto")
         self.context_allocation.addItem("Low — 4K", "low")
@@ -286,13 +324,21 @@ class ModelManager(QWidget):
         right.addWidget(self.detail_backend)
         right.addWidget(self.detail_context)
         right.addWidget(self.detail_caps)
+        right.addWidget(self.unload_status)
         right.addWidget(QLabel("Runtime context allocation:", self))
         right.addWidget(self.context_allocation)
         right.addStretch(1)
 
         self.btn_activate = QPushButton("Activate model", self)
         self.btn_activate.clicked.connect(self._on_activate_clicked)
-        right.addWidget(self.btn_activate, 0, Qt.AlignmentFlag.AlignRight)
+        self.btn_unload_all = QPushButton("Unload all models", self)
+        self.btn_unload_all.setAccessibleName("Unload all models")
+        self.btn_unload_all.setToolTip("Free Ollama RAM/VRAM. Models reload automatically when next used.")
+        self.btn_unload_all.clicked.connect(self._on_unload_all_clicked)
+        actions = QHBoxLayout()
+        actions.addWidget(self.btn_unload_all)
+        actions.addWidget(self.btn_activate)
+        right.addLayout(actions)
 
         root.addLayout(left, 3)
         root.addLayout(right, 2)
@@ -458,6 +504,70 @@ class ModelManager(QWidget):
         model_id = self._get_current_model_id()
         if model_id:
             self.sig_model_activated.emit(model_id)
+
+    def _on_unload_all_clicked(self) -> None:
+        if self._unload_busy:
+            return
+        try:
+            active = bool(self._is_generation_active())
+        except Exception:
+            active = True
+        if active:
+            self.unload_status.setText("Stop or wait for the current response before unloading models.")
+            return
+
+        from hamchat.infra.llm.ollama_client import OllamaClient
+        self._unload_busy = True
+        self.btn_unload_all.setEnabled(False)
+        self.unload_status.setText("Unloading Ollama models…")
+        client = self._ollama_client or OllamaClient()
+        job_id = next(_UNLOAD_JOB_IDS)
+        thread = QThread()
+        worker = _UnloadWorker(job_id, client, self._known_ollama_capabilities)
+        _ACTIVE_UNLOAD_JOBS[job_id] = (thread, worker)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_unload_finished)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(lambda: _ACTIVE_UNLOAD_JOBS.pop(job_id, None))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _known_ollama_capabilities(self, model_id: str):
+        try:
+            metadata = self._session.get_model_metadata(model_id)
+            capabilities = metadata.get("ollama_capabilities")
+            return capabilities if isinstance(capabilities, list) else None
+        except Exception:
+            return None
+
+    def _on_unload_finished(self, _job_id: int, outcome: object) -> None:
+        self._unload_busy = False
+        self.btn_unload_all.setEnabled(True)
+        result, error = outcome
+        if result is None:
+            self.unload_status.setText(f"Could not unload Ollama models: {error or 'unknown error'}")
+            return
+        if result.error and result.loaded_count == 0:
+            self.unload_status.setText(f"Could not query Ollama models: {result.error}")
+            return
+        if result.loaded_count == 0:
+            self.unload_status.setText("No Ollama models are currently loaded.")
+            return
+        if result.error:
+            self.unload_status.setText(
+                f"Unloaded {len(result.unloaded)} model(s); failed {len(result.failed)}; "
+                f"skipped {len(result.skipped)}. Could not verify remaining models: {result.error}"
+            )
+            return
+        if not result.failed and not result.skipped:
+            self.unload_status.setText(f"Unloaded {len(result.unloaded)} model(s).")
+            return
+        self.unload_status.setText(
+            f"Unloaded {len(result.unloaded)} model(s); failed {len(result.failed)}; "
+            f"skipped {len(result.skipped)}."
+        )
 
     # ------------------------------------------------------------------ #
     # Convenience for external callers

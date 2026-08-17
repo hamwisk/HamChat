@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys, logging, json
 from typing import Optional
 from pathlib import Path
-from PyQt6.QtCore import Qt, QSize, QUrl
+from PyQt6.QtCore import Qt, QSize, QUrl, QTimer
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStatusBar, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         self._chat_page_offset = 0
         self._chat_has_more = False
         self._chat_search_text = ""
+        self._prompt_focus_pending = False
 
         self._build_ui()
         self._wire_signals()
@@ -433,6 +434,32 @@ class MainWindow(QMainWindow):
             self.chat_panel.set_conversation_title(title)
         except Exception:
             pass
+
+    def _focus_prompt_input(self) -> None:
+        """Defer one focus request until a newly active chat has finished updating."""
+        if self._prompt_focus_pending:
+            return
+        try:
+            prompt = self.chat_display.input
+            ready = prompt.isVisible() and prompt.isEnabled() and not prompt.isReadOnly()
+        except Exception:
+            return
+        if not ready:
+            return
+
+        self._prompt_focus_pending = True
+
+        def focus_when_ready() -> None:
+            self._prompt_focus_pending = False
+            try:
+                prompt = self.chat_display.input
+                ready = prompt.isVisible() and prompt.isEnabled() and not prompt.isReadOnly()
+            except Exception:
+                return
+            if ready:
+                prompt.setFocus(Qt.FocusReason.OtherFocusReason)
+
+        QTimer.singleShot(0, focus_when_ready)
 
     def toggle_left_panel(self):
         self._left_open = not self._left_open
@@ -1254,6 +1281,7 @@ class MainWindow(QMainWindow):
             self.chat_controller.load_conversation(int(conv_id), msgs)
         except Exception as e:
             log.exception("chat_controller.load_conversation failed: %s", e)
+            return
 
         # Update right-hand chat panel "Created" timestamp from first message
         if msgs:
@@ -1277,6 +1305,7 @@ class MainWindow(QMainWindow):
             self.side_panel.set_active_chat(conv_id)
         except Exception:
             pass
+        self._focus_prompt_input()
 
     def _new_chat(self, system_call: bool=False) -> bool:
         """
@@ -1297,6 +1326,9 @@ class MainWindow(QMainWindow):
             for m in msgs
         )
         if not has_user_msgs:
+            # This is already an empty, active new-chat state; restore the
+            # prompt after a sidebar/menu action moved focus away from it.
+            self._focus_prompt_input()
             return False
 
         # 2) If this chat is already saved in the DB, just clear it – nothing is lost
@@ -1315,6 +1347,7 @@ class MainWindow(QMainWindow):
                 self.side_panel.set_active_chat(None)
             except Exception:
                 pass
+            self._focus_prompt_input()
             return True
 
         # 3) Ephemeral chat: confirm before throwing it away
@@ -1335,6 +1368,7 @@ class MainWindow(QMainWindow):
             self.side_panel.set_active_chat(None)
         except Exception:
             pass
+        self._focus_prompt_input()
         return True
 
     def _on_send_payload_from_ui(self, text: str, attachments: list):

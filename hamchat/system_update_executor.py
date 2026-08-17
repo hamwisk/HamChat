@@ -6,6 +6,7 @@ from enum import Enum
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
 
 from .updates import ReleaseManifest, release_manifest_digest
 from .update_preservation import _atomic_json, _digest_bytes, _canonical
@@ -71,14 +72,62 @@ def prepare_system_install(candidate: VerifiedStagedCandidate, transaction_root:
         source = candidate.staging_root / path
         if not _safe_path(path) or not source.is_file() or source.is_symlink() or _digest_bytes(source.read_bytes()) != digest:
             raise ValueError("unsafe staged artifact")
-        records.append({"ordinal": len(records), "path": path, "new": digest, "old": None, "checkpoint": "planned"})
+        records.append({"ordinal": len(records), "path": path, "new": digest, "old": None,
+                        "old_mode": None, "checkpoint": "planned"})
     _atomic_json(_journal_path(transaction_root), {"transaction": candidate.transaction_id, "staging": str(candidate.staging_root.resolve()), "manifest_digest": release_manifest_digest(candidate.manifest), "state": _AUTHORIZED, "files": records})
 
 
 def _state(path):
-    if not path.exists(): return None
-    if not path.is_file() or path.is_symlink(): return "foreign"
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        return "foreign"
     return _digest_bytes(path.read_bytes())
+
+
+def _mode(path: Path) -> int | None:
+    """Return a regular file's Unix permissions without following links."""
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError("managed target is not a regular file")
+    return stat.S_IMODE(file_stat.st_mode)
+
+
+def _replace_file(source: Path, target: Path, mode: int) -> None:
+    """Atomically replace a regular file, retaining its intended mode."""
+    temporary = target.with_name(target.name + ".update-tmp")
+    # A stale or substituted temporary file must never be followed.
+    try:
+        os.stat(temporary, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("update temporary already exists")
+    try:
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, mode, follow_symlinks=False)
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _rollback_mode(item: dict, backup: Path) -> int:
+    """Read new journal mode data, or use the backup mode from old journals."""
+    mode = item.get("old_mode")
+    if mode is None:
+        mode = _mode(backup)
+    if not isinstance(mode, int):
+        raise ValueError("invalid rollback mode")
+    return mode
 
 
 def _prepare_rollback(journal, installation_root, transaction_root):
@@ -89,10 +138,15 @@ def _prepare_rollback(journal, installation_root, transaction_root):
         old = _state(target)
         if old == "foreign": raise ValueError
         item["old"] = old
+        item["old_mode"] = _mode(target) if old else None
         if old:
             backup = rollback / item["path"]; backup.parent.mkdir(parents=True, exist_ok=True)
-            if not backup.exists(): shutil.copyfile(target, backup)
-            if _state(backup) != old or _state(target) != old: raise ValueError
+            if not backup.exists():
+                shutil.copyfile(target, backup)
+                os.chmod(backup, item["old_mode"], follow_symlinks=False)
+            if (_state(backup) != old or _state(target) != old
+                    or _mode(backup) != item["old_mode"]):
+                raise ValueError
             item["rollback"] = str(backup.relative_to(transaction_root))
 
 
@@ -130,18 +184,26 @@ def install_system_files(*, manifest: ReleaseManifest, candidate_root: Path, ins
     try:
         backup.mkdir(parents=True, exist_ok=False)
         for _, dst in targets:
-            if dst.exists():
+            if _state(dst) == "foreign":
+                raise ValueError
+            if _state(dst) is not None:
                 item = backup / dst.relative_to(installation_root); item.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(dst, item)
         for src, dst in targets:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            temp = dst.with_name(dst.name + ".update-tmp")
-            shutil.copyfile(src, temp); os.replace(temp, dst)
+            expected_mode = _mode(dst) if _state(dst) is not None else _mode(src)
+            expected_state = _state(src)
+            _replace_file(src, dst, expected_mode)
+            if _state(dst) != expected_state or _mode(dst) != expected_mode:
+                raise ValueError
         return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
-    except OSError:
+    except (OSError, ValueError):
         for _, dst in targets:
             prior = backup / dst.relative_to(installation_root)
             if prior.is_file():
-                shutil.copyfile(prior, dst)
+                prior_mode = _mode(prior)
+                _replace_file(prior, dst, prior_mode)
+                if _state(dst) != _state(prior) or _mode(dst) != prior_mode:
+                    raise ValueError
         return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK, SystemUpdateCode.INSTALL_FAILED)
 
 
@@ -167,9 +229,10 @@ def install_verified_candidate(*, candidate: VerifiedStagedCandidate, installati
             if _state(target) != item["old"]: raise ValueError
             item["checkpoint"] = "mutation_intent_persisted"; _save(transaction_root, journal)
             target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_name(target.name + ".update-tmp")
-            shutil.copyfile(candidate.staging_root / item["path"], temp); os.replace(temp, target)
-            if _state(target) != item["new"]: raise ValueError
+            intended_mode = item.get("old_mode") if item["old"] is not None else _mode(candidate.staging_root / item["path"])
+            if not isinstance(intended_mode, int): raise ValueError
+            _replace_file(candidate.staging_root / item["path"], target, intended_mode)
+            if _state(target) != item["new"] or _mode(target) != intended_mode: raise ValueError
             item["checkpoint"] = "target_verified"; _save(transaction_root, journal)
         journal["state"] = _VERIFIED; _save(transaction_root, journal); journal["state"] = _COMPLETED; _save(transaction_root, journal)
         return SystemUpdateResult(SystemUpdateStatus.INSTALLED)
@@ -195,8 +258,9 @@ def recover_system_install(*, candidate: VerifiedStagedCandidate, transaction_ro
             else:
                 backup = transaction_root / item["rollback"]
                 if _state(backup) != item["old"]: raise ValueError
-                shutil.copyfile(backup, target)
-            if _state(target) != item["old"]: raise ValueError
+                old_mode = _rollback_mode(item, backup)
+                _replace_file(backup, target, old_mode)
+            if _state(target) != item["old"] or (item["old"] is not None and _mode(target) != old_mode): raise ValueError
             item["checkpoint"] = "rollback_verified"; _save(transaction_root, journal)
         journal["state"] = _ROLLBACK_VERIFIED; _save(transaction_root, journal)
         return SystemUpdateResult(SystemUpdateStatus.ROLLED_BACK)
@@ -255,8 +319,9 @@ def recover_pending_system_installs(*, transaction_parent: Path, installation_ro
                 backup = root / rollback
                 if _state(backup) != old:
                     raise ValueError
-                shutil.copyfile(backup, target)
-            if _state(target) != old:
+                old_mode = _rollback_mode(item, backup)
+                _replace_file(backup, target, old_mode)
+            if _state(target) != old or (old is not None and _mode(target) != old_mode):
                 raise ValueError
             item["checkpoint"] = "rollback_verified"; _save(root, journal)
         journal["state"] = _ROLLBACK_VERIFIED; _save(root, journal)

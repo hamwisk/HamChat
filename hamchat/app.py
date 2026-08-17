@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging, sys
 import argparse, os, platform
+import stat
 from PyQt6.QtCore import QEventLoop, QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QIcon
@@ -12,6 +13,48 @@ from .splash_worker import splash_process
 from .paths import default_data_dir, log_paths, settings_dir
 from .logging_config import init_logging
 from .constants import APP_NAME, __version__
+
+
+_RETAINED_NULL_STREAMS: list[object] = []
+_KNOWN_ROOT_LAUNCHERS = ("run_hamchat.sh", "setup_venv.sh")
+
+
+def _ensure_flushable_standard_streams() -> None:
+    """Replace only unusable inherited standard streams for a detached launch."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        broken = stream is None or getattr(stream, "closed", False)
+        if not broken:
+            flush = getattr(stream, "flush", None)
+            if not callable(flush):
+                broken = True
+            else:
+                try:
+                    flush()
+                except (OSError, ValueError):
+                    broken = True
+        if broken:
+            replacement = open(os.devnull, "w", encoding="utf-8")
+            _RETAINED_NULL_STREAMS.append(replacement)
+            setattr(sys, name, replacement)
+
+
+def repair_known_launcher_modes(installation_root: Path) -> tuple[Path, ...]:
+    """Repair only launchers damaged by pre-2.7.4 byte-only replacement."""
+    failures: list[Path] = []
+    for name in _KNOWN_ROOT_LAUNCHERS:
+        launcher = installation_root / name
+        try:
+            file_stat = os.stat(launcher, follow_symlinks=False)
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            if stat.S_IMODE(file_stat.st_mode) != 0o755:
+                os.chmod(launcher, 0o755, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failures.append(launcher)
+    return tuple(failures)
 
 
 class RunMode(str, Enum):
@@ -126,6 +169,10 @@ class _SplashBridge:
             self._log.warning("Splash close request failed")
 
 def main() -> int:
+    # The previous updater may have launched us with a detached but invalid
+    # terminal.  Do this before multiprocessing and logging setup.
+    _ensure_flushable_standard_streams()
+    launcher_repair_failures = repair_known_launcher_modes(Path.cwd())
     args = parse_args()
 
     # Resolve mode early so we can skip heavy init for SNOUT
@@ -148,6 +195,8 @@ def main() -> int:
         also_console=(not args.no_console_log),
     )
     log = logging.getLogger("boot")
+    for launcher in launcher_repair_failures:
+        log.warning("Could not repair launcher permissions for %s", launcher)
     log.info("=== %s %s starting ===", APP_NAME, __version__)
     log.info("Platform: %s | Python: %s", platform.platform(), platform.python_version())
     log.info("Data dir: %s | Log file: %s", data_dir, log_path)

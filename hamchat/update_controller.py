@@ -297,7 +297,15 @@ class UpdateController(QObject):
 
     def _launch_replacement(self) -> bool:
         try:
-            subprocess.Popen([sys.executable, Path(sys.argv[0]).resolve().as_posix(), *sys.argv[1:]], cwd=str(self._installation_root), start_new_session=True)
+            subprocess.Popen(
+                [sys.executable, Path(sys.argv[0]).resolve().as_posix(), *sys.argv[1:]],
+                cwd=str(self._installation_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
             return True
         except OSError:
             return False

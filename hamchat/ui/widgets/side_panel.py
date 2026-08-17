@@ -79,6 +79,8 @@ class SidePanel(QWidget):
     rename_conversation = pyqtSignal(int, str)
     delete_conversation = pyqtSignal(int)
     import_conversation = pyqtSignal()
+    load_older_chats = pyqtSignal()
+    chat_search_changed = pyqtSignal(str)
 
     # Admin-only intents
     open_admin_user = pyqtSignal(int)   # open user overview in top panel
@@ -99,6 +101,7 @@ class SidePanel(QWidget):
 
         self._prof_list: Optional[QListWidget] = None
         self._chat_list: Optional[QListWidget] = None
+        self._btn_load_older_chats: Optional[QPushButton] = None
         self._user_list: Optional[QListWidget] = None
 
         self._session = None           # NEW
@@ -107,6 +110,7 @@ class SidePanel(QWidget):
 
         self._active_chat_id: Optional[int] = None
         self._active_profile_id: Optional[int] = None
+        self._chat_has_more = False
 
         # Keep handles to expanders so we can enable/disable/show/hide by role
         self._exp_profiles = None
@@ -182,9 +186,13 @@ class SidePanel(QWidget):
         self._chat_list.customContextMenuRequested.connect(self._on_chats_ctx_menu)
         btn_new_chat2 = QPushButton("New chat")
         btn_new_chat2.clicked.connect(self.create_conversation.emit)
+        self._btn_load_older_chats = QPushButton("Load older chats")
+        self._btn_load_older_chats.setAccessibleName("Load older chats")
+        self._btn_load_older_chats.clicked.connect(self.load_older_chats.emit)
+        self._btn_load_older_chats.hide()
 
         ch_wrap = QWidget(); chl = QVBoxLayout(ch_wrap); chl.setContentsMargins(0, 0, 0, 0)
-        chl.addWidget(self._chat_list); chl.addWidget(btn_new_chat2)
+        chl.addWidget(self._chat_list); chl.addWidget(self._btn_load_older_chats); chl.addWidget(btn_new_chat2)
         chats.set_content(ch_wrap)
         root.addWidget(chats)
 
@@ -412,6 +420,19 @@ class SidePanel(QWidget):
     def refresh_chats(self):
         self._fill_list(self._chat_list, self._list_chats or _empty_loader)
 
+    def append_chat_items(self, items: Sequence[Item]) -> None:
+        """Append a page of older chat summaries without disturbing the view."""
+        self._add_chat_items(items)
+
+    def replace_chat_items(self, items: Sequence[Item]) -> None:
+        """Replace the chat list, used for database-backed search results."""
+        self._fill_list(self._chat_list, lambda: items)
+
+    def set_chat_has_more(self, has_more: bool) -> None:
+        self._chat_has_more = bool(has_more)
+        if self._btn_load_older_chats is not None:
+            self._btn_load_older_chats.setVisible(self._chat_has_more)
+
     def refresh_users(self):
         self._fill_list(self._user_list, self._list_users or _empty_loader)
 
@@ -458,6 +479,29 @@ class SidePanel(QWidget):
             if selected_item is not None:
                 widget.setCurrentItem(selected_item)
 
+    def _add_chat_items(self, items: Sequence[Item]) -> None:
+        """Render additional summaries, ignoring rows already in the widget."""
+        if self._chat_list is None:
+            return
+        existing_ids = {
+            int(self._chat_list.item(i).data(Qt.ItemDataRole.UserRole))
+            for i in range(self._chat_list.count())
+        }
+        active_id = self._active_chat_id
+        for raw in items:
+            item_id, label = raw[:2]
+            item_id = int(item_id)
+            if item_id in existing_ids:
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, item_id)
+            if active_id is not None and item_id == int(active_id):
+                item.setText(f"● {label}")
+                font = item.font(); font.setBold(True); item.setFont(font)
+                self._chat_list.setCurrentItem(item)
+            self._chat_list.addItem(item)
+            existing_ids.add(item_id)
+
     def set_active_profile(self, profile_id: Optional[int]) -> None:
         """Highlight the active AI profile."""
         self._active_profile_id = profile_id
@@ -484,13 +528,15 @@ class SidePanel(QWidget):
         lst.blockSignals(False)
 
     def _apply_filter(self, text: str):
-        text = (text or "").lower().strip()
-        for lst in (self._prof_list, self._chat_list, self._user_list):
+        query = (text or "").strip()
+        text = query.lower()
+        for lst in (self._prof_list, self._user_list):
             if not lst:
                 continue
             for i in range(lst.count()):
                 it = lst.item(i)
                 it.setHidden(text not in it.text().lower())
+        self.chat_search_changed.emit(query)
 
     def _on_profiles_ctx_menu(self, pos: QPoint):
         if not self._prof_list:

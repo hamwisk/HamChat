@@ -586,11 +586,32 @@ def orphan_sweep(cas_sweep: bool = False, mem_sweep: bool = False):
     return summary
 
 
-def list_conversations(conn, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+def list_conversations(
+    conn,
+    user_id: int,
+    limit: Optional[int] = 50,
+    offset: int = 0,
+    search: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return one newest-first page of conversation summaries.
+
+    Only fields needed by chat-list consumers are selected.  ``id`` is used as
+    a tie-breaker so pages remain deterministic when multiple chats share the
+    same second-level ``created`` timestamp.
+    """
+    limit_value = -1 if limit is None else max(0, int(limit))
+    offset = max(0, int(offset))
+    where = "user_id=?"
+    params: List[Any] = [int(user_id)]
+    if search:
+        where += " AND title LIKE ? ESCAPE '\\'"
+        escaped = str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, title, created FROM saved_conversations WHERE user_id=? ORDER BY created DESC LIMIT ?",
-        (user_id, limit),
+        "SELECT id, title, created FROM saved_conversations "
+        f"WHERE {where} ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        (*params, limit_value, offset),
     )
     rows = cur.fetchall()
     return [{"id": r[0], "title": r[1], "created": r[2]} for r in rows]

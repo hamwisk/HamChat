@@ -93,6 +93,10 @@ class MainWindow(QMainWindow):
         self._models_available = None
         self._active_profile_id: Optional[int] = None
         self._active_profile_name: Optional[str] = None
+        self._chat_page_size = 50
+        self._chat_page_offset = 0
+        self._chat_has_more = False
+        self._chat_search_text = ""
 
         self._build_ui()
         self._wire_signals()
@@ -328,6 +332,8 @@ class MainWindow(QMainWindow):
         self.side_panel.rename_conversation.connect(self._rename_conversation)
         self.side_panel.delete_conversation.connect(self._delete_conversation)
         self.side_panel.import_conversation.connect(self._import_chat)
+        self.side_panel.load_older_chats.connect(self._load_older_chats)
+        self.side_panel.chat_search_changed.connect(self._search_chats)
         self.side_panel.profile_activated.connect(self._on_profile_activated)
 
         self.side_panel.request_login.connect(self._open_login_flow)
@@ -415,7 +421,7 @@ class MainWindow(QMainWindow):
         for the current user chat.
         """
         # Refresh 'My Chats' + highlight this conversation
-        self.side_panel.refresh_chats()
+        self._refresh_user_chats()
         try:
             self.side_panel.set_active_chat(conv_id)
         except Exception:
@@ -800,7 +806,7 @@ class MainWindow(QMainWindow):
             log.exception("rename_conversation failed: %s", e)
             QMessageBox.critical(self, "Rename failed", "Could not rename this chat.")
             return
-        self.side_panel.refresh_chats()
+        self._refresh_user_chats()
         try:
             self.side_panel.set_active_chat(conv_id)
         except Exception:
@@ -838,11 +844,12 @@ class MainWindow(QMainWindow):
             self.chat_display.clear_messages()
             self.chat_panel.on_new_chat_started()
 
-        self.side_panel.refresh_chats()
-        try:
-            self.side_panel.set_active_chat(None)
-        except Exception:
-            pass
+        self._refresh_user_chats()
+        if current_id == int(conv_id):
+            try:
+                self.side_panel.set_active_chat(None)
+            except Exception:
+                pass
 
     def _on_attachment_open_requested(self, file_id: int):
         from hamchat import db_ops as dbo
@@ -1056,7 +1063,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.side_panel.refresh_chats()
+        self._refresh_user_chats()
         self._open_conversation(int(conversation_id))
 
     def _load_user_chats(self):
@@ -1068,17 +1075,28 @@ class MainWindow(QMainWindow):
         from hamchat import db_ops as dbo
 
         if not self._db:
+            self._chat_page_offset = 0
+            self._chat_has_more = False
+            self.side_panel.set_chat_has_more(False)
             return ()
 
         uid = getattr(self.session.current, "user_id", None)
         role = getattr(self.session.current, "role", "guest")
         if not uid or role != "user":
+            self._chat_page_offset = 0
+            self._chat_has_more = False
+            self.side_panel.set_chat_has_more(False)
             return ()
 
         try:
-            rows = dbo.list_conversations(self._db, user_id=int(uid), limit=50)
+            rows = dbo.list_conversations(
+                self._db, user_id=int(uid), limit=self._chat_page_size, offset=0,
+            )
         except Exception as e:
             log.exception("list_conversations failed: %s", e)
+            self._chat_page_offset = 0
+            self._chat_has_more = False
+            self.side_panel.set_chat_has_more(False)
             return ()
 
         items = []
@@ -1086,7 +1104,72 @@ class MainWindow(QMainWindow):
             cid = int(r["id"])
             title = (r.get("title") or "").strip() or f"Chat {cid}"
             items.append((cid, title))
+        self._chat_page_offset = len(items)
+        self._chat_has_more = len(items) == self._chat_page_size
+        self.side_panel.set_chat_has_more(self._chat_has_more)
         return items
+
+    def _refresh_user_chats(self) -> None:
+        """Reset the summary pager after a chat mutation or a cleared search."""
+        self._chat_page_offset = 0
+        self._chat_has_more = False
+        if self._chat_search_text:
+            self._search_chats(self._chat_search_text)
+            return
+        self.side_panel.refresh_chats()
+
+    def _load_older_chats(self) -> None:
+        if not self._db or not self._chat_has_more or self._chat_search_text:
+            return
+        uid = getattr(self.session.current, "user_id", None)
+        role = getattr(self.session.current, "role", "guest")
+        if not uid or role != "user":
+            return
+        from hamchat import db_ops as dbo
+        try:
+            rows = dbo.list_conversations(
+                self._db, user_id=int(uid), limit=self._chat_page_size,
+                offset=self._chat_page_offset,
+            )
+        except Exception as exc:
+            log.exception("Loading older conversations failed: %s", exc)
+            return
+        items = [
+            (int(row["id"]), (row.get("title") or "").strip() or f"Chat {row['id']}")
+            for row in rows
+        ]
+        self.side_panel.append_chat_items(items)
+        self._chat_page_offset += len(items)
+        self._chat_has_more = len(items) == self._chat_page_size
+        self.side_panel.set_chat_has_more(self._chat_has_more)
+
+    def _search_chats(self, text: str) -> None:
+        """Search saved-chat summaries in the database, not just loaded rows."""
+        self._chat_search_text = (text or "").strip()
+        if not self._chat_search_text:
+            self._refresh_user_chats()
+            return
+        if not self._db:
+            return
+        uid = getattr(self.session.current, "user_id", None)
+        role = getattr(self.session.current, "role", "guest")
+        if not uid or role != "user":
+            self.side_panel.refresh_chats()
+            return
+        from hamchat import db_ops as dbo
+        try:
+            rows = dbo.list_conversations(
+                self._db, user_id=int(uid), search=self._chat_search_text, limit=None,
+            )
+        except Exception as exc:
+            log.exception("Searching conversations failed: %s", exc)
+            return
+        items = [
+            (int(row["id"]), (row.get("title") or "").strip() or f"Chat {row['id']}")
+            for row in rows
+        ]
+        self.side_panel.replace_chat_items(items)
+        self.side_panel.set_chat_has_more(False)
 
     def _get_conversation_title(self, conv_id: int) -> str:
         """Best-effort lookup of a conversation title from the DB."""
@@ -1097,13 +1180,15 @@ class MainWindow(QMainWindow):
         if not uid:
             return f"Chat {conv_id}"
         try:
-            rows = dbo.list_conversations(self._db, user_id=int(uid), limit=200)
+            row = self._db.execute(
+                "SELECT title FROM saved_conversations WHERE id=? AND user_id=?",
+                (int(conv_id), int(uid)),
+            ).fetchone()
         except Exception:
             return f"Chat {conv_id}"
-        for r in rows:
-            if int(r["id"]) == int(conv_id):
-                title = (r.get("title") or "").strip()
-                return title or f"Chat {conv_id}"
+        if row:
+            title = (row[0] or "").strip()
+            return title or f"Chat {conv_id}"
         return f"Chat {conv_id}"
 
     def _open_conversation(self, conv_id: int):

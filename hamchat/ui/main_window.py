@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         self._chat_has_more = False
         self._chat_search_text = ""
         self._prompt_focus_pending = False
+        self._close_cleanup_started = False
 
         self._build_ui()
         self._wire_signals()
@@ -1437,15 +1438,35 @@ class MainWindow(QMainWindow):
         else:
             self.chat_display.sig_send_text.emit(text)
 
-    def closeEvent(self, ev):
-        ok = True
+    def _cleanup_for_close(self) -> None:
+        if self._close_cleanup_started:
+            return
+        self._close_cleanup_started = True
+        ctrl = getattr(self, "chat_controller", None)
+        model_client = getattr(ctrl, "_model_client", None)
+        model_name = getattr(ctrl, "_model_name", None)
+        if not model_name:
+            try:
+                model_name = self.session.get_model_id()
+            except Exception:
+                model_name = None
         try:
-            ctrl = getattr(self, "chat_controller", None)
             if ctrl is not None:
                 ctrl.clear_memory_vectors()
-                ok = bool(ctrl.hard_kill())
+                ctrl.hard_kill()
         except Exception as e:
             log.exception("hard_kill failed: %s", e)
-            ok = False
+
+        if not isinstance(model_client, OllamaClient) or not model_name:
+            return
+        try:
+            metadata = self.session.get_model_metadata(model_name)
+            capabilities = metadata.get("ollama_capabilities") if isinstance(metadata, dict) else None
+            model_client.unload_model_if_running(model_name, capabilities=capabilities)
+        except Exception as exc:
+            log.warning("Ollama shutdown unload failed model=%s error=%s", model_name, exc)
+
+    def closeEvent(self, ev):
+        self._cleanup_for_close()
 
         super().closeEvent(ev)

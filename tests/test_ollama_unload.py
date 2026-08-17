@@ -128,3 +128,48 @@ def test_post_unload_ps_marks_a_runner_that_remains_loaded_as_failed(monkeypatch
     assert result.unloaded == ()
     assert result.failed == ("chat",)
     assert result.remaining == ("chat",)
+
+
+def test_shutdown_unloads_only_an_exact_running_completion_model(monkeypatch):
+    posts = []
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.get", lambda *_args, **_kwargs: _ps(["chat", "other", "nomic-embed-text"]))
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.post",
+        lambda url, **kwargs: (posts.append((url, kwargs["json"])) or _Response()),
+    )
+
+    unloaded = OllamaClient().unload_model_if_running("chat", capabilities=["completion"])
+
+    assert unloaded is True
+    assert posts == [("http://127.0.0.1:11434/api/generate", {
+        "model": "chat", "prompt": "", "stream": False, "keep_alive": 0,
+    })]
+
+
+def test_shutdown_does_not_load_or_unload_absent_or_embedding_models(monkeypatch):
+    posts = []
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.get", lambda *_args, **_kwargs: _ps(["nomic-embed-text"]))
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.post",
+        lambda url, **kwargs: (posts.append((url, kwargs["json"])) or _Response()),
+    )
+    client = OllamaClient()
+
+    assert client.unload_model_if_running("chat", capabilities=["completion"]) is False
+    assert client.unload_model_if_running("nomic-embed-text", capabilities=["embedding"]) is False
+    assert posts == []
+
+
+def test_shutdown_timeout_or_unload_failure_is_non_fatal(monkeypatch):
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("offline")),
+    )
+    assert OllamaClient().unload_model_if_running("chat", capabilities=["completion"]) is False
+
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.get", lambda *_args, **_kwargs: _ps(["chat"]))
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_client.requests.post",
+        lambda *_args, **_kwargs: _Response(error=ConnectionError("offline")),
+    )
+    assert OllamaClient().unload_model_if_running("chat", capabilities=["completion"]) is False

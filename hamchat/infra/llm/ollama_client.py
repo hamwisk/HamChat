@@ -590,6 +590,52 @@ class OllamaClient(ModelClient):
                 failed.append(name)
         return UnloadResult(len(running), tuple(verified_unloaded), tuple(failed), tuple(skipped), remaining)
 
+    def unload_model_if_running(
+        self,
+        model: str,
+        *,
+        capabilities: Optional[List[str]] = None,
+        timeout: tuple[float, float] = (0.25, 1.0),
+    ) -> bool:
+        """Best-effort unload of one exact, already-running model only."""
+        if not model:
+            return False
+        try:
+            response = requests.get(f"{self.base_url}/api/ps", timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            running = payload.get("models", []) if isinstance(payload, dict) else []
+        except Exception as exc:
+            log.warning("Ollama shutdown unload ps failed model=%s error=%s", model, exc)
+            return False
+        if not any(
+            isinstance(item, dict) and (item.get("name") == model or item.get("model") == model)
+            for item in running
+        ):
+            return False
+
+        resolved = self._normalize_capabilities(capabilities)
+        if resolved is None:
+            resolved = self._show_capabilities(model, timeout)
+        if resolved is None:
+            log.warning("Ollama shutdown unload skipped model=%s reason=unknown_capabilities", model)
+            return False
+        if "completion" in resolved:
+            endpoint, payload = "/api/generate", {
+                "model": model, "prompt": "", "stream": False, "keep_alive": 0,
+            }
+        else:
+            log.warning("Ollama shutdown unload skipped model=%s reason=unsupported_capabilities", model)
+            return False
+        try:
+            response = requests.post(f"{self.base_url}{endpoint}", json=payload, timeout=timeout)
+            response.raise_for_status()
+            self.invalidate_runtime_context(model=model)
+            return True
+        except Exception as exc:
+            log.warning("Ollama shutdown unload failed model=%s endpoint=%s error=%s", model, endpoint, exc)
+            return False
+
     def _running_models(self, timeout: tuple[float, float]) -> list[str]:
         response = requests.get(f"{self.base_url}/api/ps", timeout=timeout)
         response.raise_for_status()

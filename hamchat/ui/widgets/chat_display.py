@@ -6,14 +6,19 @@ import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, List, Any, Optional
-from PyQt6.QtCore import pyqtSlot, Qt, QUrl, pyqtSignal, QAbstractListModel, QModelIndex, QVariant, QTimer
-from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLineEdit, QPushButton
+from PyQt6.QtCore import pyqtSlot, Qt, QUrl, pyqtSignal, QAbstractListModel, QModelIndex, QVariant, QTimer, QSize
+from PyQt6.QtGui import QGuiApplication, QIcon
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLineEdit, QPushButton, QToolButton, QFileDialog
 from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtQml import QQmlContext
 
 from .prompt_input import PromptInput
 from hamchat.media_helper import normalize_image_file, ImageValidationError
+
+
+IMAGE_FILE_FILTER = (
+    "Supported images (*.jpg *.jpeg *.png *.webp *.gif *.bmp *.tif *.tiff);;All files (*)"
+)
 
 
 # --- tiny model for attachments ---
@@ -195,17 +200,34 @@ class ChatDisplay(QWidget):
         # Input bar
         bar = QFrame(self)
         bl = QHBoxLayout(bar); bl.setContentsMargins(8, 8, 8, 8); bl.setSpacing(8)
+        self.attach = QToolButton(bar)
+        self.attach.setObjectName("AttachButton")
+        self.attach.setAccessibleName("Attach files")
+        self.attach.setToolTip("Attach files")
+        self.attach.setStatusTip("Attach files")
+        self.attach.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.attach.setMinimumSize(44, 44)
+        self.attach.setIconSize(QSize(16, 16))
+        attachment_icon = QIcon.fromTheme("mail-attachment-symbolic")
+        if attachment_icon.isNull():
+            attachment_icon = QIcon.fromTheme("mail-attachment")
+        if attachment_icon.isNull():
+            self.attach.setText("📎")
+        else:
+            self.attach.setIcon(attachment_icon)
         self.input = PromptInput(bar, min_h=28, max_h=120)
         self.send = QPushButton("Send", bar)
         self.send.setProperty("accent", True)
         self.send.setObjectName("SendButton")
 
+        self.attach.clicked.connect(self._choose_attachments)
         self.send.clicked.connect(self._on_send_clicked)
         self.input.submit.connect(self._on_send_clicked)
         self.input.fileDropped.connect(self.sig_file_dropped)
         self.input.fileDetected.connect(self.sig_file_detected)
         self.input.fileDetected.connect(self._on_file_detected)
 
+        bl.addWidget(self.attach, 0)
         bl.addWidget(self.input, 1)
         bl.addWidget(self.send, 0)
         root.addWidget(bar, 0)
@@ -217,6 +239,8 @@ class ChatDisplay(QWidget):
     def set_streaming(self, on: bool) -> None:
         self._streaming = bool(on)
         self.input.setReadOnly(self._streaming)
+        self.input.setAcceptDrops(not self._streaming)
+        self.attach.setEnabled(not self._streaming)
         self.send.setText("Stop" if self._streaming else "Send")
         self.send.setProperty("accent", not self._streaming)  # subtle visual cue
         self.send.style().unpolish(self.send); self.send.style().polish(self.send)
@@ -317,19 +341,38 @@ class ChatDisplay(QWidget):
     def qmlOpenAttachmentAt(self, index: int):
         pass
 
-    # Direct, internal handler for detected files  NEW
-    @pyqtSlot(str, str)
-    def _on_file_detected(self, path: str, kind: str):
+    def _choose_attachments(self) -> None:
+        try:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Attach files",
+                "",
+                IMAGE_FILE_FILTER,
+            )
+            for path in paths:
+                self._stage_attachment(path, "image")
+        finally:
+            self.input.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _stage_attachment(self, path: str, kind: str) -> None:
+        """Validate and add one attachment path to the pending model."""
         norm = path[7:] if path.lower().startswith("file://") else path
         try:
             normalize_image_file(norm)
         except ImageValidationError:
             if kind == "image":
-                self.attachmentRejected.emit("HamChat couldn’t read this image. The file may be corrupt or use an unsupported format.")
+                self.attachmentRejected.emit(
+                    "HamChat couldn’t read this image. The file may be corrupt or use an unsupported format."
+                )
             return
         if not self._attachments.contains(norm):
             self._attachments.append_path(norm)
             self._call_qml("ensureAtEnd")
+
+    # Direct, internal handler for detected files  NEW
+    @pyqtSlot(str, str)
+    def _on_file_detected(self, path: str, kind: str):
+        self._stage_attachment(path, kind)
 
     # expose model + bridge to QML  (update your existing context reload)
     def _reload_context(self):

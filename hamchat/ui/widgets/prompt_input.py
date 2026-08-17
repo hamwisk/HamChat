@@ -100,10 +100,11 @@ class PromptInput(QTextEdit):
     def dropEvent(self, e):
         urls = e.mimeData().urls()
         if urls:
-            path = urls[0].toLocalFile() or urls[0].toString()
-            if path:
-                self.fileDropped.emit(path)
-                self.fileDetected.emit(path, _guess_kind(path))
+            for url in urls:
+                path = url.toLocalFile() or url.toString()
+                if path:
+                    self.fileDropped.emit(path)
+                    self.fileDetected.emit(path, _guess_kind(path))
             e.acceptProposedAction()
             super().dropEvent(e)     # keeps cursor/selection sane
             self.setFocus(Qt.FocusReason.MouseFocusReason)

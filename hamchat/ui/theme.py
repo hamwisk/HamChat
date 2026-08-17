@@ -295,6 +295,26 @@ def apply_theme(app: QApplication, window, colors: Dict) -> None:
     border-radius: 8px;
     padding: 6px 8px;
     }}
+    QToolButton#AttachButton {{
+        background: transparent;
+        color: {colors["text"]};
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 4px;
+    }}
+    QToolButton#AttachButton:hover {{
+        background: {colors["surface_alt"]};
+        border-color: {colors["border_strong"]};
+    }}
+    QToolButton#AttachButton:focus {{
+        background: {colors["surface_alt"]};
+        border-color: {colors["accent"]};
+    }}
+    QToolButton#AttachButton:disabled {{
+        background: transparent;
+        color: {colors["text_muted"]};
+        border-color: transparent;
+    }}
     QPushButton#SendButton[accent="true"] {{
         background: {colors["accent"]};
         color: {colors["on_accent"]};

@@ -76,3 +76,92 @@ def test_changed_digest_resets_learned_thinking_but_preserves_other_fields(tmp_p
     assert entry["capabilities"] == {"vision": False}
     assert entry["custom"] == "kept"
     assert entry["first_seen"] == 1
+
+
+def test_show_capabilities_are_normalized_and_persisted(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry.requests.get",
+        lambda *_args, **_kwargs: type("Response", (), {"json": lambda self: {
+            "models": [{"name": "chat:latest", "digest": "one"}],
+        }})(),
+    )
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry.requests.post",
+        lambda *_args, **_kwargs: type("Response", (), {"json": lambda self: {
+            "details": {"family": "chat"},
+            "capabilities": [" Completion ", "vision", "completion", 7, ""],
+        }})(),
+    )
+
+    refreshed = refresh_registry(registry_path=path)
+
+    assert refreshed["models"][0]["ollama_capabilities"] == ["completion", "vision"]
+    assert refreshed["models"][0]["capabilities"]["vision"] is False
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["models"][0]["ollama_capabilities"] == ["completion", "vision"]
+
+
+def test_unchanged_legacy_entry_is_enriched_once_then_uses_cached_path(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    _write_registry(path, digest="same")
+    probe_calls = []
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry.requests.get",
+        lambda *_args, **_kwargs: type("Response", (), {"json": lambda self: {
+            "models": [{"name": "gemma3:latest", "digest": "same"}],
+        }})(),
+    )
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry._probe_model",
+        lambda *_args, **_kwargs: (probe_calls.append(True) or {"ollama_capabilities": ["completion"]}),
+    )
+
+    first = refresh_registry(registry_path=path)
+    second = refresh_registry(registry_path=path)
+
+    assert first["models"][0]["ollama_capabilities"] == ["completion"]
+    assert second["models"][0]["ollama_capabilities"] == ["completion"]
+    assert probe_calls == [True]
+
+
+def test_failed_legacy_enrichment_stays_unknown_and_is_retryable(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    _write_registry(path, digest="same")
+    probe_calls = []
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry.requests.get",
+        lambda *_args, **_kwargs: type("Response", (), {"json": lambda self: {
+            "models": [{"name": "gemma3:latest", "digest": "same"}],
+        }})(),
+    )
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry._probe_model",
+        lambda *_args, **_kwargs: (probe_calls.append(True) or {}),
+    )
+
+    first = refresh_registry(registry_path=path)
+    second = refresh_registry(registry_path=path)
+
+    assert "ollama_capabilities" not in first["models"][0]
+    assert "ollama_capabilities" not in second["models"][0]
+    assert probe_calls == [True, True]
+
+
+def test_embedding_model_is_retained_in_registry_for_non_chat_consumers(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry.requests.get",
+        lambda *_args, **_kwargs: type("Response", (), {"json": lambda self: {
+            "models": [{"name": "nomic-embed-text", "digest": "embed"}],
+        }})(),
+    )
+    monkeypatch.setattr(
+        "hamchat.infra.llm.ollama_registry._probe_model",
+        lambda *_args, **_kwargs: {"ollama_capabilities": ["embedding"]},
+    )
+
+    refreshed = refresh_registry(registry_path=path)
+
+    assert [entry["name"] for entry in refreshed["models"]] == ["nomic-embed-text"]
+    assert refreshed["models"][0]["ollama_capabilities"] == ["embedding"]

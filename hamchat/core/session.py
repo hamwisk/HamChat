@@ -282,6 +282,18 @@ class SessionManager(QObject):
             if not name:
                 continue
 
+            backend = m.get("backend")
+            is_ollama = not isinstance(backend, str) or not backend.strip() or backend.strip().lower() == "ollama"
+            reported_capabilities = m.get("ollama_capabilities")
+            if is_ollama and isinstance(reported_capabilities, list):
+                normalized = {
+                    capability.strip().lower()
+                    for capability in reported_capabilities
+                    if isinstance(capability, str) and capability.strip()
+                }
+                if "completion" not in normalized:
+                    continue
+
             label = name  # keep it simple for now
             result.append((name, label))
 

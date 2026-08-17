@@ -82,6 +82,20 @@ def _probe_model(base_url: str, name: str) -> Dict[str, Any]:
     details = rd if isinstance(rd, dict) else {}
     out["family"] = details.get("family")
 
+    raw_capabilities = res.get("capabilities")
+    if isinstance(raw_capabilities, list):
+        # Keep Ollama's reported capability list separate from HamChat's
+        # derived capabilities (vision/thinking).  A missing field remains
+        # unknown; an empty list is an explicit, known result.
+        normalized: list[str] = []
+        for capability in raw_capabilities:
+            if not isinstance(capability, str):
+                continue
+            capability = capability.strip().lower()
+            if capability and capability not in normalized:
+                normalized.append(capability)
+        out["ollama_capabilities"] = normalized
+
     # context discovery (expanded)
     out["context"] = _extract_context(res)
 
@@ -179,38 +193,53 @@ def refresh_registry(base_url: str = DEFAULT_OLLAMA, registry_path: Path = REGIS
     # index cache by name
     cache = {m["name"]: m for m in reg["models"]}
 
-    # new or changed models -> probe once
+    # New/changed models, plus legacy entries without Ollama capability
+    # metadata, require a show probe.  Missing metadata after a failed probe
+    # deliberately remains unknown so a later refresh retries it.
     for name, digest in runtime.items():
         cached = cache.get(name)
-        if (cached is None) or (cached.get("digest") != digest):
+        digest_changed = (cached is None) or (cached.get("digest") != digest)
+        needs_capability_enrichment = cached is not None and "ollama_capabilities" not in cached
+        if digest_changed or needs_capability_enrichment:
             info = _probe_model(base_url, name)
-            context = info.get("context")
-            vision = info.get("vision", False)
-            family = info.get("family")
 
             entry = cached or {
                 "name": name, "first_seen": now
             }
-            capabilities = dict(entry.get("capabilities") or {})
-            capabilities["vision"] = bool(vision)
-            # Learned thinking support belongs to one model build, so it must
-            # be rediscovered after a tag starts pointing at a new digest.
-            if cached is not None:
-                capabilities.pop("thinking", None)
-            entry.update({
-                "digest": digest,
-                "capabilities": capabilities,
-                "context": context,
-                "family": family,
-                "last_seen": now,
-                "available": True
-            })
-            if not entry.get("context"):
-                _apply_context_overrides(entry)
-            # Label the source
-            entry["ctx_source"] = "extracted" if context else ("override" if entry.get("context") else None)
+            if digest_changed:
+                context = info.get("context")
+                vision = info.get("vision", False)
+                family = info.get("family")
+                capabilities = dict(entry.get("capabilities") or {})
+                capabilities["vision"] = bool(vision)
+                # Learned thinking support belongs to one model build, so it must
+                # be rediscovered after a tag starts pointing at a new digest.
+                if cached is not None:
+                    capabilities.pop("thinking", None)
+                entry.update({
+                    "digest": digest,
+                    "capabilities": capabilities,
+                    "context": context,
+                    "family": family,
+                })
+                if not entry.get("context"):
+                    _apply_context_overrides(entry)
+                # Label the source
+                entry["ctx_source"] = "extracted" if context else ("override" if entry.get("context") else None)
+                if "ollama_capabilities" not in info:
+                    # A new digest cannot safely inherit the old build's list.
+                    entry.pop("ollama_capabilities", None)
+
+            if "ollama_capabilities" in info:
+                entry["ollama_capabilities"] = info["ollama_capabilities"]
+
+            entry.update({"last_seen": now, "available": True})
             cache[name] = entry
-            log.info("Indexed model %s (ctx=%s, vision=%s)", name, context, vision)
+            log.info(
+                "Indexed model %s (ctx=%s, vision=%s, ollama_capabilities=%s)",
+                name, entry.get("context"), entry.get("capabilities", {}).get("vision"),
+                entry.get("ollama_capabilities", "unknown"),
+            )
         else:
             cached["available"] = True
             cached["last_seen"] = now

@@ -611,6 +611,17 @@ class MainWindow(QMainWindow):
         self.top_panel.close_panel()
 
     def _do_logout(self):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Confirm logout")
+        dialog.setText("Are you sure you want to log out?")
+        logout_button = dialog.addButton("Log out", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        if dialog.clickedButton() is not logout_button:
+            return
+
         try:
             self.chat_controller.clear_memory_vectors()
             self.chat_controller.clear_transient_thinking()

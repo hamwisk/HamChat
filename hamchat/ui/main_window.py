@@ -466,6 +466,8 @@ class MainWindow(QMainWindow):
         # show/hide the actual widget
         self.side_panel.setVisible(self._left_open)
         self._apply_split_sizes()
+        if not self._left_open and not self.top_panel._expanded:
+            self._focus_prompt_input()
 
     def toggle_right_panel(self):
         self._right_open = not self._right_open
@@ -626,6 +628,7 @@ class MainWindow(QMainWindow):
 
     def _on_top_closed(self):
         self.chat_split.setSizes([0, max(1, sum(self.chat_split.sizes()))])
+        self._focus_prompt_input()
 
     def _open_memory_manager(self) -> None:
         from .widgets.memory_manager import MemoryManager

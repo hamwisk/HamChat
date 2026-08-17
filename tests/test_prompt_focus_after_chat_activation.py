@@ -115,3 +115,59 @@ def test_unrelated_chat_refresh_does_not_request_prompt_focus():
     MainWindow._refresh_user_chats(window)
 
     assert focus_requests == []
+
+
+def _panel_window(*, side_open, top_open):
+    focus_requests = []
+    side_visibility = []
+    window = SimpleNamespace(
+        _left_open=side_open,
+        side_panel=SimpleNamespace(setVisible=lambda visible: side_visibility.append(visible)),
+        top_panel=SimpleNamespace(_expanded=top_open),
+        _apply_split_sizes=lambda: None,
+        _focus_prompt_input=lambda: focus_requests.append(True),
+    )
+    return window, focus_requests, side_visibility
+
+
+def test_closing_side_panel_only_focuses_prompt_when_top_panel_is_closed():
+    top_open_window, top_open_requests, _ = _panel_window(side_open=True, top_open=True)
+    MainWindow.toggle_left_panel(top_open_window)
+    assert top_open_requests == []
+
+    top_closed_window, top_closed_requests, visibility = _panel_window(side_open=True, top_open=False)
+    MainWindow.toggle_left_panel(top_closed_window)
+    assert visibility == [False]
+    assert top_closed_requests == [True]
+
+
+def test_closing_top_panel_focuses_prompt_once():
+    focus_requests = []
+    sizes = []
+    window = SimpleNamespace(
+        chat_split=SimpleNamespace(sizes=lambda: [80, 320], setSizes=lambda value: sizes.append(value)),
+        _focus_prompt_input=lambda: focus_requests.append(True),
+    )
+
+    MainWindow._on_top_closed(window)
+
+    assert sizes == [[0, 400]]
+    assert focus_requests == [True]
+
+
+def test_opening_side_or_top_panel_does_not_request_prompt_focus():
+    side_window, side_requests, visibility = _panel_window(side_open=False, top_open=False)
+    MainWindow.toggle_left_panel(side_window)
+    assert visibility == [True]
+    assert side_requests == []
+
+    top_requests = []
+    sizes = []
+    top_window = SimpleNamespace(
+        _top_saved_h=240,
+        chat_split=SimpleNamespace(sizes=lambda: [0, 600], setSizes=lambda value: sizes.append(value)),
+        _focus_prompt_input=lambda: top_requests.append(True),
+    )
+    MainWindow._restore_top_panel_height(top_window)
+    assert sizes
+    assert top_requests == []

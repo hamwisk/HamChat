@@ -3,12 +3,12 @@
 ## Hard Rules for Automated Agents (Codex, Copilot, ChatGPT, etc.)
 
 - **Do NOT create, modify, or delete any `.qml` files.**
-- Treat all QML / UI layout files as **read-only**, even if a change *looks* tempting or “obvious”.
+- Treat all QML / UI layout files as **read-only**, even if a change *looks* tempting or â€œobviousâ€.
 - If a bug or feature seems to require QML changes, **stop** and prefer adjustments in:
   - Python controllers / UI logic (`hamchat/ui/`, `hamchat/core/`, etc.),
   - configuration, or
   - data-handling code.
-- Do not “modernize”, “refactor”, or “simplify” QML; its current behavior is intentional and must remain stable.
+- Do not â€œmodernizeâ€, â€œrefactorâ€, or â€œsimplifyâ€ QML; its current behavior is intentional and must remain stable.
 - Do not introduce new UI frameworks or replace QML with alternatives.
 
 If a human explicitly asks for QML changes in a prompt, follow that prompt; otherwise, **leave QML strictly untouched**.
@@ -39,7 +39,7 @@ If a human explicitly asks for QML changes in a prompt, follow that prompt; othe
 ## Coding Style & Naming Conventions
 - Python 3.10+ assumed; prefer type hints and `from __future__ import annotations` where helpful.
 - Follow PEP 8: 4-space indentation, snake_case for functions/variables, PascalCase for classes.
-- Keep UI strings and asset paths centralized; avoid hardcoding absolute paths—use helpers in `paths.py`.
+- Keep UI strings and asset paths centralized; avoid hardcoding absolute pathsâ€”use helpers in `paths.py`.
 - Logging: prefer structured logger names (e.g., `logging.getLogger("boot")`) and avoid `print` outside CLI errors.
 
 ## Testing Guidelines
@@ -56,4 +56,3 @@ If a human explicitly asks for QML changes in a prompt, follow that prompt; othe
 - Sensitive data should not live in `settings/`; prefer environment variables for secrets and overrides.
 - Database and logs default to `data/`; ensure that directory is writable in your environment.
 - When running agents, validate `--server-url` endpoints and keep PyQt dependencies pinned to avoid ABI mismatches.
-

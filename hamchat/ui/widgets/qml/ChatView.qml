@@ -47,6 +47,7 @@ Rectangle {
         delegate: MessageBubble {
             role: model.role
             text: model.text
+            displayBlocks: model.displayBlocks
             thumbs: model.thumbs || []
             theme: Theme || ({})
             width: list.width

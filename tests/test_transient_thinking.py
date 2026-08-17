@@ -39,8 +39,8 @@ class FakeChat:
     def stream_chunk(self, row, text):
         self.streamed.append((row, text))
 
-    def end_assistant_stream(self, row):
-        self.ended.append(row)
+    def end_assistant_stream(self, row, *, successful):
+        self.ended.append((row, successful))
 
     def set_streaming(self, value):
         self.streaming.append(value)
@@ -133,6 +133,7 @@ def test_thinking_lifecycle_clears_only_for_new_generation_or_conversation_switc
     assert panel.text == "partial reasoning"
     ChatController._on_job_finished(state, 1, "cancelled")
     assert panel.text == "partial reasoning"
+    assert state.chat.ended == [(0, False)]
 
     ChatController.reset_history(state)
     assert panel.text == ""

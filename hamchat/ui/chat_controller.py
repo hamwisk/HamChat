@@ -892,7 +892,7 @@ class ChatController(QObject):
         ):
             self._set_learned_thinking_capability(generation["model"], True)
         if ticket == self._active_ticket and self._active_row is not None:
-            self.chat.end_assistant_stream(self._active_row)
+            self.chat.end_assistant_stream(self._active_row, successful=(status == "ok"))
 
         # Commit assistant turn iff we received any content
         if status == "ok" and self._assistant_buf:

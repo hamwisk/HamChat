@@ -1,6 +1,7 @@
 # hamchat/ui/widgets/chat_display.py
 from __future__ import annotations
 
+import html
 import time
 
 from pathlib import Path
@@ -69,12 +70,160 @@ class Msg:
     role: str   # "user" | "assistant" | "system"
     text: str
     thumbs: list[str] | None = None  # NEW (list of file paths)
+    render_markdown: bool = True
+
+
+def _raw_html_end(text: str, start: int) -> int | None:
+    """Return the exclusive end of an HTML-like tag starting at ``start``."""
+    if text.startswith("<!--", start):
+        end = text.find("-->", start + 4)
+        return len(text) if end < 0 else end + 3
+
+    marker = start + 1
+    if marker < len(text) and text[marker] in "!?":
+        marker += 1
+    elif marker < len(text) and text[marker] == "/":
+        marker += 1
+    if marker >= len(text) or not text[marker].isalpha():
+        return None
+
+    quote = ""
+    for pos in range(marker + 1, len(text)):
+        char = text[pos]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == ">":
+            return pos + 1
+    return len(text)
+
+
+def _safe_inline_markdown(text: str) -> str:
+    """Keep Markdown syntax while neutralizing images and raw HTML outside code."""
+    output: list[str] = []
+    pos = 0
+    while pos < len(text):
+        char = text[pos]
+        if char == "\\" and pos + 1 < len(text):
+            output.append(text[pos:pos + 2])
+            pos += 2
+            continue
+        if char == "`":
+            run_end = pos
+            while run_end < len(text) and text[run_end] == "`":
+                run_end += 1
+            delimiter = text[pos:run_end]
+            close = text.find(delimiter, run_end)
+            if close >= 0:
+                output.append(text[pos:close + len(delimiter)])
+                pos = close + len(delimiter)
+                continue
+        if char == "!" and pos + 1 < len(text) and text[pos + 1] == "[":
+            # Escaping only the image marker keeps its source visible but makes
+            # both inline and reference-style images ordinary Markdown text.
+            output.append("\\!")
+            pos += 1
+            continue
+        if char == "<":
+            tag_end = _raw_html_end(text, pos)
+            if tag_end is not None:
+                output.append(html.escape(text[pos:tag_end]))
+                pos = tag_end
+                continue
+        output.append(char)
+        pos += 1
+    return "".join(output)
+
+
+def _fence_opening(line: str) -> tuple[str, int] | None:
+    """Return a Markdown fence marker when ``line`` opens a code block."""
+    indent = len(line) - len(line.lstrip(" "))
+    if indent > 3 or indent >= len(line):
+        return None
+    marker = line[indent]
+    if marker not in "`~":
+        return None
+    end = indent
+    while end < len(line) and line[end] == marker:
+        end += 1
+    length = end - indent
+    if length < 3:
+        return None
+    if marker == "`" and "`" in line[end:].rstrip("\r\n"):
+        return None
+    return marker, length
+
+
+def _is_fence_closing(line: str, marker: str, minimum_length: int) -> bool:
+    indent = len(line) - len(line.lstrip(" "))
+    if indent > 3 or indent >= len(line) or line[indent] != marker:
+        return False
+    end = indent
+    while end < len(line) and line[end] == marker:
+        end += 1
+    return (end - indent) >= minimum_length and not line[end:].strip(" \t\r\n")
+
+
+def _without_fence_terminator(code: str) -> str:
+    """Drop only the line ending that structurally precedes a closing fence."""
+    if code.endswith("\r\n"):
+        return code[:-2]
+    if code.endswith(("\n", "\r")):
+        return code[:-1]
+    return code
+
+
+def message_display_blocks(text: str, *, render_markdown: bool) -> list[dict[str, str]]:
+    """Return safe, display-only blocks while leaving canonical message text intact."""
+    if not render_markdown:
+        return [{"kind": "plain", "text": text}]
+
+    blocks: list[dict[str, str]] = []
+    normal_lines: list[str] = []
+    fenced_lines: list[str] | None = None
+    fence_marker = ""
+    fence_length = 0
+
+    def append_markdown(lines: list[str]) -> None:
+        markdown = _safe_inline_markdown("".join(lines))
+        if markdown.strip():
+            blocks.append({"kind": "markdown", "text": markdown})
+
+    for line in text.splitlines(keepends=True):
+        if fenced_lines is not None:
+            if _is_fence_closing(line, fence_marker, fence_length):
+                blocks.append({"kind": "code", "text": _without_fence_terminator("".join(fenced_lines))})
+                fenced_lines = None
+                fence_marker = ""
+                fence_length = 0
+            else:
+                fenced_lines.append(line)
+            continue
+
+        opening = _fence_opening(line)
+        if opening is not None:
+            if normal_lines:
+                append_markdown(normal_lines)
+                normal_lines.clear()
+            fence_marker, fence_length = opening
+            fenced_lines = []
+        else:
+            normal_lines.append(line)
+    if fenced_lines is not None:
+        blocks.append({"kind": "code", "text": "".join(fenced_lines)})
+    if normal_lines:
+        append_markdown(normal_lines)
+    return blocks
 
 
 class MessageListModel(QAbstractListModel):
     ROLE_ROLE   = Qt.ItemDataRole.UserRole + 1
     TEXT_ROLE   = Qt.ItemDataRole.UserRole + 2
     THUMBS_ROLE = Qt.ItemDataRole.UserRole + 3
+    DISPLAY_BLOCKS_ROLE = Qt.ItemDataRole.UserRole + 4
+    RENDER_MARKDOWN_ROLE = Qt.ItemDataRole.UserRole + 5
 
     def __init__(self, messages: Optional[List[Msg]] = None, parent=None):
         super().__init__(parent)
@@ -90,6 +239,9 @@ class MessageListModel(QAbstractListModel):
         if role == self.ROLE_ROLE: return m.role
         if role == self.TEXT_ROLE: return m.text
         if role == self.THUMBS_ROLE: return m.thumbs or []  # NEW
+        if role == self.DISPLAY_BLOCKS_ROLE:
+            return message_display_blocks(m.text, render_markdown=m.render_markdown)
+        if role == self.RENDER_MARKDOWN_ROLE: return m.render_markdown
         return None
 
     def roleNames(self):
@@ -97,6 +249,8 @@ class MessageListModel(QAbstractListModel):
             self.ROLE_ROLE: b"role",
             self.TEXT_ROLE: b"text",
             self.THUMBS_ROLE: b"thumbs",
+            self.DISPLAY_BLOCKS_ROLE: b"displayBlocks",
+            self.RENDER_MARKDOWN_ROLE: b"renderMarkdown",
         }
 
     def set_thumbs(self, row: int, paths: list[str]):
@@ -129,13 +283,22 @@ class MessageListModel(QAbstractListModel):
         if 0 <= row < len(self._items):
             self._items[row].text = new_text
             ix = self.index(row)
-            self.dataChanged.emit(ix, ix, [self.TEXT_ROLE])
+            self.dataChanged.emit(ix, ix, [self.TEXT_ROLE, self.DISPLAY_BLOCKS_ROLE])
 
     def append_chunk(self, row: int, chunk: str):
         if 0 <= row < len(self._items):
             self._items[row].text += chunk
             ix = self.index(row)
-            self.dataChanged.emit(ix, ix, [self.TEXT_ROLE])
+            self.dataChanged.emit(ix, ix, [self.TEXT_ROLE, self.DISPLAY_BLOCKS_ROLE])
+
+    def set_render_markdown(self, row: int, enabled: bool) -> None:
+        if 0 <= row < len(self._items):
+            message = self._items[row]
+            if message.render_markdown == bool(enabled):
+                return
+            message.render_markdown = bool(enabled)
+            ix = self.index(row)
+            self.dataChanged.emit(ix, ix, [self.DISPLAY_BLOCKS_ROLE, self.RENDER_MARKDOWN_ROLE])
 
     def clear(self):
         if not self._items:
@@ -309,7 +472,7 @@ class ChatDisplay(QWidget):
 
     def begin_assistant_stream(self) -> int:
         # Create with placeholder so QML shows the spinner immediately
-        row = self._model.append_and_index(Msg("assistant", self.PLACEHOLDER))
+        row = self._model.append_and_index(Msg("assistant", self.PLACEHOLDER, render_markdown=False))
         self._call_qml("forceStickAndEnd")
         self._call_qml("ensureAtEnd")
         return row
@@ -322,10 +485,13 @@ class ChatDisplay(QWidget):
             self._model.append_chunk(row, delta)
         self._call_qml("ensureAtEnd")
 
-    def end_assistant_stream(self, row: int):
+    def end_assistant_stream(self, row: int, *, successful: bool):
         # If we ended without receiving any tokens, clear the placeholder so no spinner remains
         if self._model.get_text(row) == self.PLACEHOLDER:
             self._model.set_text(row, "")
+        elif successful:
+            self._model.set_render_markdown(row, True)
+            self._call_qml("ensureAtEnd")
 
     def _root_ctx(self) -> QQmlContext:
         return self.qml.rootContext()

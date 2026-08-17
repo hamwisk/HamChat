@@ -7,6 +7,7 @@ Item {
   signal bubbleActionRequested(string action, int messageIndex, string role, string text)
   property string role: "assistant"
   property string text: ""
+  property var displayBlocks: []
   property int messageIndex: -1
   property var thumbs: []       // array of thumbnail URLs (file://)
   property var theme: ({})    // injected from Python; may be {}
@@ -71,13 +72,26 @@ Item {
 
       property real maxContentWidth: Math.max(0, bubble.maxBubbleWidth - bubble.basePadding - bubble.spinnerSpacing)
 
-      Text {
-        id: content
+      Column {
+        id: messageBlocks
         visible: root.text.length > 0
-        text: root.text
-        wrapMode: Text.Wrap
-        color: textColor
         width: Math.min(contentBox.maxContentWidth, implicitWidth)
+        spacing: 6
+
+        Repeater {
+          model: root.displayBlocks
+
+          delegate: Text {
+            property var block: modelData
+            text: block.text
+            textFormat: block.kind === "markdown" ? Text.MarkdownText : Text.PlainText
+            wrapMode: block.kind === "code" ? Text.WrapAnywhere : Text.Wrap
+            font.family: block.kind === "code" ? "monospace" : Qt.application.font.family
+            color: textColor
+            linkColor: theme.link || accentColor
+            width: Math.min(contentBox.maxContentWidth, implicitWidth)
+          }
+        }
       }
 
       Flow {

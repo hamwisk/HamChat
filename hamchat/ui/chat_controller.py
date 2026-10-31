@@ -87,6 +87,7 @@ class ChatController(QObject):
         # state; forced-low and rejection notices have separate lifecycles.
         self._thinking_capability_notice_model: Optional[str] = None
         self._use_ham_mem = True
+        self._ham_mem_retrieval = (5, 0.25)
         self._conv_id: Optional[int] = None  # lazily created on first user msg
         memory_cfg = getattr(session, "settings", None).get("ham_mem", {}) if session is not None else {}
         embedding_model = (memory_cfg.get("embedding_model") or "nomic-embed-text").strip() if isinstance(memory_cfg, dict) else "nomic-embed-text"
@@ -107,6 +108,12 @@ class ChatController(QObject):
             )
             self._thinking_panel.hamMemChanged.connect(self._on_use_ham_mem_changed, Qt.ConnectionType.QueuedConnection)
 
+        if session is not None and hasattr(session, "get_ham_mem_retrieval"):
+            session.sessionChanged.connect(self._restore_ham_mem_retrieval)
+            self._restore_ham_mem_retrieval()
+        if self._thinking_panel is not None and hasattr(self._thinking_panel, "hamMemRetrievalChanged"):
+            self._thinking_panel.hamMemRetrievalChanged.connect(self._on_ham_mem_retrieval_changed)
+
         # Broker → UI
         self.broker.job_token.connect(self._on_job_token, Qt.ConnectionType.QueuedConnection)
         self.broker.job_thinking.connect(self._on_job_thinking, Qt.ConnectionType.QueuedConnection)
@@ -123,6 +130,20 @@ class ChatController(QObject):
         self._thinking_generation_state: dict[int, dict] = {}
         self._refresh_thinking_controls()
         self._refresh_ham_mem_control()
+
+    def _restore_ham_mem_retrieval(self, _session=None) -> None:
+        self._ham_mem_retrieval = self._session.get_ham_mem_retrieval()
+        if self._thinking_panel is not None and hasattr(self._thinking_panel, "set_ham_mem_retrieval"):
+            self._thinking_panel.set_ham_mem_retrieval(*self._ham_mem_retrieval)
+
+    def _on_ham_mem_retrieval_changed(self, top_k: int, min_similarity: float) -> None:
+        from hamchat.memory_embeddings import validate_retrieval
+        self._ham_mem_retrieval = validate_retrieval(top_k, min_similarity)
+        if self._session is not None:
+            self._session.set_ham_mem_retrieval(*self._ham_mem_retrieval)
+
+    def _lifecycle_blocked(self) -> bool:
+        return bool(getattr(getattr(self, "_session", None), "model_lifecycle_busy", False))
 
     def _clear_thinking(self) -> None:
         if self._thinking_panel is not None:
@@ -565,6 +586,8 @@ class ChatController(QObject):
             return [injection] if injection is not None else []
         memory_context, memory_status, details = MemoryEmbeddingService.format_context(
             prompt, self._memory_provider, snapshot, return_details=True,
+            top_k=getattr(self, "_ham_mem_retrieval", (5, 0.25))[0],
+            min_similarity=getattr(self, "_ham_mem_retrieval", (5, 0.25))[1],
         )
         self._report_ham_mem(memory_status)
         prefix: List[ChatMessage] = []
@@ -695,6 +718,8 @@ class ChatController(QObject):
         - Persists to DB first (if enabled) and captures the message row id.
         - Appends a ChatMessage with metadata for attachments.
         """
+        if ChatController._lifecycle_blocked(self):
+            return
         if self._local_command_handler:
             try:
                 if self._local_command_handler(text):
@@ -767,6 +792,8 @@ class ChatController(QObject):
         Send a user turn that includes vision parts (base64 images).
         Media parts go to the backend via llm_parts; metadata tracks attachments for history.
         """
+        if ChatController._lifecycle_blocked(self):
+            return
         # Persist first (if enabled) and capture DB row id
         msg_db_id = self._persist_user_with_attachments(text, attachments_meta)
 
@@ -1091,6 +1118,8 @@ class ChatController(QObject):
 
     def resend_message(self, index: int):
         """Resend from this user message: truncate after it, then replay it."""
+        if ChatController._lifecycle_blocked(self):
+            return
         payload = self._prepare_resend(index)
         if not payload:
             return
@@ -1128,6 +1157,8 @@ class ChatController(QObject):
 
         Unlike resend_message(), this does NOT actually send anything.
         """
+        if ChatController._lifecycle_blocked(self):
+            return
         payload = self._prepare_resend(index)
         if not payload:
             return None

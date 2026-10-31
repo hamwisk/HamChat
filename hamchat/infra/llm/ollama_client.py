@@ -456,15 +456,18 @@ class OllamaClient(ModelClient):
         model: str,
         options: Optional[Dict] = None,
         request_id: Optional[str] = None,
+        force: bool = False,
     ) -> RuntimeContext:
         """Preload a model and discover its runtime context before real chat work."""
         request_id = request_id or uuid.uuid4().hex[:8]
         effective_options = dict(options or {})
         cache_key = self._runtime_context_cache_key(model, effective_options)
         cached = self._runtime_context_cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and not force:
             return RuntimeContext(context_length=cached, source="cache")
 
+        if force:
+            self.invalidate_runtime_context(model=model)
         preload_started = time.monotonic()
         try:
             preload = requests.post(

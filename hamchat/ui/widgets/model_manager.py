@@ -524,7 +524,8 @@ class ModelManager(QWidget):
             self.sig_model_activated.emit(model_id)
 
     def _on_unload_all_clicked(self) -> None:
-        if self._unload_busy:
+        if self._unload_busy or getattr(self._session, "model_lifecycle_busy", False):
+            self.unload_status.setText("Wait for the current model operation.")
             return
         try:
             active = bool(self._is_generation_active())
@@ -536,6 +537,8 @@ class ModelManager(QWidget):
 
         from hamchat.infra.llm.ollama_client import OllamaClient
         self._unload_busy = True
+        if hasattr(self._session, "set_model_lifecycle_busy"):
+            self._session.set_model_lifecycle_busy(True)
         self.btn_unload_all.setEnabled(False)
         self.unload_status.setText("Unloading Ollama models…")
         client = self._ollama_client or OllamaClient()
@@ -545,6 +548,9 @@ class ModelManager(QWidget):
         _ACTIVE_UNLOAD_JOBS[job_id] = (thread, worker)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        if hasattr(self._session, "set_model_lifecycle_busy"):
+            session = self._session
+            worker.done.connect(lambda *_args: session.set_model_lifecycle_busy(False))
         worker.done.connect(self._on_unload_finished)
         worker.done.connect(thread.quit)
         worker.done.connect(worker.deleteLater)

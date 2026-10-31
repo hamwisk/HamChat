@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QDateTime, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, QToolButton, QFrame, QFormLayout,
     QFileDialog, QMessageBox, QHBoxLayout, QSizePolicy, QListWidget, QListWidgetItem,
-    QAbstractItemView, QMenu, QPlainTextEdit, QComboBox, QCheckBox
+    QAbstractItemView, QMenu, QPlainTextEdit, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox
 )
 from PyQt6.QtGui import QTextCursor
 
@@ -53,6 +53,7 @@ class ChatPanel(QWidget):
     attachmentScrollRequested = pyqtSignal(int)
     thinkingModeChanged = pyqtSignal(str)
     hamMemChanged = pyqtSignal(bool)
+    hamMemRetrievalChanged = pyqtSignal(int, float)
 
     def __init__(self, parent=None, *, chat_display=None, attachments_loader=None):
         super().__init__(parent)
@@ -144,6 +145,25 @@ class ChatPanel(QWidget):
         self._use_ham_mem.setToolTip("Controls whether HamMem memories are retrieved and included in the next request.")
         self._use_ham_mem.toggled.connect(self.hamMemChanged)
         memory_layout.addWidget(self._use_ham_mem)
+        retrieval_form = QFormLayout()
+        retrieval_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self._memory_maximum = QSpinBox(memory_body)
+        self._memory_maximum.setRange(1, 100)
+        self._memory_maximum.setValue(5)
+        self._memory_maximum.setToolTip("Limits the number of relevant memories selected by semantic retrieval.")
+        self._memory_relevance = QDoubleSpinBox(memory_body)
+        self._memory_relevance.setRange(-1.0, 1.0)
+        self._memory_relevance.setDecimals(2)
+        self._memory_relevance.setSingleStep(0.05)
+        self._memory_relevance.setValue(0.25)
+        self._memory_relevance.setToolTip("Excludes weaker matches using cosine similarity (-1 to 1). This is not a confidence percentage.")
+        retrieval_form.addRow("Maximum memories:", self._memory_maximum)
+        retrieval_form.addRow("Minimum relevance:", self._memory_relevance)
+        memory_layout.addLayout(retrieval_form)
+        for control in (self._memory_maximum, self._memory_relevance):
+            control.valueChanged.connect(lambda _value: self.hamMemRetrievalChanged.emit(
+                self._memory_maximum.value(), self._memory_relevance.value()))
+        self._use_ham_mem.toggled.connect(self._update_retrieval_enabled)
         self._memory_view = QPlainTextEdit(memory_body)
         self._memory_view.setReadOnly(True)
         self._memory_view.setPlainText("")
@@ -296,6 +316,19 @@ class ChatPanel(QWidget):
         if control_enabled is not None:
             self._use_ham_mem.setEnabled(control_enabled)
         self._use_ham_mem.blockSignals(False)
+        self._update_retrieval_enabled()
+
+    def _update_retrieval_enabled(self, _checked=None) -> None:
+        enabled = self._use_ham_mem.isChecked() and self._use_ham_mem.isEnabled()
+        self._memory_maximum.setEnabled(enabled)
+        self._memory_relevance.setEnabled(enabled)
+
+    def set_ham_mem_retrieval(self, top_k: int, min_similarity: float) -> None:
+        for control, value in ((self._memory_maximum, top_k), (self._memory_relevance, min_similarity)):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
+        self._update_retrieval_enabled()
 
     def clear_memory_snapshot(self) -> None:
         self._memory_view.clear()

@@ -31,6 +31,8 @@ class SessionData:
 
 
 class SessionManager(QObject):
+    modelLifecycleChanged = pyqtSignal(bool)
+    model_lifecycle_busy = False
     sessionChanged = pyqtSignal(object)   # emits SessionData
     prefsChanged   = pyqtSignal(object)   # emits Preferences
     modelContextAllocationChanged = pyqtSignal(str, str)  # model_id, allocation mode
@@ -170,6 +172,29 @@ class SessionManager(QObject):
         except Exception:
             self.current.profile_id = None
         self.sessionChanged.emit(self.current)
+
+    def get_ham_mem_retrieval(self) -> tuple[int, float]:
+        from hamchat.memory_embeddings import validate_retrieval
+        saved = self.settings.get("ham_mem_retrieval", {})
+        key = str(self.current.user_id) if self.current.user_id is not None else "guest"
+        entry = saved.get(key, {}) if isinstance(saved, dict) else {}
+        try:
+            return validate_retrieval(entry.get("top_k", 5), entry.get("min_similarity", 0.25))
+        except (ValueError, AttributeError):
+            return 5, 0.25
+
+    def set_ham_mem_retrieval(self, top_k: int, min_similarity: float) -> None:
+        from hamchat.memory_embeddings import validate_retrieval
+        top_k, min_similarity = validate_retrieval(top_k, min_similarity)
+        saved = self.settings.get("ham_mem_retrieval", {})
+        saved = dict(saved) if isinstance(saved, dict) else {}
+        key = str(self.current.user_id) if self.current.user_id is not None else "guest"
+        saved[key] = {"top_k": top_k, "min_similarity": min_similarity}
+        self.settings.set("ham_mem_retrieval", saved)
+
+    def set_model_lifecycle_busy(self, busy: bool) -> None:
+        self.model_lifecycle_busy = busy
+        self.modelLifecycleChanged.emit(busy)
 
     # --- Model helpers ---
 

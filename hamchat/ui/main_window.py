@@ -143,6 +143,11 @@ class MainWindow(QMainWindow):
             get_models=self.session.get_model_choices,
             set_current_model=self._on_model_changed_from_menu,
             open_model_manager=self._open_model_manager,
+            unload_all_models=lambda: self.model_lifecycle.start("unload"),
+            warm_selected_model=lambda: self.model_lifecycle.start("warm"),
+            model_actions_available=lambda: (
+                not self.session.model_lifecycle_busy
+                and self.chat_controller.broker.active_ticket() == -1),
             get_update_mode=(update_controller.mode_value if update_controller else (lambda: "ask")),
             set_update_mode=(update_controller.set_mode if update_controller else (lambda _value: None)),
             check_updates=(update_controller.check_manually if update_controller else (lambda: None)),
@@ -173,6 +178,12 @@ class MainWindow(QMainWindow):
             self.chat_controller.forked_conversation.connect(self._open_conversation)
         except Exception:
             pass
+        from .model_lifecycle import ModelLifecycle
+        self.model_lifecycle = ModelLifecycle(self.session, self.chat_controller, self)
+        self.model_lifecycle.status.connect(
+            lambda message: self.statusBar().showMessage(
+                message, 0 if self.session.model_lifecycle_busy else 8000))
+        self.session.modelLifecycleChanged.connect(self._on_model_lifecycle_busy)
         self.chat_controller.ham_mem_status.connect(self._show_ham_mem_status)
         self.session.modelContextAllocationChanged.connect(
             self.chat_controller.on_model_context_allocation_changed
@@ -684,7 +695,15 @@ class MainWindow(QMainWindow):
 
         self.top_panel.open_with(form)
 
+    def _on_model_lifecycle_busy(self, busy: bool) -> None:
+        self.top_panel.setEnabled(not busy)
+        self.chat_display.setEnabled(not busy)
+        self.chat_panel.setEnabled(not busy)
+        self.side_panel.setEnabled(not busy)
+
     def _on_model_changed_from_menu(self, model_id: str) -> None:
+        if self.session.model_lifecycle_busy:
+            return
         # 1) Update session + persist
         self.session.set_model_id(model_id)
 
@@ -716,6 +735,8 @@ class MainWindow(QMainWindow):
 
         def _on_model_activated(mid: str):
             # Switch session + controller to the chosen model
+            if self.session.model_lifecycle_busy:
+                return
             self.session.set_model_id(mid)
             new_client = self._make_model_client(mid)
             if hasattr(self.chat_controller, "set_model_client"):
@@ -1472,6 +1493,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.exception("hard_kill failed: %s", e)
 
+        if getattr(self.session, "model_lifecycle_busy", False):
+            return
         if not isinstance(model_client, OllamaClient) or not model_name:
             return
         try:

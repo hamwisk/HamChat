@@ -28,11 +28,17 @@ class Menus:
         get_models: Callable[[], Iterable[tuple[str, str]]],
         set_current_model: Callable[[str], None],
         open_model_manager: Callable[[], None],
+        unload_all_models: Callable[[], None] = lambda: None,
+        warm_selected_model: Callable[[], None] = lambda: None,
+        model_actions_available: Callable[[], bool] = lambda: True,
         get_update_mode: Callable[[], str] = lambda: "ask",
         set_update_mode: Callable[[str], None] = lambda _value: None,
         check_updates: Callable[[], None] = lambda: None,
         show_about: Callable[[], None] = lambda: None,
     ) -> None:
+        self._unload_all_models = unload_all_models
+        self._warm_selected_model = warm_selected_model
+        self._model_actions_available = model_actions_available
         self.mb = menubar
         self._get_spell_enabled = get_spell_enabled
         self._get_locale = get_locale
@@ -121,6 +127,15 @@ class Menus:
 
     def _model_menu(self) -> None:
         m = self.mb.addMenu("&Model")
+
+        unload = m.addAction("Unload all models", self._unload_all_models)
+        warm = m.addAction("Load and warm selected model", self._warm_selected_model)
+        m.addSeparator()
+        def update_actions():
+            enabled = self._model_actions_available()
+            for action in m.actions():
+                action.setEnabled(enabled)
+        m.aboutToShow.connect(update_actions)
 
         models = list(self._get_models() or [])
         current = self._get_current_model()

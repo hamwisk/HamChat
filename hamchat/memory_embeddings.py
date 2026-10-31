@@ -18,6 +18,17 @@ EMBEDDING_FORMAT_VERSION = 1
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_TOP_K = 5
 DEFAULT_MIN_SIMILARITY = 0.25
+MAX_TOP_K = 100
+
+
+def validate_retrieval(top_k, min_similarity) -> tuple[int, float]:
+    if type(top_k) is not int or not 1 <= top_k <= MAX_TOP_K:
+        raise ValueError("Maximum memories must be an integer from 1 to 100.")
+    if (type(min_similarity) not in (int, float)
+            or not np.isfinite(min_similarity) or not -1 <= min_similarity <= 1):
+        raise ValueError("Minimum relevance must be a cosine similarity from -1 to 1.")
+    return top_k, float(min_similarity)
+
 
 
 class EmbeddingProvider(Protocol):
@@ -231,6 +242,7 @@ class MemoryEmbeddingService:
 
     @staticmethod
     def format_context(query: str, provider: EmbeddingProvider, snapshot, *, top_k: int = DEFAULT_TOP_K, min_similarity: float = DEFAULT_MIN_SIMILARITY, return_details: bool = False):
+        top_k, min_similarity = validate_retrieval(top_k, min_similarity)
         candidates, globals_text = snapshot
         selected=[]; status="no relevant memories"
         try:
@@ -278,7 +290,7 @@ class MemoryEmbeddingService:
             exclusions[memory_id] = "corrupt_embedding"; return None
 
     def inspect(self, query: str, *, user_id: int, role: str, conversation_id: Optional[int] = None, profile_id: Optional[int] = None, top_k: int = DEFAULT_TOP_K, min_similarity: float = DEFAULT_MIN_SIMILARITY) -> RetrievalInspection:
-        if top_k < 1 or not -1.0 <= min_similarity <= 1.0: raise ValueError("Invalid retrieval limits.")
+        top_k, min_similarity = validate_retrieval(top_k, min_similarity)
         query_vector = normalize_vector(self.provider.embed_one(query))
         role = str(role).lower(); exclusions: dict[int, str] = {}
         globals_ = self.conn.execute("SELECT id FROM persistent_memory WHERE scope='global' AND enabled=1 ORDER BY id").fetchall()

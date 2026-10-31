@@ -569,7 +569,7 @@ class ChatController(QObject):
         if memory_context and memory_context.startswith("[HamMem administrative"):
             global_part, _, relevant_part = memory_context.partition("\n\n[HamMem relevant memory]")
             managed = details["managed"]
-            marker = {"ham_mem_view": global_part if role == "admin" else f"{len(managed)} managed memor{'y' if len(managed) == 1 else 'ies'} included"}
+            marker = {"ham_mem_view": global_part if role == "admin" else f"{len(managed)} managed memor{'y' if len(managed) == 1 else 'ies'} included", "ham_mem_count": (len(managed), 0)}
             prefix.append(ChatMessage(role="system", content=global_part, metadata=marker))
         else:
             relevant_part = memory_context or ""
@@ -577,13 +577,22 @@ class ChatController(QObject):
             prefix.append(injection)
         if relevant_part:
             content = "[HamMem relevant memory]" + relevant_part if not relevant_part.startswith("[HamMem") else relevant_part
-            prefix.append(ChatMessage(role="system", content=content, metadata={"ham_mem_view": content}))
+            prefix.append(ChatMessage(role="system", content=content, metadata={"ham_mem_view": content, "ham_mem_count": (0, len(details["semantic"]))}))
         return prefix
 
     @staticmethod
     def _final_memory_snapshot(messages: List[ChatMessage]) -> Optional[str]:
         parts = [str(message.metadata["ham_mem_view"]) for message in messages if message.metadata and message.metadata.get("ham_mem_view")]
         return "\n\n".join(parts) if parts else None
+
+    def _report_final_memory_snapshot(self, messages: List[ChatMessage]) -> Optional[str]:
+        counts = [message.metadata["ham_mem_count"] for message in messages
+                  if message.metadata and "ham_mem_count" in message.metadata]
+        if counts:
+            managed = sum(count[0] for count in counts)
+            semantic = sum(count[1] for count in counts)
+            self._report_ham_mem(f"HamMem: {semantic} relevant included, {managed} global included")
+        return self._final_memory_snapshot(messages)
 
     def _make_text_stream(self, injection: Optional[ChatMessage], options: Optional[Dict] = None, memory_snapshot=None):
         """Create a text-only stream using a prompt resolved on the GUI thread."""
@@ -628,7 +637,7 @@ class ChatController(QObject):
             build_options=_build_options,
             build_thinking=lambda: thinking_mode,
             build_requested_thinking=lambda: requested_thinking_mode,
-            on_final_messages=self._final_memory_snapshot,
+            on_final_messages=self._report_final_memory_snapshot,
         )
         setattr(stream, "_thinking_generation", (requested_thinking_mode, thinking_mode))
         return stream
@@ -815,7 +824,7 @@ class ChatController(QObject):
             build_options=build_options,
             build_thinking=lambda: thinking_mode,
             build_requested_thinking=lambda: requested_thinking_mode,
-            on_final_messages=self._final_memory_snapshot,
+            on_final_messages=self._report_final_memory_snapshot,
         )
 
         self._active_ticket = self.broker.submit(stream_func, text)

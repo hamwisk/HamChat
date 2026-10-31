@@ -84,3 +84,24 @@ def test_memory_snapshot_uses_ticket_and_never_enters_assistant_buffer():
 
     assert panel.memory == "included memory"
     assert state._assistant_buf == ["answer"]
+
+
+def test_included_counts_follow_final_messages_and_rejection_leaves_panel_empty():
+    statuses = []
+    state = SimpleNamespace(
+        _report_ham_mem=statuses.append,
+        _final_memory_snapshot=ChatController._final_memory_snapshot,
+    )
+    messages = [
+        ChatMessage("system", "global", metadata={"ham_mem_view": "global", "ham_mem_count": (1, 0)}),
+        ChatMessage("system", "profile"),
+        ChatMessage("system", "semantic", metadata={"ham_mem_view": "semantic", "ham_mem_count": (0, 2)}),
+        ChatMessage("user", "question"),
+    ]
+    assert ChatController._report_final_memory_snapshot(state, messages) == "global\n\nsemantic"
+    assert statuses == ["HamMem: 2 relevant included, 1 global included"]
+
+    panel = SimpleNamespace(memory="previous", clear_memory_snapshot=lambda: None)
+    panel.clear_memory_snapshot = lambda: setattr(panel, "memory", "")
+    ChatController._clear_memory_snapshot(SimpleNamespace(_thinking_panel=panel))
+    assert panel.memory == ""

@@ -55,7 +55,9 @@ def test_oldest_complete_turn_is_trimmed_first_and_no_message_is_cut():
         message("user", "new" * 40),
     ]
 
-    result = plan(messages, context=2700)
+    # One old turn must go to leave the default 2048-token output budget;
+    # after that removal, the remaining turn still fits at this allocation.
+    result = plan(messages, context=3300)
 
     assert result.outcome == "trimmed"
     assert result.omitted_turn_count == 1

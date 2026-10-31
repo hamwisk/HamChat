@@ -1,73 +1,290 @@
 {
   "schema_version": 2,
-  "version": "2.7.4",
-  "git_ref": "v2.7.4",
-  "release_notes": "updates/2.7.4.md",
+  "version": "2.7.5",
+  "git_ref": "v2.7.5",
+  "release_notes": "updates/2.7.5.md",
   "data_compatibility": {
     "database_schema_version": "2026-08-03.2",
     "data_layout_version": 1,
     "data_mutation_required": false
   },
   "release_payload": {
-    "url": "https://codeload.github.com/hamwisk/HamChat/zip/refs/tags/v2.7.4",
+    "url": "https://codeload.github.com/hamwisk/HamChat/zip/refs/tags/v2.7.5",
     "format": "zip",
-    "size": 336612,
-    "sha256": "036de7c9c835e3b2d4ab65353895bc0df06bf41ac9bd1dea55697221bc1e6681",
-    "root_prefix": "HamChat-2.7.4",
+    "size": 354405,
+    "sha256": "a8ebb8371ecb6a4bfb47c0ba3dbb30068a3d9fa22ecbca81526f9a2775ed15a1",
+    "root_prefix": "HamChat-2.7.5",
     "files": [
-      {"path": "hamchat/__init__.py", "size": 129, "sha256": "46ba4ac03b8cb3a9f5058ea62efa4bb6e2f4559d979b0ee0077b9a43837de765"},
-      {"path": "hamchat/app.py", "size": 12260, "sha256": "9c541c3966104767673e1f11b9bd759b112351f0940421298ddf2518dec18ee5"},
-      {"path": "hamchat/constants.py", "size": 235, "sha256": "30b31a2abc2be1f10b96543d18fe75e298039af0c182a073d47c8e317cd8b786"},
-      {"path": "hamchat/core/session.py", "size": 15024, "sha256": "7395d39838c1cacd69cccedf361dd75140f9b233d835675163866113f04f9fdc"},
-      {"path": "hamchat/core/settings.py", "size": 698, "sha256": "a8859bb0c62bdf134898e99b270af39b4e61690c4c66bd764b771078c8a01353"},
-      {"path": "hamchat/core/spell_highlighter.py", "size": 4534, "sha256": "88e164f727821b3aba8e8e66107ccefc87bf36272ec5188871274a49c177d9d3"},
-      {"path": "hamchat/db_init.py", "size": 30045, "sha256": "69457df2e2982f9b8d305bbe3bc174cff93c4166c49805a2d502f3af50580143"},
-      {"path": "hamchat/db_ops.py", "size": 43118, "sha256": "0bca136e392e27d7dafccd5dcfcf6e0852e65129ba3706484b3d83495369eafd"},
-      {"path": "hamchat/infra/llm/backend_adapter.py", "size": 5244, "sha256": "003126f1913241b72157cc0548fb45aaecab27dd6aa5361fce449fc2740c12a4"},
-      {"path": "hamchat/infra/llm/base.py", "size": 797, "sha256": "641ad06a76d5c0cb52000f68159c4d95828ccf3bbaf5b00341fee5156cef3589"},
-      {"path": "hamchat/infra/llm/ollama_client.py", "size": 33274, "sha256": "c463c4c077d936ac7e5c56bdfc1eb65c0e73dfcc52c59691341ca8eecc026922"},
-      {"path": "hamchat/infra/llm/ollama_planner.py", "size": 6040, "sha256": "ff018b63a01ac97fa83d7bc135d341d9d769544d59438a61db1e20eb164c5a57"},
-      {"path": "hamchat/infra/llm/ollama_registry.py", "size": 14009, "sha256": "5d5277b3a4ef4d98fde960fd55d557e3718944eb4e408743016aaf89ccd094d0"},
-      {"path": "hamchat/infra/llm/openai_client.py", "size": 2563, "sha256": "01e9c2b4f8477817f59d40ee1b7897b8b3423da8aa1b7d9a41520d61b5706e3c"},
-      {"path": "hamchat/infra/llm/registry_layers.py", "size": 14216, "sha256": "85e6cd96aecac4479df5d2f5f1eb6e8a68c832e04eb1be1b8541ce4539c209bf"},
-      {"path": "hamchat/infra/llm/thread_broker.py", "size": 7103, "sha256": "7279a87a8358a061cb669db28534d5f330caeef42e5fbe9ef641eb527dff9b9c"},
-      {"path": "hamchat/legacy_registry_migration.py", "size": 14392, "sha256": "f90cfb1209bd5934cc516ca255566810b4e8dd6c0b44dfe23f219c1810b38e0b"},
-      {"path": "hamchat/logging_config.py", "size": 3176, "sha256": "c7ef6ce07a3e8f389e874d7525e77fc69327892fe0b464db72cf9c5700bcb4f1"},
-      {"path": "hamchat/media_helper.py", "size": 11565, "sha256": "18f260d4b615df7027806638bbcd37d5b416e59e96e87f4b03286309d91a88cf"},
-      {"path": "hamchat/memory_embeddings.py", "size": 16588, "sha256": "d89e98666ecfe46bbf982017c20a17dd628c65cea0b7c638b16ba3ab83109ef4"},
-      {"path": "hamchat/paths.py", "size": 892, "sha256": "da1c1a81032cb3617f6057741948d2b773d7bde517358dfe8ba9333ca6581fcc"},
-      {"path": "hamchat/settings.py", "size": 2038, "sha256": "63ede0512619be67fdb8c28cac0779cc0bb32e6993341999928ab1b33e295fef"},
-      {"path": "hamchat/splash_worker.py", "size": 1443, "sha256": "9b4aa5010a9e9bdbee0ff3d44a7a0ba6ae381b4de4200806670de316803a8e6d"},
-      {"path": "hamchat/system_update_executor.py", "size": 20954, "sha256": "3bf615094dc095b7efc1fd3884c00d8ac4b664e49ff6060dbc19125bf8a13cbd"},
-      {"path": "hamchat/ui/__init__.py", "size": 57, "sha256": "0dff2423044a72eda7fbca8ece28ca6f9838ac1c478969051d45efd883ce371d"},
-      {"path": "hamchat/ui/chat_controller.py", "size": 64907, "sha256": "9ed0b401549be32a9f52b01c3a4b3daae5597d0e2ffd71fe3c8468ecf6db5aac"},
-      {"path": "hamchat/ui/ham_ico.ico", "size": 130943, "sha256": "a8a8e386693776f13eec975180849dcc6b3b9fcdedb99e55859367a41409ab1a"},
-      {"path": "hamchat/ui/logo.png", "size": 12164, "sha256": "705c2e501f6c72b4af984ad6543c17ecf079df792e69f84bc431f340e151595b"},
-      {"path": "hamchat/ui/main_window.py", "size": 59079, "sha256": "be9c970cb5f6d61305f1b4b699f827c3d3592dce5d0d77c32994590721c3bb8f"},
-      {"path": "hamchat/ui/menus.py", "size": 5908, "sha256": "ea20c42e1a00412d891ae393d0973bff7ace906341f1f159ece2560806b19124"},
-      {"path": "hamchat/ui/splash.py", "size": 10450, "sha256": "c4c432ef603e34e1e189475aca661aa46081f81614629f7a9072451ded0fbb60"},
-      {"path": "hamchat/ui/theme.py", "size": 11801, "sha256": "50ce4e13f3d7cb438c80e0133e9ef5f9e59d5c0fcb07a2651fa84a0c2142c750"},
-      {"path": "hamchat/ui/widgets/ai_profiles_manager.py", "size": 27120, "sha256": "c33948594be858dd734ef68fe87ca610b3eb6dd0201d99bb2d45c558283e6a15"},
-      {"path": "hamchat/ui/widgets/chat_display.py", "size": 27186, "sha256": "cdaa58ce7c20dc8cf6c980004ea7ef4c3ed5be6147753e0ace00681e22f35b13"},
-      {"path": "hamchat/ui/widgets/chat_panel.py", "size": 18231, "sha256": "decc77b6543daacfd4b260f47ddda30f0071bf24ab0730ba3344df1517c50611"},
-      {"path": "hamchat/ui/widgets/login_form.py", "size": 7570, "sha256": "1281fddcd2dfabf22aebb72f554f808fd0492dca4f8e85a23b229288b755a656"},
-      {"path": "hamchat/ui/widgets/memory_manager.py", "size": 13626, "sha256": "8326839649823e77a209309255f1e56c3f373015a9d937df411988de62d836d1"},
-      {"path": "hamchat/ui/widgets/model_manager.py", "size": 21122, "sha256": "b492cdef551367b8f662012e91399f400ffe6a72d149e2cd72e1fbf83a758cbe"},
-      {"path": "hamchat/ui/widgets/prompt_input.py", "size": 6194, "sha256": "99bba625bdd8ee599ac6bf1447e3b7afbe75101182f21fe5f1abcc5b1fb9a371"},
-      {"path": "hamchat/ui/widgets/qml/ChatView.qml", "size": 4683, "sha256": "2b4f12cc18660966a963769ae97f4579ded187eb5d7fd467234f247486935dfb"},
-      {"path": "hamchat/ui/widgets/qml/MessageBubble.qml", "size": 6391, "sha256": "d543b01ed449161245be4288a85191e862728506b40b7b575c052a78fb3ee573"},
-      {"path": "hamchat/ui/widgets/side_panel.py", "size": 22655, "sha256": "3ed760fdcf17f55321dfd4a2e289ae6d77152846503cfd8c47381e1604dbdf89"},
-      {"path": "hamchat/ui/widgets/test_form.py", "size": 553, "sha256": "390f7e6d176d78612ce10b55a56c34c947a00d54a84ab8f3a3e12c38bcefc870"},
-      {"path": "hamchat/ui/widgets/top_panel.py", "size": 1795, "sha256": "d101c26fce2223b78dd2b8653db3202088b8eb3fc125724ff5fbd2708e50722b"},
-      {"path": "hamchat/update_acquisition.py", "size": 18313, "sha256": "3a1ffda5bcbeaca8961b5bac52a0f36528fadc69246db539d36fc9a74e7c167e"},
-      {"path": "hamchat/update_assessment.py", "size": 16330, "sha256": "3f5c982f92ceffe2ba636a97febb90721f21311051bcf0e3da1ba572528d75f1"},
-      {"path": "hamchat/update_controller.py", "size": 14850, "sha256": "4a3415148897934019f723488db560a1cd06d2e7820c99e0e846aed58366929a"},
-      {"path": "hamchat/update_preservation.py", "size": 24789, "sha256": "f1f7eacb7ec1d40c09ee06a4887fd801f780beb2f2b597419cb0de27a3050ddf"},
-      {"path": "hamchat/updates.py", "size": 27496, "sha256": "e106e852ab6dadef9498b9da4396326006f9ba07412b468ead8089beb18910ac"},
-      {"path": "main.py", "size": 86, "sha256": "e65e29307eb03e3171a3ae4f34b9fddc4310a6c29c9dc6c0c327af6d5e10b9cd"},
-      {"path": "requirements.txt", "size": 551, "sha256": "560be120f958119a69fc6baecc4298a6c57a5785ae4831b2d9c3c2f6c97a12cc"},
-      {"path": "run_hamchat.sh", "size": 349, "sha256": "e70d3fe3f9f33fe55328976cf052738a20a6a7ee5b92d52dc0d95c239884f98e"},
-      {"path": "setup_venv.sh", "size": 127, "sha256": "441dd51bb9f4be05f200258e95d23ce4b2b1153bd8cf3955b383430038d95827"}
+      {
+        "path": "hamchat/__init__.py",
+        "size": 129,
+        "sha256": "46ba4ac03b8cb3a9f5058ea62efa4bb6e2f4559d979b0ee0077b9a43837de765"
+      },
+      {
+        "path": "hamchat/app.py",
+        "size": 12260,
+        "sha256": "9c541c3966104767673e1f11b9bd759b112351f0940421298ddf2518dec18ee5"
+      },
+      {
+        "path": "hamchat/constants.py",
+        "size": 235,
+        "sha256": "66e6aa1be14194f592134eee5879a6dee63fa7574c92ef296204adfef6228ec9"
+      },
+      {
+        "path": "hamchat/core/session.py",
+        "size": 17146,
+        "sha256": "72cd4da13a88212af27adc6e1269e359070cd6ff0425f2cd8eca483034ad8912"
+      },
+      {
+        "path": "hamchat/core/settings.py",
+        "size": 698,
+        "sha256": "a8859bb0c62bdf134898e99b270af39b4e61690c4c66bd764b771078c8a01353"
+      },
+      {
+        "path": "hamchat/core/spell_highlighter.py",
+        "size": 4534,
+        "sha256": "88e164f727821b3aba8e8e66107ccefc87bf36272ec5188871274a49c177d9d3"
+      },
+      {
+        "path": "hamchat/db_init.py",
+        "size": 30045,
+        "sha256": "69457df2e2982f9b8d305bbe3bc174cff93c4166c49805a2d502f3af50580143"
+      },
+      {
+        "path": "hamchat/db_ops.py",
+        "size": 43176,
+        "sha256": "40e8d477ba77aed2f8553268548cbffbc326ffa7f4193edbe7db15acfe57c5a9"
+      },
+      {
+        "path": "hamchat/infra/llm/backend_adapter.py",
+        "size": 5265,
+        "sha256": "e22d6f50ea63fa61873be82a563426d452a3abf62eb6831396c876656e9f3c26"
+      },
+      {
+        "path": "hamchat/infra/llm/base.py",
+        "size": 797,
+        "sha256": "641ad06a76d5c0cb52000f68159c4d95828ccf3bbaf5b00341fee5156cef3589"
+      },
+      {
+        "path": "hamchat/infra/llm/ollama_client.py",
+        "size": 34000,
+        "sha256": "49e676a76557a74132cfe5f3f720df2f331a9edea5a1c6e0bfa230bd069a833c"
+      },
+      {
+        "path": "hamchat/infra/llm/ollama_planner.py",
+        "size": 7023,
+        "sha256": "364f69dc693f4c45af318444c47072f31fba56fc25841d035c5eb75c7d6cbcf9"
+      },
+      {
+        "path": "hamchat/infra/llm/ollama_registry.py",
+        "size": 14009,
+        "sha256": "5d5277b3a4ef4d98fde960fd55d557e3718944eb4e408743016aaf89ccd094d0"
+      },
+      {
+        "path": "hamchat/infra/llm/openai_client.py",
+        "size": 2563,
+        "sha256": "01e9c2b4f8477817f59d40ee1b7897b8b3423da8aa1b7d9a41520d61b5706e3c"
+      },
+      {
+        "path": "hamchat/infra/llm/registry_layers.py",
+        "size": 14216,
+        "sha256": "85e6cd96aecac4479df5d2f5f1eb6e8a68c832e04eb1be1b8541ce4539c209bf"
+      },
+      {
+        "path": "hamchat/infra/llm/thread_broker.py",
+        "size": 7124,
+        "sha256": "b1817904d03ca90401a67a12d27f0fb33bf0b115577fc9a7392fdd852bad8123"
+      },
+      {
+        "path": "hamchat/legacy_registry_migration.py",
+        "size": 14392,
+        "sha256": "f90cfb1209bd5934cc516ca255566810b4e8dd6c0b44dfe23f219c1810b38e0b"
+      },
+      {
+        "path": "hamchat/logging_config.py",
+        "size": 3176,
+        "sha256": "c7ef6ce07a3e8f389e874d7525e77fc69327892fe0b464db72cf9c5700bcb4f1"
+      },
+      {
+        "path": "hamchat/media_helper.py",
+        "size": 11565,
+        "sha256": "18f260d4b615df7027806638bbcd37d5b416e59e96e87f4b03286309d91a88cf"
+      },
+      {
+        "path": "hamchat/memory_embeddings.py",
+        "size": 17523,
+        "sha256": "047c36901b9a355ca3c5a6f27f24645e5b545842917bf14b6cc58efae68634c7"
+      },
+      {
+        "path": "hamchat/paths.py",
+        "size": 892,
+        "sha256": "da1c1a81032cb3617f6057741948d2b773d7bde517358dfe8ba9333ca6581fcc"
+      },
+      {
+        "path": "hamchat/settings.py",
+        "size": 2038,
+        "sha256": "63ede0512619be67fdb8c28cac0779cc0bb32e6993341999928ab1b33e295fef"
+      },
+      {
+        "path": "hamchat/splash_worker.py",
+        "size": 1443,
+        "sha256": "9b4aa5010a9e9bdbee0ff3d44a7a0ba6ae381b4de4200806670de316803a8e6d"
+      },
+      {
+        "path": "hamchat/system_update_executor.py",
+        "size": 20954,
+        "sha256": "3bf615094dc095b7efc1fd3884c00d8ac4b664e49ff6060dbc19125bf8a13cbd"
+      },
+      {
+        "path": "hamchat/ui/__init__.py",
+        "size": 57,
+        "sha256": "0dff2423044a72eda7fbca8ece28ca6f9838ac1c478969051d45efd883ce371d"
+      },
+      {
+        "path": "hamchat/ui/chat_controller.py",
+        "size": 67771,
+        "sha256": "fa7703b77b4e71e699d73476c3e05df177a5f3d773c41b20c748fa570254c71d"
+      },
+      {
+        "path": "hamchat/ui/ham_ico.ico",
+        "size": 130943,
+        "sha256": "a8a8e386693776f13eec975180849dcc6b3b9fcdedb99e55859367a41409ab1a"
+      },
+      {
+        "path": "hamchat/ui/logo.png",
+        "size": 12164,
+        "sha256": "705c2e501f6c72b4af984ad6543c17ecf079df792e69f84bc431f340e151595b"
+      },
+      {
+        "path": "hamchat/ui/main_window.py",
+        "size": 60324,
+        "sha256": "a5d07903bf988f7d674b2afb472451b83ea38527f9fc2609e6abcee4ea4c6f56"
+      },
+      {
+        "path": "hamchat/ui/menus.py",
+        "size": 6673,
+        "sha256": "e5fd249021daf452ef3fd32355296a55a13f447ba772fc0b924c1cc0276d9221"
+      },
+      {
+        "path": "hamchat/ui/model_lifecycle.py",
+        "size": 3247,
+        "sha256": "fbc6b24c870d568019aecc527ae0cecd5772f768649a1e9ebc8b3c5128825462"
+      },
+      {
+        "path": "hamchat/ui/splash.py",
+        "size": 10450,
+        "sha256": "c4c432ef603e34e1e189475aca661aa46081f81614629f7a9072451ded0fbb60"
+      },
+      {
+        "path": "hamchat/ui/theme.py",
+        "size": 11801,
+        "sha256": "50ce4e13f3d7cb438c80e0133e9ef5f9e59d5c0fcb07a2651fa84a0c2142c750"
+      },
+      {
+        "path": "hamchat/ui/widgets/ai_profiles_manager.py",
+        "size": 27120,
+        "sha256": "c33948594be858dd734ef68fe87ca610b3eb6dd0201d99bb2d45c558283e6a15"
+      },
+      {
+        "path": "hamchat/ui/widgets/chat_display.py",
+        "size": 27186,
+        "sha256": "cdaa58ce7c20dc8cf6c980004ea7ef4c3ed5be6147753e0ace00681e22f35b13"
+      },
+      {
+        "path": "hamchat/ui/widgets/chat_panel.py",
+        "size": 20219,
+        "sha256": "80a5bd15042bdcc6e680a4c64fd1915bbfdd998e7772c212c7d43f986a8bdcf2"
+      },
+      {
+        "path": "hamchat/ui/widgets/login_form.py",
+        "size": 7570,
+        "sha256": "1281fddcd2dfabf22aebb72f554f808fd0492dca4f8e85a23b229288b755a656"
+      },
+      {
+        "path": "hamchat/ui/widgets/memory_manager.py",
+        "size": 13626,
+        "sha256": "8326839649823e77a209309255f1e56c3f373015a9d937df411988de62d836d1"
+      },
+      {
+        "path": "hamchat/ui/widgets/model_manager.py",
+        "size": 22631,
+        "sha256": "c7fc28390d31515e3ed52c7324b40095c56e9f9cb74af969cf9bf16433eba864"
+      },
+      {
+        "path": "hamchat/ui/widgets/prompt_input.py",
+        "size": 6194,
+        "sha256": "99bba625bdd8ee599ac6bf1447e3b7afbe75101182f21fe5f1abcc5b1fb9a371"
+      },
+      {
+        "path": "hamchat/ui/widgets/qml/ChatView.qml",
+        "size": 4683,
+        "sha256": "2b4f12cc18660966a963769ae97f4579ded187eb5d7fd467234f247486935dfb"
+      },
+      {
+        "path": "hamchat/ui/widgets/qml/MessageBubble.qml",
+        "size": 6421,
+        "sha256": "6a18f43f6d96662db337004a12c0eb361f9009d57d7cc414d38acaac76fbc62d"
+      },
+      {
+        "path": "hamchat/ui/widgets/side_panel.py",
+        "size": 22655,
+        "sha256": "3ed760fdcf17f55321dfd4a2e289ae6d77152846503cfd8c47381e1604dbdf89"
+      },
+      {
+        "path": "hamchat/ui/widgets/test_form.py",
+        "size": 553,
+        "sha256": "390f7e6d176d78612ce10b55a56c34c947a00d54a84ab8f3a3e12c38bcefc870"
+      },
+      {
+        "path": "hamchat/ui/widgets/top_panel.py",
+        "size": 1795,
+        "sha256": "d101c26fce2223b78dd2b8653db3202088b8eb3fc125724ff5fbd2708e50722b"
+      },
+      {
+        "path": "hamchat/update_acquisition.py",
+        "size": 18313,
+        "sha256": "3a1ffda5bcbeaca8961b5bac52a0f36528fadc69246db539d36fc9a74e7c167e"
+      },
+      {
+        "path": "hamchat/update_assessment.py",
+        "size": 16330,
+        "sha256": "3f5c982f92ceffe2ba636a97febb90721f21311051bcf0e3da1ba572528d75f1"
+      },
+      {
+        "path": "hamchat/update_controller.py",
+        "size": 14850,
+        "sha256": "4a3415148897934019f723488db560a1cd06d2e7820c99e0e846aed58366929a"
+      },
+      {
+        "path": "hamchat/update_preservation.py",
+        "size": 24789,
+        "sha256": "f1f7eacb7ec1d40c09ee06a4887fd801f780beb2f2b597419cb0de27a3050ddf"
+      },
+      {
+        "path": "hamchat/updates.py",
+        "size": 27496,
+        "sha256": "e106e852ab6dadef9498b9da4396326006f9ba07412b468ead8089beb18910ac"
+      },
+      {
+        "path": "main.py",
+        "size": 86,
+        "sha256": "e65e29307eb03e3171a3ae4f34b9fddc4310a6c29c9dc6c0c327af6d5e10b9cd"
+      },
+      {
+        "path": "requirements.txt",
+        "size": 551,
+        "sha256": "560be120f958119a69fc6baecc4298a6c57a5785ae4831b2d9c3c2f6c97a12cc"
+      },
+      {
+        "path": "run_hamchat.sh",
+        "size": 349,
+        "sha256": "e70d3fe3f9f33fe55328976cf052738a20a6a7ee5b92d52dc0d95c239884f98e"
+      },
+      {
+        "path": "setup_venv.sh",
+        "size": 127,
+        "sha256": "441dd51bb9f4be05f200258e95d23ce4b2b1153bd8cf3955b383430038d95827"
+      }
     ],
     "removals": []
   }

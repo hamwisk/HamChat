@@ -14,11 +14,8 @@ CHARS_PER_TOKEN = 2
 PER_MESSAGE_OVERHEAD = 12
 TEMPLATE_RESERVE = 64
 IMAGE_TOKEN_ALLOWANCE = 1024
-MIN_REASONING_RESERVE = 256
-MIN_VISIBLE_RESERVE = 256
-DEFAULT_REASONING_RESERVE = 1024
-DEFAULT_VISIBLE_RESERVE = 1024
-DEFAULT_NUM_PREDICT = DEFAULT_REASONING_RESERVE + DEFAULT_VISIBLE_RESERVE
+MIN_GENERATION_ALLOWANCE = 512
+DEFAULT_NUM_PREDICT = 4096
 
 
 class RequestTooLargeError(StreamError):
@@ -33,8 +30,8 @@ class RequestPlan:
     original_input_tokens: int
     final_input_tokens: int
     template_reserve: int
-    reasoning_reserve: int
-    visible_response_reserve: int
+    requested_num_predict: int
+    reduction_reason: str
     num_predict: int
     omitted_turn_count: int
     omitted_message_count: int
@@ -76,22 +73,20 @@ def plan_ollama_request(
     def selected() -> List[ChatMessage]:
         return [message for index, message in enumerate(original) if index in retained]
 
-    # Work out the largest response budget possible without dropping mandatory
-    # system messages, HamMem injections or the newest user turn.  Explicitly
-    # requested budgets larger than that ceiling are capped, not rejected.
+    # Preserve mandatory content, and retain history whenever the shared minimum
+    # output allowance fits. A larger preferred maximum never evicts history.
     removable = {index for group in groups for index in group}
     mandatory = [message for index, message in enumerate(original) if index not in removable]
     mandatory_space = _available_generation(
         context_length, estimate_input_tokens(mandatory), len(mandatory)
     )
-    if mandatory_space < _minimum_output_reserve():
+    target_generation = _requested_num_predict(planned_options.get("num_predict"))
+    minimum_generation = min(MIN_GENERATION_ALLOWANCE, target_generation)
+    if mandatory_space < minimum_generation:
         raise _too_large(context_length)
 
-    requested = planned_options.get("num_predict")
-    target_generation = min(_requested_num_predict(requested), mandatory_space)
-
     candidate = selected()
-    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < target_generation:
+    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < minimum_generation:
         if not groups:
             raise _too_large(context_length)
         group = groups.pop(0)
@@ -106,8 +101,6 @@ def plan_ollama_request(
     available_generation = _available_generation(context_length, final_input, len(candidate))
     num_predict = min(target_generation, available_generation)
     planned_options["num_predict"] = num_predict
-    reasoning = min(DEFAULT_REASONING_RESERVE, num_predict // 2)
-    visible = num_predict - reasoning
     return RequestPlan(
         messages=candidate,
         options=planned_options,
@@ -115,8 +108,8 @@ def plan_ollama_request(
         original_input_tokens=original_input,
         final_input_tokens=final_input,
         template_reserve=TEMPLATE_RESERVE + len(candidate) * PER_MESSAGE_OVERHEAD,
-        reasoning_reserve=reasoning,
-        visible_response_reserve=visible,
+        requested_num_predict=target_generation,
+        reduction_reason="context_capacity" if num_predict < target_generation else "none",
         num_predict=num_predict,
         omitted_turn_count=omitted_turns,
         omitted_message_count=omitted_messages,
@@ -126,10 +119,6 @@ def plan_ollama_request(
 
 def _available_generation(context_length: int, input_tokens: int, message_count: int) -> int:
     return context_length - input_tokens - TEMPLATE_RESERVE - message_count * PER_MESSAGE_OVERHEAD
-
-
-def _minimum_output_reserve() -> int:
-    return MIN_REASONING_RESERVE + MIN_VISIBLE_RESERVE
 
 
 def _requested_num_predict(requested: object) -> int:

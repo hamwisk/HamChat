@@ -16,6 +16,14 @@ from hamchat.ui.widgets.model_manager import ModelManager
 
 class _Session:
     selected_model = "chat"
+    generation_limit = 4096
+
+    def get_model_generation_limit(self, _model):
+        return self.generation_limit
+
+    def set_model_generation_limit(self, _model, value):
+        self.generation_limit = value
+
 
     def get_model_choices(self):
         return [("chat", "chat")]
@@ -74,3 +82,11 @@ def test_busy_unload_is_deduplicated_and_result_keeps_selected_model(manager):
 
     assert manager._session.selected_model == "chat"
     assert manager.unload_status.text() == "Unloaded 1 model(s); failed 0; skipped 1."
+
+
+def test_generation_control_restores_and_saves_selected_model(manager):
+    assert manager.generation_limit.value() == 4096
+    manager.generation_limit.setValue(7000)
+    assert manager._session.generation_limit == 7000
+    manager._load_models()
+    assert manager.generation_limit.value() == 7000

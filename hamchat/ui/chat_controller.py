@@ -648,6 +648,10 @@ class ChatController(QObject):
             return
         if not hasattr(self._model_client, "prepare_runtime_context"):
             return
+        if hasattr(self._session, "get_model_generation_limit"):
+            explicit = options.get("num_predict")
+            if type(explicit) is not int or explicit <= 0:
+                options["num_predict"] = self._session.get_model_generation_limit(self._model_name)
         num_ctx = self._session.get_model_context_num_ctx(self._model_name)
         if num_ctx is None:
             options.pop("num_ctx", None)
@@ -873,6 +877,8 @@ class ChatController(QObject):
             self._thinking_panel.show_thinking_notice(
                 f"Ollama rejected the {mode.title()} thinking effort. Choose another effort and retry."
             )
+        elif event_type == "generation_budget":
+            self._report_ham_mem(mode)
         elif event_type == "output_limit" and self._active_row is not None:
             # This is display-only: retain and persist any visible model text,
             # but never make the explanatory marker part of its response.
@@ -880,8 +886,10 @@ class ChatController(QObject):
                 self._active_row,
                 "\n[output limit] The model reached its output limit. Any partial response has "
                 "been kept. If Thinking consumed the budget before an answer appeared, try "
-                "lowering or disabling Thinking in the Chat Panel. You can also request a "
-                "shorter response and regenerate.",
+                "lowering or disabling Thinking in the Chat Panel where supported. You can also request a "
+                "shorter response and regenerate. Increase Maximum generation in Model Manager "
+                "for a larger shared Thinking and answer allowance. If context constrained "
+                "the allowance, increase Context allocation.",
             )
 
     def _on_job_memory_snapshot(self, ticket: int, snapshot: str) -> None:

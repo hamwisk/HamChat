@@ -187,6 +187,21 @@ class SessionManager(QObject):
         """Models without an explicit backend retain HamChat's local-Ollama default."""
         return (self.get_model_backend(model_id) or "ollama") == "ollama"
 
+    def get_model_generation_limit(self, model_id: str) -> int:
+        saved = self.settings.get("ollama_generation_limits", {}) or {}
+        value = saved.get(model_id, 4096) if isinstance(saved, dict) else 4096
+        return value if type(value) is int and 1 <= value <= 2147483647 else 4096
+
+    def set_model_generation_limit(self, model_id: str, value: int) -> None:
+        if type(value) is not int or not 1 <= value <= 2147483647:
+            raise ValueError("Generation maximum must be a positive integer.")
+        if not self.is_ollama_model(model_id):
+            return
+        saved = self.settings.get("ollama_generation_limits", {}) or {}
+        saved = dict(saved) if isinstance(saved, dict) else {}
+        saved[model_id] = value
+        self.settings.set("ollama_generation_limits", saved)
+
     def get_model_context_allocation(self, model_id: str) -> str:
         if not self.is_ollama_model(model_id):
             return "auto"

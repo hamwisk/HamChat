@@ -79,6 +79,8 @@ def test_output_limit_notice_is_visible_but_not_persisted_as_assistant_text():
     assert "Any partial response has been kept." in guidance
     assert "If Thinking consumed the budget before an answer appeared" in guidance
     assert "lowering or disabling Thinking in the Chat Panel" in guidance
+    assert "Increase Maximum generation" in guidance
+    assert "If context constrained" in guidance
 
 
 def test_thinking_only_length_exhaustion_still_has_a_visible_explanation():

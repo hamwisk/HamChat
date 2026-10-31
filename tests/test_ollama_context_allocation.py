@@ -129,3 +129,27 @@ def test_fallback_with_allocation_remains_retryable(monkeypatch):
 
     assert (first.context_length, first.source) == (4096, "fallback")
     assert (second.context_length, second.source) == (4096, "fallback")
+
+
+def test_generation_limit_persistence_validation_and_explicit_precedence(tmp_path):
+    import pytest
+    from types import SimpleNamespace
+    from hamchat.ui.chat_controller import ChatController
+
+    settings = Settings(tmp_path / "app.json")
+    session = SessionManager(settings, "solo", None)
+    assert session.get_model_generation_limit("one") == 4096
+    session.set_model_generation_limit("one", 7000)
+    restored = SessionManager(Settings(tmp_path / "app.json"), "solo", None)
+    assert restored.get_model_generation_limit("one") == 7000
+    assert restored.get_model_generation_limit("two") == 4096
+    for invalid in (0, -1, True, "4096", 2.5):
+        with pytest.raises(ValueError):
+            session.set_model_generation_limit("one", invalid)
+    state = SimpleNamespace(_session=restored, _model_client=OllamaClient(), _model_name="one")
+    options = {}
+    ChatController._apply_model_context_allocation(state, options)
+    assert options["num_predict"] == 7000
+    options["num_predict"] = 128
+    ChatController._apply_model_context_allocation(state, options)
+    assert options["num_predict"] == 128

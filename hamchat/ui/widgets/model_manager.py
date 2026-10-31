@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLineEdit,
     QComboBox,
+    QSpinBox,
     QCheckBox,
     QTableView,
     QHeaderView,
@@ -327,6 +328,13 @@ class ModelManager(QWidget):
         right.addWidget(self.unload_status)
         right.addWidget(QLabel("Runtime context allocation:", self))
         right.addWidget(self.context_allocation)
+        self.generation_limit = QSpinBox(self)
+        self.generation_limit.setRange(1, 2147483647)
+        self.generation_limit.setValue(4096)
+        self.generation_limit.setToolTip("Maximum tokens shared by Thinking and the visible answer. Context may reduce this allowance.")
+        right.addWidget(QLabel("Maximum generation (Thinking + answer):", self))
+        right.addWidget(self.generation_limit)
+        self.generation_limit.valueChanged.connect(self._on_generation_limit_changed)
         right.addStretch(1)
 
         self.btn_activate = QPushButton("Activate model", self)
@@ -453,6 +461,10 @@ class ModelManager(QWidget):
         self.detail_context.setText(f"Context: {ctx if ctx is not None else 'unknown'}")
         self.detail_caps.setText(f"Capabilities: {cap_str}")
         is_ollama = not hasattr(self._session, "is_ollama_model") or self._session.is_ollama_model(model_id)
+        self.generation_limit.blockSignals(True)
+        self.generation_limit.setValue(self._session.get_model_generation_limit(model_id))
+        self.generation_limit.setEnabled(is_ollama)
+        self.generation_limit.blockSignals(False)
         self.context_allocation.setEnabled(is_ollama)
         if is_ollama:
             mode = self._session.get_model_context_allocation(model_id)
@@ -468,8 +480,14 @@ class ModelManager(QWidget):
         self.detail_backend.setText("Backend: —")
         self.detail_context.setText("Context: —")
         self.detail_caps.setText("Capabilities: —")
+        self.generation_limit.setEnabled(False)
         self.context_allocation.setEnabled(False)
         self.context_allocation.setCurrentIndex(0)
+
+    def _on_generation_limit_changed(self, value: int) -> None:
+        model_id = self._get_current_model_id()
+        if model_id:
+            self._session.set_model_generation_limit(model_id, value)
 
     def _on_context_allocation_changed(self, _index: int) -> None:
         model_id = self._get_current_model_id()

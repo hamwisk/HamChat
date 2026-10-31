@@ -31,7 +31,7 @@ def plan(messages, context=4096, options=None):
 def test_short_request_passes_unchanged_and_sets_default_num_predict():
     messages = [message("system", "profile"), message("user", "hello")]
 
-    result = plan(messages)
+    result = plan(messages, context=8192)
 
     assert result.messages == messages
     assert result.options["num_predict"] == DEFAULT_NUM_PREDICT
@@ -55,9 +55,9 @@ def test_oldest_complete_turn_is_trimmed_first_and_no_message_is_cut():
         message("user", "new" * 40),
     ]
 
-    # One old turn must go to leave the default 2048-token output budget;
-    # after that removal, the remaining turn still fits at this allocation.
-    result = plan(messages, context=3300)
+    # Input plus the 512-token minimum cannot fit until the oldest turn goes.
+    # Retain the second turn even though this reduces the preferred maximum.
+    result = plan(messages, context=2700)
 
     assert result.outcome == "trimmed"
     assert result.omitted_turn_count == 1
@@ -169,7 +169,7 @@ def test_rejected_plan_reaches_broker_as_error_without_emitting_tokens():
 
 def test_num_predict_default_preserved_and_clamped():
     messages = [message("user", "hello")]
-    default = plan(messages)
+    default = plan(messages, context=8192)
     smaller = plan(messages, options={"num_predict": 128})
     excessive = plan(messages, options={"num_predict": 999999})
 
@@ -262,3 +262,43 @@ def test_non_ollama_adapter_path_remains_unchanged():
 
     assert list(stream_func("hello", stop_fn=lambda: False)) == []
     assert client.seen == ("remote", messages, {"temperature": 0.3})
+
+
+def test_history_has_priority_over_preferred_generation_target():
+    messages = [message("system", "profile"), message("user", "old" * 1000),
+                message("assistant", "answer" * 300), message("user", "new")]
+    result = plan(messages, context=4096)
+    assert result.messages == messages
+    assert result.requested_num_predict == 4096
+    assert 512 <= result.num_predict < 4096
+    assert result.reduction_reason == "context_capacity"
+    assert result.final_input_tokens + result.template_reserve + result.num_predict == 4096
+
+
+@pytest.mark.parametrize("invalid", [0, -1, -2, True, "8192", 3.5])
+def test_invalid_generation_override_falls_back_to_finite_default(invalid):
+    result = plan([message("user", "hi")], context=16384, options={"num_predict": invalid})
+    assert result.requested_num_predict == result.num_predict == 4096
+
+
+def test_reduction_notice_and_log_report_shared_effective_budget(monkeypatch, caplog):
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def raise_for_status(self): return None
+        def iter_lines(self, **_kwargs): return iter(['{"done":true}'])
+
+    submitted = []
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post",
+                        lambda _url, **kw: submitted.append(kw["json"]) or Response())
+    caplog.set_level(logging.INFO, logger="llm.ollama")
+    events = list(OllamaClient().stream_chat(
+        model="test", messages=[message("system", "M" * 3000), message("user", "hi")],
+        options={"num_predict": 7000}, prepared_context=RuntimeContext(4096, "cache")))
+    notice = next(event for event in events if event.type == "generation_budget")
+    effective = submitted[0]["options"]["num_predict"]
+    assert f"from 7000 to {effective}" in notice.text
+    assert "shared by Thinking and answer" in notice.text
+    assert "requested_num_predict=7000" in caplog.text
+    assert "reduction_reason=context_capacity" in caplog.text
+    assert "reasoning_reserve" not in caplog.text

@@ -87,15 +87,22 @@ class OllamaClient(ModelClient):
         log.info(
             "Ollama request plan request_id=%s model=%s context_length=%d context_source=%s "
             "original_message_count=%d final_message_count=%d original_input_tokens=%d "
-            "final_input_tokens=%d template_reserve=%d reasoning_reserve=%d "
-            "visible_response_reserve=%d num_predict=%d omitted_turn_count=%d "
+            "final_input_tokens=%d template_reserve=%d requested_num_predict=%d "
+            "reduction_reason=%s effective_num_predict=%d omitted_turn_count=%d "
             "omitted_message_count=%d outcome=%s",
             request_id, model, resolved_context.context_length, resolved_context.source,
             plan.original_message_count, len(messages), plan.original_input_tokens,
-            plan.final_input_tokens, plan.template_reserve, plan.reasoning_reserve,
-            plan.visible_response_reserve, plan.num_predict, plan.omitted_turn_count,
+            plan.final_input_tokens, plan.template_reserve, plan.requested_num_predict,
+            plan.reduction_reason, plan.num_predict, plan.omitted_turn_count,
             plan.omitted_message_count, plan.outcome,
         )
+
+        if plan.num_predict <= plan.requested_num_predict * 0.9:
+            yield StreamEvent(type="generation_budget", text=(
+                f"Generation allowance reduced from {plan.requested_num_predict} to "
+                f"{plan.num_predict} tokens by context capacity; shared by Thinking and answer. "
+                "Increase Context allocation to allow more."
+            ))
 
         # Build wire messages; translate our internal .parts → Ollama's "images".
         wire = []

@@ -2,7 +2,7 @@
 
 HamChat is a local-first Linux desktop application for talking to large language models. It combines private, Ollama-focused chat with multiple user accounts, AI Profiles, persistent memory, image-capable conversations, model-aware context planning, and safe application updates in a comfortable PyQt6 interface.
 
-**Current release: HamChat 2.7.4**
+**Current release: HamChat 2.7.5**
 
 HamChat is a complete working application under active development. Linux is its primary and currently tested platform.
 
@@ -24,7 +24,9 @@ HamMem lets HamChat recall useful information beyond the immediate context windo
 - Scope memories to a user, chat, AI Profile, administrator, or the whole installation.
 - Enable or disable memory independently for each conversation.
 - Preserve a chat's HamMem preference when forking it.
-- Build and rebuild embeddings used for relevant memory retrieval.
+- Build and rebuild embeddings used for relevant memory retrieval; Ollama embeddings use the CPU by default.
+- Set **Maximum memories** and **Minimum relevance** beneath **Use HamMem**; preferences persist separately per user and guest.
+- Include full selected memory content before context planning.
 - Control memory availability through account roles and permissions.
 
 ### AI Profiles
@@ -40,9 +42,11 @@ HamChat inspects the active Ollama model instead of assuming every model behaves
 
 - Discover the model's effective runtime context window.
 - Choose **Auto**, **Low/4K**, **Mid/8K**, or **High/16K** context allocation.
-- Account for the complete prompt while reserving room for the response.
+- Configure a per-model **Maximum generation** allowance (default 4096 tokens), shared by thinking and the answer.
+- Preserve that allowance by excluding oldest conversation turns from requests when needed, with status reporting; saved history is retained.
 - Stop requests that cannot fit and provide useful guidance instead of failing mysteriously.
 - Record diagnostics for interrupted streams, malformed responses, and model preparation.
+- Use **Model → Unload all models** (including embedding models) or **Load and warm selected model** without adding a chat message.
 
 ### Thinking support
 
@@ -137,7 +141,7 @@ You should still keep an independent backup of important user data. Automatic up
 
 ## Release notes
 
-See [`updates/2.7.4.md`](updates/2.7.4.md) for the current release notes.
+See [`updates/2.7.5.md`](updates/2.7.5.md) for the current release notes.
 
 For the complete HamChat 2.7 feature overview, see [`updates/2.7.0.md`](updates/2.7.0.md). The [`2.7.1 maintenance notes`](updates/2.7.1.md) document the corrected automatic-updater baseline.
 

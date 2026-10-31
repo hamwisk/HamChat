@@ -64,7 +64,7 @@ def stream(client, model="test:latest", options=None):
     return list(client.stream_chat(
         model=model,
         messages=[ChatMessage(role="user", content="hello")],
-        options=options if options is not None else {"temperature": 0.2, "num_ctx": 4096},
+        options=options if options is not None else {"temperature": 0.2, "num_ctx": 4096, "num_predict": 512},
     ))
 
 
@@ -246,7 +246,7 @@ def test_transport_failure_invalidates_confirmed_context(monkeypatch):
     client = OllamaClient()
     client.prepare_runtime_context(model="test:latest", options={})
 
-    failed_events = stream(client, options={})
+    failed_events = stream(client, options={"num_predict": 512})
     assert failed_events[-1].type == "error"
     assert client.get_runtime_context(model="test:latest", options={}).source == "fallback"
     client.prepare_runtime_context(model="test:latest", options={})
@@ -278,7 +278,7 @@ def test_preload_failure_keeps_chat_possible_and_later_retryable(monkeypatch):
     calls = install_transport(monkeypatch, preload_error=OSError("offline"))
     client = OllamaClient()
 
-    events = stream(client, options={})
+    events = stream(client, options={"num_predict": 512})
 
     assert events[-1].type == "end"
     assert calls == ["preload", "chat"]
@@ -297,7 +297,7 @@ def test_ps_failure_keeps_chat_possible_and_later_retryable(monkeypatch):
     monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.get", lambda *_a, **_k: (_ for _ in ()).throw(OSError("ps down")))
     client = OllamaClient()
 
-    assert stream(client, options={})[-1].type == "end"
+    assert stream(client, options={"num_predict": 512})[-1].type == "end"
     assert calls == ["preload", "chat"]
     monkeypatch.setattr(
         "hamchat.infra.llm.ollama_client.requests.get",
@@ -331,7 +331,7 @@ def test_request_logging_labels_runtime_cache_and_fallback(monkeypatch, caplog):
     assert "effective_context_source=cache" in caplog.text
 
     install_transport(monkeypatch, preload_error=OSError("offline"))
-    stream(OllamaClient(), options={})
+    stream(OllamaClient(), options={"num_predict": 512})
     assert "effective_context_length=4096 effective_context_source=fallback" in caplog.text
 
 

@@ -331,7 +331,7 @@ class ModelManager(QWidget):
         self.generation_limit = QSpinBox(self)
         self.generation_limit.setRange(1, 2147483647)
         self.generation_limit.setValue(4096)
-        self.generation_limit.setToolTip("Maximum tokens shared by Thinking and the visible answer. Context may reduce this allowance.")
+        self.generation_limit.setToolTip("Maximum tokens shared by Thinking and the visible answer. Older turns may be excluded to preserve this allowance; requests that cannot fit are rejected.")
         right.addWidget(QLabel("Maximum generation (Thinking + answer):", self))
         right.addWidget(self.generation_limit)
         self.generation_limit.valueChanged.connect(self._on_generation_limit_changed)

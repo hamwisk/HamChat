@@ -26,7 +26,7 @@ class Response:
 def _chat(client, mode):
     return list(client.stream_chat(
         model="thinker", messages=[ChatMessage(role="user", content="hello")], options={},
-        prepared_context=RuntimeContext(4096, "runtime"), thinking_mode=mode,
+        prepared_context=RuntimeContext(8192, "runtime"), thinking_mode=mode,
     ))
 
 
@@ -107,7 +107,7 @@ def test_medium_default_omits_think_from_preload_and_chat(monkeypatch):
         "hamchat.infra.llm.ollama_client.requests.get",
         lambda *_args, **_kwargs: SimpleNamespace(
             raise_for_status=lambda: None,
-            json=lambda: {"models": [{"name": "thinker", "context_length": 4096}]},
+            json=lambda: {"models": [{"name": "thinker", "context_length": 8192}]},
         ),
     )
 
@@ -142,7 +142,7 @@ def test_thinking_logs_requested_and_effective_modes(monkeypatch, caplog):
 
     list(OllamaClient().stream_chat(
         model="thinker", messages=[ChatMessage(role="user", content="hello")], options={},
-        prepared_context=RuntimeContext(4096, "runtime"), thinking_mode="low", requested_thinking_mode="off",
+        prepared_context=RuntimeContext(8192, "runtime"), thinking_mode="low", requested_thinking_mode="off",
     ))
 
     assert "requested_thinking_mode=off effective_thinking_mode=low" in caplog.text
@@ -248,7 +248,7 @@ def test_unsupported_retry_keeps_final_messages_callback_once(monkeypatch):
     monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post", post)
     list(OllamaClient().stream_chat(
         model="thinker", messages=[ChatMessage(role="user", content="hello")], options={},
-        prepared_context=RuntimeContext(4096, "runtime"), thinking_mode="high",
+        prepared_context=RuntimeContext(8192, "runtime"), thinking_mode="high",
         final_messages_callback=lambda messages: snapshots.append(messages),
     ))
 

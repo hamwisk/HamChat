@@ -24,7 +24,7 @@ def message(role: str, content: str, images: int = 0) -> ChatMessage:
     return item
 
 
-def plan(messages, context=4096, options=None):
+def plan(messages, context=8192, options=None):
     return plan_ollama_request(messages=messages, options=options or {}, context_length=context)
 
 
@@ -55,9 +55,8 @@ def test_oldest_complete_turn_is_trimmed_first_and_no_message_is_cut():
         message("user", "new" * 40),
     ]
 
-    # Input plus the 512-token minimum cannot fit until the oldest turn goes.
-    # Retain the second turn even though this reduces the preferred maximum.
-    result = plan(messages, context=2700)
+    # Input plus the requested 4096-token allowance fits after one old turn goes.
+    result = plan(messages, context=5300)
 
     assert result.outcome == "trimmed"
     assert result.omitted_turn_count == 1
@@ -74,7 +73,7 @@ def test_repeated_trimming_removes_multiple_complete_pairs_without_orphans():
         message("user", "new" * 40),
     ]
 
-    result = plan(messages, context=1300)
+    result = plan(messages, context=4300)
 
     assert result.omitted_turn_count == 2
     assert [(item.role, item.content) for item in result.messages] == [
@@ -88,7 +87,7 @@ def test_newest_user_system_messages_and_attachments_always_survive():
     result = plan([
         message("system", "profile"), message("system", "[HamMem]"),
         message("user", "old" * 1000), message("assistant", "reply" * 1000), newest,
-    ], context=3000)
+    ], context=6500)
 
     assert result.messages[0].content == "profile"
     assert result.messages[1].content == "[HamMem]"
@@ -110,7 +109,7 @@ def test_attachment_history_stub_is_trimmed_with_its_parent_turn():
     result = plan([
         message("system", "profile"), parent, stub, message("assistant", "reply" * 1000),
         message("user", "new"),
-    ], context=2500)
+    ], context=4500)
 
     assert parent not in result.messages
     assert stub not in result.messages
@@ -120,10 +119,10 @@ def test_attachment_history_stub_is_trimmed_with_its_parent_turn():
 def test_mandatory_request_budget_boundaries(chars, should_fit):
     messages = [message("user", "x" * chars)]
     if should_fit:
-        assert plan(messages, context=4096).messages == messages
+        assert plan(messages, context=4096, options={"num_predict": 512}).messages == messages
     else:
         with pytest.raises(RequestTooLargeError):
-            plan(messages, context=4096)
+            plan(messages, context=4096, options={"num_predict": 512})
 
 
 def test_required_system_and_newest_prompt_too_large_prevents_chat_post(monkeypatch):
@@ -167,16 +166,15 @@ def test_rejected_plan_reaches_broker_as_error_without_emitting_tokens():
     assert finished == [(1, "error")]
 
 
-def test_num_predict_default_preserved_and_clamped():
+def test_num_predict_default_and_small_override_preserved_excess_rejected():
     messages = [message("user", "hello")]
     default = plan(messages, context=8192)
     smaller = plan(messages, options={"num_predict": 128})
-    excessive = plan(messages, options={"num_predict": 999999})
+    with pytest.raises(RequestTooLargeError):
+        plan(messages, options={"num_predict": 999999})
 
     assert default.num_predict == DEFAULT_NUM_PREDICT
     assert smaller.num_predict == 128
-    assert excessive.num_predict < 999999
-    assert excessive.num_predict + excessive.final_input_tokens + excessive.template_reserve <= 4096
 
 
 def test_exact_planned_messages_and_options_are_submitted(monkeypatch):
@@ -199,7 +197,7 @@ def test_exact_planned_messages_and_options_are_submitted(monkeypatch):
     client = OllamaClient()
     events = list(client.stream_chat(
         model="test", messages=messages, options={},
-        prepared_context=RuntimeContext(3000, "cache"), request_id="request2",
+        prepared_context=RuntimeContext(6000, "cache"), request_id="request2",
     ))
 
     assert events[-1].type == "end"
@@ -219,7 +217,7 @@ def test_all_runtime_context_sources_plan_requests(monkeypatch, source):
     monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post", lambda *_a, **_k: Response())
     events = list(OllamaClient().stream_chat(
         model="test", messages=[message("user", "hello")], options={},
-        prepared_context=RuntimeContext(4096, source), request_id="request-source",
+        prepared_context=RuntimeContext(8192, source), request_id="request-source",
     ))
 
     assert events[-1].type == "end"
@@ -237,7 +235,7 @@ def test_plan_logging_has_budgets_and_never_message_contents(monkeypatch, caplog
     secret = "do-not-log-this-request-content"
     list(OllamaClient().stream_chat(
         model="test", messages=[message("user", secret)], options={},
-        prepared_context=RuntimeContext(4096, "runtime"), request_id="request3",
+        prepared_context=RuntimeContext(8192, "runtime"), request_id="request3",
     ))
 
     assert "original_input_tokens=" in caplog.text
@@ -264,15 +262,15 @@ def test_non_ollama_adapter_path_remains_unchanged():
     assert client.seen == ("remote", messages, {"temperature": 0.3})
 
 
-def test_history_has_priority_over_preferred_generation_target():
+def test_generation_has_priority_over_removable_history():
     messages = [message("system", "profile"), message("user", "old" * 1000),
                 message("assistant", "answer" * 300), message("user", "new")]
-    result = plan(messages, context=4096)
-    assert result.messages == messages
-    assert result.requested_num_predict == 4096
-    assert 512 <= result.num_predict < 4096
-    assert result.reduction_reason == "context_capacity"
-    assert result.final_input_tokens + result.template_reserve + result.num_predict == 4096
+    original = list(messages)
+    result = plan(messages, context=5000)
+    assert result.messages == [messages[0], messages[-1]]
+    assert result.requested_num_predict == result.num_predict == 4096
+    assert result.omitted_turn_count == 1
+    assert messages == original
 
 
 @pytest.mark.parametrize("invalid", [0, -1, -2, True, "8192", 3.5])
@@ -281,7 +279,7 @@ def test_invalid_generation_override_falls_back_to_finite_default(invalid):
     assert result.requested_num_predict == result.num_predict == 4096
 
 
-def test_reduction_notice_and_log_report_shared_effective_budget(monkeypatch, caplog):
+def test_omission_notice_and_log_report_preserved_shared_budget(monkeypatch, caplog):
     class Response:
         def __enter__(self): return self
         def __exit__(self, *_args): return False
@@ -293,12 +291,75 @@ def test_reduction_notice_and_log_report_shared_effective_budget(monkeypatch, ca
                         lambda _url, **kw: submitted.append(kw["json"]) or Response())
     caplog.set_level(logging.INFO, logger="llm.ollama")
     events = list(OllamaClient().stream_chat(
-        model="test", messages=[message("system", "M" * 3000), message("user", "hi")],
-        options={"num_predict": 7000}, prepared_context=RuntimeContext(4096, "cache")))
+        model="test", messages=[message("system", "M" * 3000), message("user", "old" * 3000),
+                               message("assistant", "reply"), message("user", "hi")],
+        options={"num_predict": 7000}, prepared_context=RuntimeContext(10000, "cache")))
     notice = next(event for event in events if event.type == "generation_budget")
     effective = submitted[0]["options"]["num_predict"]
-    assert f"from 7000 to {effective}" in notice.text
+    assert effective == 7000
+    assert "Excluded 1 oldest turns (2 messages)" in notice.text
     assert "shared by Thinking and answer" in notice.text
     assert "requested_num_predict=7000" in caplog.text
-    assert "reduction_reason=context_capacity" in caplog.text
+    assert "effective_num_predict=7000" in caplog.text
+    assert "omitted_turn_count=1" in caplog.text
     assert "reasoning_reserve" not in caplog.text
+
+
+def test_observed_602_token_headroom_omits_history_instead_of_shrinking_output():
+    messages = [message("system", "S" * 2500) for _ in range(4)]
+    for _ in range(10):
+        messages.extend([message("user", "U" * 1000), message("assistant", "A" * 1000)])
+    messages.append(message("user", "N" * 836))
+    original = list(messages)
+    result = plan(messages, context=16384)
+    assert len(messages) == 25
+    assert result.original_input_tokens == 15418
+    assert 16384 - result.original_input_tokens - (64 + 25 * 12) == 602
+    assert result.num_predict == result.requested_num_predict == 4096
+    assert result.omitted_turn_count == 4
+    assert result.messages == messages[:4] + messages[12:]
+    assert result.final_input_tokens + result.template_reserve + 4096 <= 16384
+    assert messages == original
+
+
+@pytest.mark.parametrize("retained_turns", [0, 1, 2, 3, 4])
+def test_recent_turns_are_preferred_without_being_a_fixed_history_limit(retained_turns):
+    messages = [message("system", "s")]
+    for index in range(4):
+        messages.extend([message("user", str(index) * 200),
+                         message("assistant", str(index) * 200)])
+    messages.append(message("user", "n"))
+    # Mandatory text = 2, template = 88, generation = 128;
+    # each completed turn adds 200 input tokens and 24 wrapper tokens.
+    result = plan(messages, context=218 + 224 * retained_turns, options={"num_predict": 128})
+    assert result.messages == messages[:1] + messages[1 + (4 - retained_turns) * 2:]
+    assert result.omitted_turn_count == 4 - retained_turns
+    assert result.num_predict == 128
+
+
+def test_newest_text_and_attachment_stub_are_both_mandatory():
+    newest = message("user", "N" * 1000)
+    stub = ChatMessage("user", "attachment", metadata={"attachment_stub_parent": True})
+    with pytest.raises(RequestTooLargeError):
+        plan([message("user", "old"), message("assistant", "reply"), newest, stub],
+             context=400, options={"num_predict": 128})
+
+
+@pytest.mark.parametrize("images", [0, 1])
+def test_mandatory_input_alone_fits_but_requested_output_does_not_rejects(monkeypatch, caplog, images):
+    posts, snapshots = [], []
+    monkeypatch.setattr("hamchat.infra.llm.ollama_client.requests.post",
+                        lambda *a, **kw: posts.append(kw))
+    messages = [message("system", "profile"), message("system", "memory" * 100),
+                message("user", "question", images=images)]
+    caplog.set_level(logging.WARNING, logger="llm.ollama")
+    events = list(OllamaClient().stream_chat(
+        model="test", messages=messages, options={"num_predict": 4096},
+        prepared_context=RuntimeContext(4096, "runtime"),
+        final_messages_callback=snapshots.append))
+    assert [event.type for event in events] == ["error"]
+    assert "Preflight context rejection" in events[0].error
+    assert "Lower Maximum generation" in events[0].error
+    assert "requested 4096-token" in events[0].error
+    assert "effective_num_predict=none" in caplog.text
+    assert not posts and not snapshots

@@ -10,11 +10,14 @@ from .base import ChatMessage, StreamError
 # We do not have the active model's exact chat tokenizer.  Two characters per
 # token is intentionally conservative for code and non-ASCII text.  Every
 # message also receives wrapper overhead and every image a fixed allowance.
+# This is a fallback estimate, not a tokenizer or a guaranteed upper bound.
+# Ollama /api/chat reports prompt_eval_count after inference; /api/show metadata
+# alone does not count a rendered chat with images. Do not calibrate a changed
+# prompt from a previous request's measured count.
 CHARS_PER_TOKEN = 2
 PER_MESSAGE_OVERHEAD = 12
 TEMPLATE_RESERVE = 64
 IMAGE_TOKEN_ALLOWANCE = 1024
-MIN_GENERATION_ALLOWANCE = 512
 DEFAULT_NUM_PREDICT = 4096
 
 
@@ -31,7 +34,6 @@ class RequestPlan:
     final_input_tokens: int
     template_reserve: int
     requested_num_predict: int
-    reduction_reason: str
     num_predict: int
     omitted_turn_count: int
     omitted_message_count: int
@@ -73,22 +75,22 @@ def plan_ollama_request(
     def selected() -> List[ChatMessage]:
         return [message for index, message in enumerate(original) if index in retained]
 
-    # Preserve mandatory content, and retain history whenever the shared minimum
-    # output allowance fits. A larger preferred maximum never evicts history.
+    # Reserve the user's entire shared generation allowance first. Oldest-first
+    # removal prefers the latest two completed turns (and any additional history
+    # that fits), without imposing a fixed history count or mutating saved history.
     removable = {index for group in groups for index in group}
     mandatory = [message for index, message in enumerate(original) if index not in removable]
     mandatory_space = _available_generation(
         context_length, estimate_input_tokens(mandatory), len(mandatory)
     )
     target_generation = _requested_num_predict(planned_options.get("num_predict"))
-    minimum_generation = min(MIN_GENERATION_ALLOWANCE, target_generation)
-    if mandatory_space < minimum_generation:
-        raise _too_large(context_length)
+    if mandatory_space < target_generation:
+        raise _too_large(context_length, target_generation)
 
     candidate = selected()
-    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < minimum_generation:
+    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < target_generation:
         if not groups:
-            raise _too_large(context_length)
+            raise _too_large(context_length, target_generation)
         group = groups.pop(0)
         # Groups contain only eligible older, non-system messages.
         for index in group:
@@ -98,8 +100,7 @@ def plan_ollama_request(
         candidate = selected()
 
     final_input = estimate_input_tokens(candidate)
-    available_generation = _available_generation(context_length, final_input, len(candidate))
-    num_predict = min(target_generation, available_generation)
+    num_predict = target_generation
     planned_options["num_predict"] = num_predict
     return RequestPlan(
         messages=candidate,
@@ -109,7 +110,6 @@ def plan_ollama_request(
         final_input_tokens=final_input,
         template_reserve=TEMPLATE_RESERVE + len(candidate) * PER_MESSAGE_OVERHEAD,
         requested_num_predict=target_generation,
-        reduction_reason="context_capacity" if num_predict < target_generation else "none",
         num_predict=num_predict,
         omitted_turn_count=omitted_turns,
         omitted_message_count=omitted_messages,
@@ -129,6 +129,11 @@ def _requested_num_predict(requested: object) -> int:
 
 def _older_turn_groups(messages: List[ChatMessage]) -> List[List[int]]:
     newest_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "user"), None)
+    # A text-path attachment stub is a second user message belonging to its
+    # preceding user text. Protect both as the newest turn.
+    while newest_user is not None and messages[newest_user].metadata and messages[newest_user].metadata.get("attachment_stub_parent"):
+        newest_user = next((i for i in range(newest_user - 1, -1, -1)
+                            if messages[i].role == "user"), None)
     if newest_user is None:
         # Without a distinct newest user there is no safe history to remove.
         return []
@@ -155,9 +160,12 @@ def _older_turn_groups(messages: List[ChatMessage]) -> List[List[int]]:
     return groups
 
 
-def _too_large(context_length: int) -> RequestTooLargeError:
+def _too_large(context_length: int, generation: int) -> RequestTooLargeError:
     return RequestTooLargeError(
-        "This request cannot fit within the model’s active context. Increase Context "
+        f"Preflight context rejection: mandatory input plus the requested {generation}-token "
+        f"generation allowance cannot fit within the {context_length}-token active context "
+        "using the conservative input estimate. No answer generation was sent. "
+        "Lower Maximum generation. Increase Context "
         "allocation in Model → Model Manager—higher allocations use more memory—or reduce "
         "the input by shortening the newest message or AI Profile, removing attachments, "
         "or temporarily disabling Use HamMem in the Chat Panel."

@@ -53,7 +53,9 @@ def test_auto_omits_num_ctx_and_tiers_reach_preload_and_chat(monkeypatch):
 
     for requested in (None, 4096, 8192, 16384):
         requests_seen.clear()
-        options = {} if requested is None else {"num_ctx": requested}
+        options = {"num_predict": 512}
+        if requested is not None:
+            options["num_ctx"] = requested
         events = list(OllamaClient().stream_chat(
             model="model", messages=[ChatMessage(role="user", content="hello")], options=options,
         ))
@@ -87,7 +89,7 @@ def test_discovered_context_not_requested_tier_controls_planning(monkeypatch, ca
     events = list(OllamaClient().stream_chat(
         model="model",
         messages=[ChatMessage(role="user", content="x" * 6000)],
-        options={"num_ctx": 16384},
+        options={"num_ctx": 16384, "num_predict": 512},
     ))
 
     assert events[-1].type == "end"

@@ -74,7 +74,7 @@ class OllamaClient(ModelClient):
             )
         except RequestTooLargeError as exc:
             log.warning(
-                "Ollama request plan rejected request_id=%s model=%s context_length=%d source=%s error=%s",
+                "Ollama request plan rejected request_id=%s model=%s context_length=%d source=%s outcome=rejected effective_num_predict=none input_estimator=conservative_chars_2 error=%s",
                 request_id, model, resolved_context.context_length, resolved_context.source, exc,
             )
             yield StreamEvent(type="error", error=str(exc))
@@ -88,20 +88,22 @@ class OllamaClient(ModelClient):
             "Ollama request plan request_id=%s model=%s context_length=%d context_source=%s "
             "original_message_count=%d final_message_count=%d original_input_tokens=%d "
             "final_input_tokens=%d template_reserve=%d requested_num_predict=%d "
-            "reduction_reason=%s effective_num_predict=%d omitted_turn_count=%d "
+            "input_estimator=conservative_chars_2 effective_num_predict=%d omitted_turn_count=%d "
             "omitted_message_count=%d outcome=%s",
             request_id, model, resolved_context.context_length, resolved_context.source,
             plan.original_message_count, len(messages), plan.original_input_tokens,
             plan.final_input_tokens, plan.template_reserve, plan.requested_num_predict,
-            plan.reduction_reason, plan.num_predict, plan.omitted_turn_count,
+            plan.num_predict, plan.omitted_turn_count,
             plan.omitted_message_count, plan.outcome,
         )
 
-        if plan.num_predict <= plan.requested_num_predict * 0.9:
+        if plan.omitted_message_count:
             yield StreamEvent(type="generation_budget", text=(
-                f"Generation allowance reduced from {plan.requested_num_predict} to "
-                f"{plan.num_predict} tokens by context capacity; shared by Thinking and answer. "
-                "Increase Context allocation to allow more."
+                f"Excluded {plan.omitted_turn_count} oldest turns "
+                f"({plan.omitted_message_count} messages) from this request to preserve "
+                f"the requested {plan.requested_num_predict}-token generation allowance "
+                f"(effective {plan.num_predict}; shared by Thinking and answer). "
+                "Input uses a conservative estimate; saved history is unchanged."
             ))
 
         # Build wire messages; translate our internal .parts → Ollama's "images".

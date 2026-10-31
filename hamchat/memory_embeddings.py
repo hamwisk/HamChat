@@ -37,9 +37,20 @@ class OllamaEmbeddingProvider:
     provider_id = "ollama"
     format_version = EMBEDDING_FORMAT_VERSION
 
-    def __init__(self, model_id: str = DEFAULT_EMBEDDING_MODEL, *, base_url: str = DEFAULT_OLLAMA, timeout: int = 20) -> None:
+    def __init__(
+        self,
+        model_id: str = DEFAULT_EMBEDDING_MODEL,
+        *,
+        base_url: str = DEFAULT_OLLAMA,
+        timeout: int = 20,
+        options: Optional[dict] = None,
+    ) -> None:
         self.model_id = model_id
         self.base_url, self.timeout = base_url.rstrip("/"), timeout
+        # Default embeddings to CPU to leave GPU memory available for chat.
+        self.options = {"num_gpu": 0}
+        if options is not None:
+            self.options.update(options)
         self.dimension: Optional[int] = None
 
     def embed_one(self, text: str) -> np.ndarray:
@@ -51,14 +62,24 @@ class OllamaEmbeddingProvider:
             return []
         try:
             log.debug("Ollama embedding request begun provider=%s model=%s host=%s", self.provider_id, self.model_id, self.base_url)
-            response = requests.post(f"{self.base_url}/api/embed", json={"model": self.model_id, "input": values}, timeout=self.timeout)
+
+            # Updated payload to include the 'options' key
+            payload = {
+                "model": self.model_id,
+                "input": values,
+                "options": self.options
+            }
+
+            response = requests.post(f"{self.base_url}/api/embed", json=payload, timeout=self.timeout)
             response.raise_for_status()
             embeddings = response.json().get("embeddings")
         except Exception as exc:
             log.warning("Ollama embedding request failed provider=%s model=%s host=%s error=%s", self.provider_id, self.model_id, self.base_url, type(exc).__name__)
             raise EmbeddingUnavailable("Ollama embedding model is unavailable; install/configure the embedding model and retry rebuild.") from exc
+
         if not isinstance(embeddings, list) or len(embeddings) != len(values):
             raise EmbeddingUnavailable("Ollama returned an invalid embedding response.")
+
         vectors = [normalize_vector(vector) for vector in embeddings]
         dimensions = {int(vector.size) for vector in vectors}
         if len(dimensions) != 1:

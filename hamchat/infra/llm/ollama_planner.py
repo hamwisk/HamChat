@@ -76,8 +76,22 @@ def plan_ollama_request(
     def selected() -> List[ChatMessage]:
         return [message for index, message in enumerate(original) if index in retained]
 
+    # Work out the largest response budget possible without dropping mandatory
+    # system messages, HamMem injections or the newest user turn.  Explicitly
+    # requested budgets larger than that ceiling are capped, not rejected.
+    removable = {index for group in groups for index in group}
+    mandatory = [message for index, message in enumerate(original) if index not in removable]
+    mandatory_space = _available_generation(
+        context_length, estimate_input_tokens(mandatory), len(mandatory)
+    )
+    if mandatory_space < _minimum_output_reserve():
+        raise _too_large(context_length)
+
+    requested = planned_options.get("num_predict")
+    target_generation = min(_requested_num_predict(requested), mandatory_space)
+
     candidate = selected()
-    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < _minimum_output_reserve():
+    while _available_generation(context_length, estimate_input_tokens(candidate), len(candidate)) < target_generation:
         if not groups:
             raise _too_large(context_length)
         group = groups.pop(0)
@@ -90,8 +104,7 @@ def plan_ollama_request(
 
     final_input = estimate_input_tokens(candidate)
     available_generation = _available_generation(context_length, final_input, len(candidate))
-    requested = planned_options.get("num_predict")
-    num_predict = _effective_num_predict(requested, available_generation)
+    num_predict = min(target_generation, available_generation)
     planned_options["num_predict"] = num_predict
     reasoning = min(DEFAULT_REASONING_RESERVE, num_predict // 2)
     visible = num_predict - reasoning
@@ -119,10 +132,10 @@ def _minimum_output_reserve() -> int:
     return MIN_REASONING_RESERVE + MIN_VISIBLE_RESERVE
 
 
-def _effective_num_predict(requested: object, available_generation: int) -> int:
+def _requested_num_predict(requested: object) -> int:
     if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0:
-        return min(requested, available_generation)
-    return min(DEFAULT_NUM_PREDICT, available_generation)
+        return requested
+    return DEFAULT_NUM_PREDICT
 
 
 def _older_turn_groups(messages: List[ChatMessage]) -> List[List[int]]:

@@ -1434,6 +1434,7 @@ class MainWindow(QMainWindow):
             for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
                 attachments_meta.append({
                     "file_id": stored["file_id"],
+                    "tmp_path": stored.get("tmp_path"),
                     "sha256": stored["sha256"],
                     "mime": stored["mime"],
                     "thumb_file_id": thumb.get("file_id"),

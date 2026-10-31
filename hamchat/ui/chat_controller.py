@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Optional, List, Dict
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
@@ -12,7 +15,7 @@ from hamchat.infra.llm.base import ChatMessage
 from hamchat.infra.llm.backend_adapter import make_stream_func_from_client
 from hamchat import db_ops as dbo  # persistence API (create_conversation, add_message)
 from hamchat.core.session import SessionManager
-from hamchat.media_helper import process_images
+from hamchat.media_helper import process_images, normalize_image_file
 from hamchat.infra.llm.base import ModelClient  # if you want to type-hint, optional
 from hamchat.memory_embeddings import MemoryEmbeddingService, OllamaEmbeddingProvider
 
@@ -1088,38 +1091,11 @@ class ChatController(QObject):
 
     def resend_message(self, index: int):
         """Resend from this user message: truncate after it, then replay it."""
-        payload = self._get_user_payload(index)
+        payload = self._prepare_resend(index)
         if not payload:
             return
-
         text = payload.get("text") or ""
-        attachments = self._resolve_attachment_paths(payload)
-        msg_id = payload.get("message_id")
-        base_index = payload.get("base_index")
-
-        # 1) Persisted truncate (if we have a real conversation + message id)
-        if self._save_enabled() and self._db is not None and self._conv_id and msg_id:
-            try:
-                dbo.delete_many_messages(
-                    self._db,
-                    conversation_id=int(self._conv_id),
-                    message_id=int(msg_id),
-                )
-            except Exception:
-                pass
-
-        # Keep in-memory history consistent with DB
-        try:
-            self._truncate_history_from_message_id(int(msg_id))
-        except Exception:
-            pass
-
-        # 2) Update the UI to remove all message bubbles from this logical message onward
-        if isinstance(base_index, int):
-            try:
-                self.chat.truncate_messages_from(base_index)
-            except Exception:
-                pass
+        attachments = payload["attachments"]
 
         # 3) Resend payload
         if attachments:
@@ -1152,37 +1128,11 @@ class ChatController(QObject):
 
         Unlike resend_message(), this does NOT actually send anything.
         """
-        payload = self._get_user_payload(index)
+        payload = self._prepare_resend(index)
         if not payload:
             return None
-
         text = payload.get("text") or ""
-        attachments = self._resolve_attachment_paths(payload)
-        msg_id = payload.get("message_id")
-        base_index = payload.get("base_index")
-
-        # 1) Persisted truncate (if we have a real conversation + message id)
-        if self._save_enabled() and self._db is not None and self._conv_id and msg_id:
-            try:
-                dbo.delete_many_messages(
-                    self._db,
-                    conversation_id=int(self._conv_id),
-                    message_id=int(msg_id),
-                )
-            except Exception:
-                pass
-
-        try:
-            self._truncate_history_from_message_id(int(msg_id))
-        except Exception:
-            pass
-
-        # 2) Update the UI to remove all message bubbles from this logical message onward
-        if isinstance(base_index, int):
-            try:
-                self.chat.truncate_messages_from(base_index)
-            except Exception:
-                pass
+        attachments = payload["attachments"]
 
         return {
             "text": text,
@@ -1394,71 +1344,90 @@ class ChatController(QObject):
                 ...
             }
         """
-        try:
-            if not hasattr(self.chat, "get_user_payload"):
-                return None
-            payload = self.chat.get_user_payload(index)
-        except Exception:
+        if index < 0:
             return None
-
-        if not payload:
-            return None
-
-        # Only care about user messages for delete/resend/regenerate.
-        if payload.get("role") != "user":
-            return payload
-
-        base_index = payload.get("base_index")
-        if isinstance(base_index, int):
-            if 0 <= base_index < len(self._history):
-                entry = self._history[base_index]
-                if entry.db_id is not None:
-                    # Attach the DB id so callers can use it.
-                    payload["message_id"] = entry.db_id
-                meta = getattr(entry.msg, "metadata", None) or {}
-                try:
-                    atts_meta = meta.get("attachments")
-                    if atts_meta:
-                        payload["attachments_meta"] = atts_meta
-                except Exception:
-                    pass
-
-        return payload
+        # A text bubble and its thumbnails occupy two rows, but one history entry.
+        row = 0
+        selected = None
+        for history_index, entry in enumerate(self._history):
+            attachments = (entry.msg.metadata or {}).get("attachments") or []
+            count = int(bool(entry.msg.content)) + int(entry.msg.role == "user" and bool(attachments))
+            if row > index:
+                break
+            if entry.msg.role == "user":
+                selected = {
+                    "role": "user", "text": entry.msg.content or "",
+                    "attachments_meta": attachments, "message_id": entry.db_id,
+                    "base_index": row, "history_index": history_index,
+                }
+            if index < row + count:
+                break
+            row += count
+        return selected
 
     def _resolve_attachment_paths(self, payload: dict) -> list[str]:
+        """Retain validated originals before removing message/CAS references.
+
+        Use the attachment panel's CAS accessor, including its decryption path.
+        Thumbnails are never source media.
         """
-        Resolve filesystem paths for original attachments, preferring DB-backed metadata.
-        """
-        paths: list[str] = []
+        paths = []
+        staging = None
         try:
-            atts_meta = payload.get("attachments_meta")
-        except Exception:
-            atts_meta = None
-
-        if isinstance(atts_meta, list):
-            for att in atts_meta:
-                if not isinstance(att, dict):
-                    continue
-                fid = att.get("file_id")
-                if fid is None or self._db is None:
-                    continue
-                try:
-                    path = dbo.cas_path_for_file(self._db, int(fid), data_dir=self._data_dir)
-                except Exception:
-                    path = None
-                if path:
-                    paths.append(str(path))
-
-        if not paths:
-            try:
-                fallback = payload.get("attachments") or []
-            except Exception:
-                fallback = []
-            for att in fallback:
-                if isinstance(att, str):
-                    paths.append(str(att))
-
+            for position, att in enumerate(payload.get("attachments_meta") or []):
+                if isinstance(att, dict):
+                    fid = att.get("file_id")
+                    source = (dbo.cas_path_for_file(self._db, int(fid), data_dir=self._data_dir)
+                              if fid is not None and self._db is not None else att.get("tmp_path"))
+                    name = att.get("original_name")
+                    if fid is not None and self._db is not None:
+                        row = self._db.execute("SELECT original_name FROM files WHERE id=?", (int(fid),)).fetchone()
+                        name = row[0] if row else name
+                else:
+                    source, name = att, None
+                if not source:
+                    raise ValueError("Original attachment is unavailable.")
+                source = str(source)
+                source = source[7:] if source.startswith("file://") else source
+                normalize_image_file(source)
+                if staging is None:
+                    staging = Path(tempfile.mkdtemp(prefix="hamchat_resend_"))
+                folder = staging / str(position)
+                folder.mkdir()
+                target = folder / Path(name or source).name
+                shutil.copy2(source, target)
+                paths.append(str(target))
+        except Exception as exc:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+            raise ValueError("Original attachment is unavailable or unreadable; resend cancelled.") from exc
         return paths
+
+    def _remove_resend_tail(self, payload: dict) -> bool:
+        try:
+            if self._save_enabled() and self._db is not None and self._conv_id and payload.get("message_id"):
+                dbo.delete_many_messages(self._db, conversation_id=int(self._conv_id),
+                                         message_id=int(payload["message_id"]))
+        except Exception:
+            log.exception("Could not remove resend tail")
+            return False
+        self._history = self._history[:payload["history_index"]]
+        self.chat.truncate_messages_from(payload["base_index"])
+        return True
+
+    def _prepare_resend(self, index: int) -> Optional[dict]:
+        payload = self._get_user_payload(index)
+        if not payload:
+            return None
+        try:
+            payload["attachments"] = self._resolve_attachment_paths(payload)
+        except ValueError as exc:
+            log.warning("%s", exc)
+            self.chat.attachmentRejected.emit(str(exc))
+            return None
+        if not self._remove_resend_tail(payload):
+            return None
+        return payload
 
     def _send_with_attachments(self, text: str, attachments: list[str]) -> None:
         if not attachments:
@@ -1484,6 +1453,7 @@ class ChatController(QObject):
             for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
                 attachments_meta.append({
                     "file_id": stored["file_id"],
+                    "tmp_path": stored.get("tmp_path"),
                     "sha256": stored["sha256"],
                     "mime": stored["mime"],
                     "thumb_file_id": thumb.get("file_id"),
@@ -1539,6 +1509,7 @@ class ChatController(QObject):
             for stored, thumb in zip(batch.get("stored", []), batch.get("thumbs", [])):
                 attachments_meta.append({
                     "file_id": stored["file_id"],
+                    "tmp_path": stored.get("tmp_path"),
                     "sha256": stored["sha256"],
                     "mime": stored["mime"],
                     "thumb_file_id": thumb.get("file_id"),

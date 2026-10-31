@@ -557,19 +557,16 @@ def delete_message(conn, message_id: int) -> None:
 
 
 def delete_many_messages(conn, conversation_id: int, message_id: int):
-    """
-    Removes all messages in the conversation with id > message_id.
-    """
+    """Remove the selected message and its tail, updating attachment references."""
     if not conversation_id:
         return
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id ASC",
-        (int(conversation_id), int(message_id)),
-    )
-    rows = cur.fetchall()
-    for row in rows:
-        delete_message(conn, int(row[0]))
+    # One transaction prevents a failed replacement preparation from leaving a
+    # partially deleted tail. message_files cascades maintain CAS ref_counts.
+    with conn:
+        conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ? AND id >= ?",
+            (int(conversation_id), int(message_id)),
+        )
 
     try:
         orphan_sweep(cas_sweep=True)

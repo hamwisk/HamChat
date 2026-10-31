@@ -87,6 +87,7 @@ Item {
             textFormat: block.kind === "markdown" ? Text.MarkdownText : Text.PlainText
             wrapMode: block.kind === "code" ? Text.WrapAnywhere : Text.Wrap
             font.family: block.kind === "code" ? "monospace" : Qt.application.font.family
+            font.pointSize: 14
             color: textColor
             linkColor: theme.link || accentColor
             width: Math.min(contentBox.maxContentWidth, implicitWidth)
